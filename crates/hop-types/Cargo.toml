@@ -1,0 +1,10 @@
+[package]
+name = "hop-types"
+description = "Shared vocabulary for Hop: device identity, geometry, input events and session messages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true

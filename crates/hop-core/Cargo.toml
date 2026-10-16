@@ -1,0 +1,13 @@
+[package]
+name = "hop-core"
+description = "Hop's OS-independent core: the control hand-off state machine, screen layout and edge mapping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hop-types.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
