@@ -13,4 +13,23 @@ hop-types.workspace = true
 
 # The OS bindings exist only on Windows; elsewhere this crate is empty.
 [target.'cfg(windows)'.dependencies]
-windows.workspace = true
+windows = { workspace = true, features = [
+    # HWND, POINT, RECT, error codes.
+    "Win32_Foundation",
+    # Monitors (EnumDisplayMonitors, GetMonitorInfoW) and the test window's font.
+    "Win32_Graphics_Gdi",
+    # GetModuleHandleW, for window classes and hooks.
+    "Win32_System_LibraryLoader",
+    # GetTickCount, the clock GetLastInputInfo uses.
+    "Win32_System_SystemInformation",
+    # Thread priority, EcoQoS opt-out, AttachThreadInput.
+    "Win32_System_Threading",
+    # Per-monitor DPI awareness and monitor scales.
+    "Win32_UI_HiDpi",
+    # Raw Input.
+    "Win32_UI_Input",
+    # SendInput, MapVirtualKeyW, GetLastInputInfo, SetFocus.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # Hooks, windows, messages, the cursor.
+    "Win32_UI_WindowsAndMessaging",
+] }
