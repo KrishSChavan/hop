@@ -8,7 +8,9 @@ publish.workspace = true
 
 [dependencies]
 hop-types.workspace = true
-keycode.workspace = true
 
 [dev-dependencies]
+# Chromium's key table, used only by a test that cross-checks our own table
+# (see src/table.rs for why the table is not taken from this crate at runtime).
+keycode.workspace = true
 proptest.workspace = true
