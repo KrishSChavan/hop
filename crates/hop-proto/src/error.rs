@@ -80,7 +80,9 @@ pub enum ProtoError {
     Decode {
         /// The kind the body arrived under.
         kind: u16,
-        /// What is wrong with it.
+        /// What is wrong with it. It can quote the peer's bytes, so it is
+        /// cut to a few hundred bytes and its control characters are
+        /// escaped, which keeps it safe to log.
         reason: String,
     },
 

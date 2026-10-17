@@ -24,6 +24,12 @@ pub const MAX_CLIPBOARD_TEXT: usize = 1024 * 1024;
 /// exhausting the stack.
 const MAX_DEPTH: usize = 32;
 
+/// Longest reason, in bytes, that a [`ProtoError::Decode`] keeps. The
+/// decoder's messages can quote the peer's bytes (an unknown variant name,
+/// for one), and a peer must not be able to put a megabyte of its own text
+/// into Hop's logs.
+const MAX_REASON_LEN: usize = 256;
+
 /// A message Hop sends between two devices.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
@@ -104,12 +110,17 @@ pub(crate) fn decode_message(kind: u16, body: &[u8]) -> Result<Decoded, ProtoErr
 /// their defaults (serde's derive does both); this function adds the depth
 /// limit and rejects trailing bytes.
 pub(crate) fn decode_body<T: DeserializeOwned>(kind: u16, body: &[u8]) -> Result<T, ProtoError> {
-    let malformed = |reason: String| ProtoError::Decode { kind, reason };
+    let malformed = |reason: String| ProtoError::Decode {
+        kind,
+        reason: log_safe(&reason),
+    };
     // A reading (not borrowing) deserializer is used because it can report
     // how much input is left. It never allocates more than the input holds,
     // so a hostile length prefix cannot cause a huge allocation.
     let mut de = rmp_serde::Deserializer::new(body);
-    de.set_max_depth(MAX_DEPTH);
+    // rmp-serde fails on the level where its countdown reaches zero, so one
+    // more lets exactly `MAX_DEPTH` levels through.
+    de.set_max_depth(MAX_DEPTH + 1);
     let value = T::deserialize(&mut de).map_err(|err| malformed(err.to_string()))?;
     let trailing = de.get_ref().len();
     if trailing > 0 {
@@ -118,6 +129,27 @@ pub(crate) fn decode_body<T: DeserializeOwned>(kind: u16, body: &[u8]) -> Result
         )));
     }
     Ok(value)
+}
+
+/// `text` made safe to log: control characters (line breaks, terminal escape
+/// codes) are escaped, and text past [`MAX_REASON_LEN`] bytes is cut off and
+/// marked with "…".
+fn log_safe(text: &str) -> String {
+    let mut safe = String::new();
+    for c in text.chars() {
+        let before = safe.len();
+        if c.is_control() {
+            safe.extend(c.escape_default());
+        } else {
+            safe.push(c);
+        }
+        if safe.len() > MAX_REASON_LEN {
+            safe.truncate(before);
+            safe.push('…');
+            break;
+        }
+    }
+    safe
 }
 
 fn check_clipboard(core: &CoreMessage) -> Result<(), ProtoError> {
@@ -239,6 +271,55 @@ mod tests {
     fn moderate_nesting_in_an_unknown_field_is_skipped() {
         let old: Old = decode_body(KIND_CORE, &nested_junk(MAX_DEPTH - 2)).expect("decodes");
         assert_eq!(old.seq, 1);
+    }
+
+    #[test]
+    fn exactly_max_depth_levels_are_accepted() {
+        // The outer map is one level, so `MAX_DEPTH - 1` arrays inside it
+        // make `MAX_DEPTH` levels: the most the crate docs promise.
+        let old: Old = decode_body(KIND_CORE, &nested_junk(MAX_DEPTH - 1)).expect("decodes");
+        assert_eq!(old.seq, 1);
+        assert!(matches!(
+            decode_body::<Old>(KIND_CORE, &nested_junk(MAX_DEPTH)),
+            Err(ProtoError::Decode { .. })
+        ));
+    }
+
+    /// `{"<variant>": {}}`: a core message with a made-up variant name.
+    fn core_message_named(variant: &str) -> Vec<u8> {
+        let len = u32::try_from(variant.len()).expect("test names are small");
+        let mut body = vec![0x81, 0xdb]; // one-entry map, then a str32 key
+        body.extend_from_slice(&len.to_be_bytes());
+        body.extend_from_slice(variant.as_bytes());
+        body.push(0x80); // its fields: an empty map
+        body
+    }
+
+    #[test]
+    fn decode_errors_quote_the_peer_briefly_and_without_control_characters() {
+        // The decoder's message quotes the unknown variant name, which comes
+        // from the peer: it must not be able to write a megabyte, a fake
+        // second log line or terminal escape codes into Hop's logs.
+        let long = "A".repeat(100_000);
+        for hostile in ["two\nlines \u{1b}[31mred\u{7}", long.as_str()] {
+            let result = decode_message(KIND_CORE, &core_message_named(hostile));
+            let Err(ProtoError::Decode { reason, .. }) = result else {
+                panic!("expected a decode error, got {result:?}");
+            };
+            assert!(reason.starts_with("unknown variant"), "{reason}");
+            assert!(
+                reason.len() <= MAX_REASON_LEN + '…'.len_utf8(),
+                "{} bytes",
+                reason.len()
+            );
+            assert!(!reason.chars().any(char::is_control), "{reason:?}");
+        }
+        let Err(ProtoError::Decode { reason, .. }) =
+            decode_message(KIND_CORE, &core_message_named("a\nb"))
+        else {
+            panic!("expected a decode error");
+        };
+        assert!(reason.contains(r"a\nb"), "escaped, not dropped: {reason}");
     }
 
     #[test]
