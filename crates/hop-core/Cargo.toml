@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 hop-types.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
