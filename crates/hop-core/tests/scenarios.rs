@@ -135,7 +135,10 @@ fn pushing_past_the_pc_left_edge_returns_to_the_mac() {
     sim.advance(5);
     assert_eq!(sim.state(PC), State::Idle);
     assert_eq!(sim.state(MAC), controlling(&sim, 1));
-    assert_eq!(sim.dev[PC].release_all, 1);
+    assert_eq!(
+        sim.dev[PC].release_all, 2,
+        "once as the session began, once as it ended"
+    );
     let leaves = sim.dev[PC].sent_matching(|m| matches!(m, CoreMessage::Leave { .. }));
     assert_eq!(leaves.len(), 1);
 
@@ -158,6 +161,58 @@ fn pushing_past_the_pc_left_edge_returns_to_the_mac() {
     assert_eq!(sim.state(MAC), controlling(&sim, 3));
 }
 
+/// Coming home with Shift held, then letting go of Shift and returning. The
+/// Mac's injector pressed Shift again for local apps, and must not still hold
+/// it afterwards.
+fn come_home_holding_shift(sim: &mut Sim) {
+    sim.key(MAC, KeyCode::LEFT_SHIFT, true);
+    cross_mac_to_pc(sim);
+    sim.motion(MAC, -2000.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), State::Idle);
+    assert!(sim.dev[MAC].injector_keys.contains(&KeyCode::LEFT_SHIFT));
+}
+
+/// Regression: the physical key-up of a modifier pressed again on the way
+/// home went straight to local apps and never reached the injector, which
+/// kept the modifier down and added it to the next session's keys.
+#[test]
+fn letting_go_of_a_modifier_pressed_again_at_home_releases_the_injector_too() {
+    let mut sim = Sim::mac_and_pc();
+    come_home_holding_shift(&mut sim);
+
+    sim.key(MAC, KeyCode::LEFT_SHIFT, false);
+    assert!(
+        sim.dev[MAC].injector_keys.is_empty(),
+        "the injector still holds {:?}",
+        sim.dev[MAC].injector_keys
+    );
+    assert_eq!(
+        sim.dev[MAC].injected_events().last(),
+        Some(&(key(KeyCode::LEFT_SHIFT, false), Os::MacOs))
+    );
+}
+
+/// The second line of defence: a device that becomes controlled first
+/// releases whatever its injector still holds, so nothing left over from an
+/// earlier session reaches the new one.
+#[test]
+fn becoming_controlled_first_releases_anything_still_injected() {
+    let mut sim = Sim::mac_and_pc();
+    come_home_holding_shift(&mut sim);
+
+    let releases_before = sim.dev[MAC].release_all;
+    sim.motion(PC, -4000.0, 0.0);
+    sim.settle();
+    assert!(
+        matches!(sim.state(MAC), State::Controlled { .. }),
+        "the PC should now control the Mac, but the Mac is {:?}",
+        sim.state(MAC)
+    );
+    assert_eq!(sim.dev[MAC].release_all, releases_before + 1);
+    assert!(sim.dev[MAC].injector_keys.is_empty());
+}
+
 #[test]
 fn moving_the_pc_trackpad_takes_control_back() {
     let mut sim = Sim::mac_and_pc();
@@ -173,7 +228,10 @@ fn moving_the_pc_trackpad_takes_control_back() {
     // ... but real motion takes control back, releasing the held A.
     sim.motion(PC, 1.0, 0.0);
     assert_eq!(sim.state(PC), State::Idle);
-    assert_eq!(sim.dev[PC].release_all, 1);
+    assert_eq!(
+        sim.dev[PC].release_all, 2,
+        "once as the session began, once as it ended"
+    );
     assert!(sim.dev[PC].remote_keys.is_empty());
     assert_eq!(
         sim.dev[PC].sent.last().map(|(_, m)| m.clone()),
@@ -405,7 +463,10 @@ fn an_ack_that_loses_the_race_with_the_enter_timeout_is_undone() {
     assert_eq!(sim.state(MAC), State::Idle);
     assert_eq!(sim.state(PC), State::Idle);
     assert!(ended(&sim, PC, EndReason::Released));
-    assert_eq!(sim.dev[PC].release_all, 1);
+    assert_eq!(
+        sim.dev[PC].release_all, 2,
+        "once as the session began, once as it ended"
+    );
     assert!(sim.dev[PC].remote_keys.is_empty());
 }
 
@@ -570,7 +631,10 @@ fn a_new_crossing_supersedes_a_session_whose_release_was_lost() {
     assert_eq!(sim.state(MAC), controlling(&sim, 3));
     assert_eq!(sim.state(PC), controlled(&sim, 3));
     assert!(ended(&sim, PC, EndReason::Superseded));
-    assert_eq!(sim.dev[PC].release_all, 1);
+    assert_eq!(
+        sim.dev[PC].release_all, 3,
+        "as session 1 began, as it was superseded, and as session 3 began"
+    );
     assert!(sim.dev[PC].remote_keys.is_empty());
 }
 
@@ -595,7 +659,10 @@ fn peer_timeout_mid_session_frees_both_sides() {
     assert_eq!(sim.state(MAC), State::Idle);
     assert_eq!(sim.state(PC), State::Idle);
     assert!(sim.now - t <= 1510);
-    assert_eq!(sim.dev[PC].release_all, 1);
+    assert_eq!(
+        sim.dev[PC].release_all, 2,
+        "once as the session began, once as it ended"
+    );
     assert!(ended(&sim, MAC, EndReason::PeerTimeout));
     assert!(ended(&sim, PC, EndReason::PeerTimeout));
     assert_eq!(sim.cursor(MAC), Point::new(1511.0, 491.0));
@@ -641,7 +708,10 @@ fn disconnect_mid_session_frees_both_sides() {
     sim.disconnect();
     assert_eq!(sim.state(MAC), State::Idle);
     assert_eq!(sim.state(PC), State::Idle);
-    assert_eq!(sim.dev[PC].release_all, 1);
+    assert_eq!(
+        sim.dev[PC].release_all, 2,
+        "once as the session began, once as it ended"
+    );
     assert_eq!(sim.dev[MAC].capture, CaptureMode::Passive);
     assert!(ended(&sim, MAC, EndReason::Disconnected));
     assert!(ended(&sim, PC, EndReason::Disconnected));
@@ -677,7 +747,10 @@ fn emergency_chord_ends_the_session_and_escape_is_not_forwarded() {
     assert!(ended(&sim, MAC, EndReason::EmergencyChord));
     sim.settle();
     assert_eq!(sim.state(PC), State::Idle);
-    assert_eq!(sim.dev[PC].release_all, 1);
+    assert_eq!(
+        sim.dev[PC].release_all, 2,
+        "once as the session began, once as it ended"
+    );
     let escape_seen = sim.dev[PC]
         .injected
         .iter()

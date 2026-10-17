@@ -127,6 +127,11 @@ pub struct Device {
     /// local injections (key-ups at a crossing, key-downs on the way back).
     pub os_keys: BTreeSet<KeyCode>,
     pub os_buttons: BTreeSet<MouseButton>,
+    /// Every key the runtime's injector holds down, whoever it was injected
+    /// for: added by an injected key-down, removed by its key-up or by
+    /// `ReleaseAllInjected`. A real injector adds held modifiers to every
+    /// later event, so a stale one would change what the user types.
+    pub injector_keys: BTreeSet<KeyCode>,
     pub release_all: usize,
     pub notices: Vec<Notice>,
     pub sent: Vec<(Millis, CoreMessage)>,
@@ -377,6 +382,7 @@ impl Sim {
                 physical_buttons: BTreeSet::new(),
                 os_keys: BTreeSet::new(),
                 os_buttons: BTreeSet::new(),
+                injector_keys: BTreeSet::new(),
                 release_all: 0,
                 notices: Vec::new(),
                 sent: Vec::new(),
@@ -769,6 +775,9 @@ impl Sim {
                 }
                 Action::Inject { event, source_os } => {
                     let dev = &mut self.dev[d];
+                    if let InputEvent::Key { code, pressed, .. } = *event {
+                        set_held(&mut dev.injector_keys, code, pressed);
+                    }
                     if *source_os == dev.os {
                         // The core's own keys for local apps: never buttons.
                         let InputEvent::Key { code, pressed, .. } = *event else {
@@ -800,6 +809,11 @@ impl Sim {
                     dev.release_all += 1;
                     dev.remote_keys.clear();
                     dev.remote_buttons.clear();
+                    // The injector sends a key-up for everything it holds,
+                    // including modifiers pressed again for local apps.
+                    for code in std::mem::take(&mut dev.injector_keys) {
+                        dev.os_keys.remove(&code);
+                    }
                 }
                 Action::Notify(notice) => self.dev[d].notices.push(notice.clone()),
             }
@@ -855,6 +869,21 @@ impl Sim {
             dev.os_buttons,
             dev.physical_keys,
             dev.physical_buttons,
+            ctx()
+        );
+
+        // The injector holds only keys of the current session, or keys the
+        // user is still physically holding here. Anything else would be
+        // added to later injected events (Cmd+Q instead of Q).
+        let allowed = if matches!(after, State::Controlled { .. }) {
+            &dev.remote_keys
+        } else {
+            &dev.physical_keys
+        };
+        assert!(
+            dev.injector_keys.is_subset(allowed),
+            "the injector still holds {:?} (allowed {allowed:?}), {}",
+            dev.injector_keys,
             ctx()
         );
 

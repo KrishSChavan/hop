@@ -111,7 +111,10 @@ pub enum Action {
         /// The OS whose keyboard produced the key codes.
         source_os: Os,
     },
-    /// Release every key and button the runtime injected for a peer.
+    /// Release every key and button the runtime injected. Emitted on every
+    /// exit from Controlled, and also when this device becomes controlled,
+    /// so nothing an earlier session left pressed carries over into the new
+    /// one.
     ReleaseAllInjected,
     /// Tell the user interface.
     Notify(Notice),
@@ -272,6 +275,12 @@ pub struct Core {
     held_keys: BTreeSet<KeyCode>,
     /// Mouse buttons physically held on this device, tracked in every state.
     held_buttons: BTreeSet<MouseButton>,
+    /// Modifiers pressed again for local apps when the cursor came home
+    /// (rule 7) whose physical key is still down. The injector remembers
+    /// them, so when the physical key comes up the core also releases the
+    /// injected copy; otherwise the injector would keep the modifier down
+    /// and add it to the next session's keys (Cmd+Q instead of Q).
+    repressed: BTreeSet<KeyCode>,
     /// The lowest `seq` the next `Enter` may use (see [`Core::new_seq`]).
     next_seq: u64,
     phase: Phase,
@@ -403,6 +412,7 @@ impl Core {
             peers: BTreeMap::new(),
             held_keys: BTreeSet::new(),
             held_buttons: BTreeSet::new(),
+            repressed: BTreeSet::new(),
             next_seq: 1,
             phase: Phase::idle(),
         }
@@ -733,6 +743,10 @@ impl Core {
             });
             return;
         };
+        // Start the session with nothing injected: a modifier pressed again
+        // on an earlier return must not leak into the peer's keys.
+        out.push(Action::ReleaseAllInjected);
+        self.repressed.clear();
         out.push(Action::MoveCursorTo { to: pos });
         // Only modifiers are pressed: they are all `held_keys` should carry,
         // and pressing arbitrary keys for a peer would be unsafe.
@@ -898,6 +912,7 @@ impl Core {
                     },
                     source_os: self.os,
                 });
+                self.repressed.insert(code);
             }
             out.push(Action::Notify(Notice::SessionEnded {
                 peer: link.peer,
@@ -941,6 +956,18 @@ impl Core {
                     self.held_keys.insert(code);
                 } else {
                     self.held_keys.remove(&code);
+                    if self.repressed.remove(&code) {
+                        // The physical key-up already reached local apps;
+                        // this one clears the injector's copy of the press.
+                        out.push(Action::Inject {
+                            event: InputEvent::Key {
+                                code,
+                                pressed: false,
+                                repeat: false,
+                            },
+                            source_os: self.os,
+                        });
+                    }
                 }
             }
             InputEvent::Button { button, pressed } => {
@@ -1049,6 +1076,9 @@ impl Core {
                 source_os: self.os,
             });
         }
+        // Those key-ups also cleared the injector's copy of any modifier
+        // pressed again on an earlier return.
+        self.repressed.clear();
         let departure = Departure {
             point: candidate.exit.inside_point(),
             display: candidate.exit.display,
