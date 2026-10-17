@@ -2,7 +2,14 @@
 
 One keyboard and mouse across a Mac and a Windows PC. Push the cursor past the screen edge and it continues on the other computer, and the keyboard follows. Copy text on one machine and paste it on the other with that machine's own shortcut. Drag files across to a Received folder.
 
-**Status:** M0, the foundation. There is no OS integration yet. See [docs/ROADMAP.md](docs/ROADMAP.md).
+**Status:** M0, the foundation, is done. The protocol, keymap, hand-off logic and configuration work and are tested, but Hop doesn't touch the OS yet (that's M1). See [docs/ROADMAP.md](docs/ROADMAP.md).
+
+## Try it
+
+```
+cargo run -p hop -- simulate      # a narrated Mac <-> PC session, fully simulated
+cargo run -p hop -- config show   # where the config lives and what's in it
+```
 
 ## Build and test
 

@@ -116,6 +116,23 @@ A session is identified by (controller id, `seq`). The controller picks a new, i
     - the controlled side emits `ReleaseAllInjected` and goes to Idle;
     - both notify the UI.
 
+### Details settled while building M0
+
+The rules above leave some cases open. `hop-core` decides them as follows, and its rustdoc on `Core` is the authoritative list.
+
+1. **Session numbers by parity.** Each device pair splits session numbers by parity: the device with the lower `DeviceId` uses odd numbers and the other uses even ones. Heartbeats carry only a `seq`, so without this two devices whose counters both started at 1 could keep each other's dead sessions alive ("ghost sessions").
+2. **Best-effort goodbyes.** When a session ends by enter timeout, peer timeout, buffer overflow or a lost tie-break, the controller still sends `Release` and the controlled side still sends `TakeBack`. The tie-break loser also sends `Release` for its own abandoned `Enter`.
+3. **Repeated `Enter`.** An `Enter` from the current session peer replaces the session (ended as "superseded"). A duplicate `Enter` only refreshes liveness. Any other device gets `Busy`.
+4. **Entering buffer.** More than 64 buffered events abandons the crossing, because dropping only some of them could lose a key-up. Consecutive motion and scroll events are merged, so normal mouse movement doesn't fill the buffer.
+5. **Edge disarm.** After a crossing or session that went out through an edge ends without the cursor coming back, that edge is disarmed until the cursor stops pushing against it. This prevents repeated crossings toward a busy or silent peer.
+6. **Heartbeat timing.** Motion datagrams don't count as "something sent" when deciding whether a heartbeat is due. The heartbeat interval is capped at a third of the peer timeout.
+7. **Layout first.** Within one `handle` call, layout changes are applied before timers fire, so a timeout never restores the cursor onto a display that was just unplugged.
+8. **No displays.** A device with no displays answers `Enter` with `EnterReject(Unavailable)`. A peer whose displays fail validation stays connected but can't be entered, and the UI gets a notice.
+9. **Entry inset.** The 1-unit inset is measured from the edge line: an entry through a right or bottom edge lands on the last column or row (x = 1511 on a 1512-wide screen), and one through a left or top edge lands 1 unit in.
+10. **Take-back threshold.** Measured as path length: the total distance the controlled device's own pointer moved since the session began.
+11. **Monitors on the controlled side.** On the controlled device, motion follows the cursor across touching displays of that device, and the exit is judged at the last display it passes. Without an exit, the cursor stops where an OS would put it.
+12. **`LocalInput.cursor`.** This is the position *before* the motion, and the core treats `cursor + delta` as where the motion tries to go. A macOS event tap reports the position after the motion, so the platform layer must pass the previous position.
+
 ### Invariants
 
 The core's tests check these:
@@ -192,7 +209,8 @@ Dragging a file across the edge sends it, and it lands in a "Hop Received" folde
   - capabilities, as a list of `{ name, version }`.
 
   The major version must match. The minor version and the capabilities negotiate down to what both sides support.
-- **Limits.** A stream frame is at most 1 MiB, a datagram at most 1200 bytes, and clipboard text at most 1 MiB. Oversized input is rejected, never truncated.
+- **Limits.** A stream frame body is at most 1 MiB + 64 KiB (room for 1 MiB of clipboard text plus its envelope). A whole datagram, kind included, is at most 1200 bytes. Clipboard text is at most 1 MiB of UTF-8. Oversized input is rejected, never truncated, and frames are rejected from their header before the body is buffered.
+- **Evolution rules.** The crate docs of `hop-proto` set the rules for changing messages: add fields only with defaults; never rename, remove or retype a field; send new enum variants only to peers that negotiated the capability that introduced them.
 
 ## Transport and security (M2)
 
@@ -217,7 +235,7 @@ TOML, at `~/Library/Application Support/Hop/config.toml` on macOS and `%APPDATA%
 - peers: name, id, OS, side, and an optional address;
 - input settings: edge delay, corner dead zone, pointer speed, take-back threshold, emergency chord;
 - keymap: `swap_cmd_ctrl`;
-- clipboard: enabled, size limit, never sync concealed items;
+- clipboard: enabled and size limit (password-manager items are never synced, and there is no setting for that);
 - the folder for received files;
 - the network port. The default 47800 is chosen to avoid Synergy/Deskflow's 24800.
 

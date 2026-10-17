@@ -2,10 +2,11 @@
 
 Each milestone ends with something you can try. Estimates assume Claude writes the code; the pace is mostly set by test sessions on the two laptops.
 
-## M0: Foundation (now)
+## M0: Foundation (done)
 
 - **Scope:** the workspace, shared types, wire protocol, keymap, the hand-off state machine (simulated, no OS access), configuration, CI, and docs.
 - **Done when:** `cargo test --workspace` passes on macOS and Windows, and a simulated two-device session crosses, types, takes back and times out correctly.
+- **Result:** 267 tests, including property tests over random two-device sessions. Try it with `cargo run -p hop -- simulate`.
 
 ## M1: Platform spikes on the real machines
 
@@ -65,6 +66,20 @@ Each milestone ends with something you can try. Estimates assume Claude writes t
   - a Windows installer that creates the firewall rule;
   - a diagnostics bundle (never containing clipboard contents).
 - **Done when:** Hop installs and works from a fresh user account on each OS, and survives sleep, wake and reboot.
+
+## Open questions from the M0 reviews
+
+Decide these when the milestone in brackets is built.
+
+- **[M3] A click resent after a loss.** If a click's packet is lost and resent, motion sent after it can arrive first, so the click lands late. Options: send motion reliably while a button is held, or have the receiver step back to the click's motion mark.
+- **[M3] Edge delay.** `edge_delay_ms` applies only to crossings from Idle; leaving the controlled device is immediate. Decide whether both directions should feel the same.
+- **[M3] Modifiers after other endings.** Held modifiers come back locally only when the cursor returns through the edge. After a take-back or timeout, a still-held Shift stops working until it is pressed again (lost, never stuck).
+- **[M3] Take-back sensitivity.** The take-back threshold adds up over the whole session, so small bumps of the controlled laptop's trackpad can add up. A short time window would be more forgiving.
+- **[M3] Corner dead zones between monitors.** Where two displays continue one edge, the dead zones leave a 20-unit band in the middle. That is what the spec says, but it may feel odd.
+- **[M2] Display changes.** Peers are not told when a device's displays change until they reconnect. Add a message for it.
+- **[M2] Peer addresses.** Decide whether `peers.address` is a host or `host:port`.
+- **[M6] Saving the config.** Saving drops comments and unknown keys. Keep them (`toml_edit`) once the settings UI writes the file.
+- **[M2] Unknown values.** An unknown value (for example a future `os = "android"`) fails the whole config load, unlike unknown keys, which only warn.
 
 ## Later
 
