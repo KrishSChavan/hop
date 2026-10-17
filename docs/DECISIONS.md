@@ -26,7 +26,8 @@
 
 ## Constraints
 
-- **Work Mac.** The Mac is managed by the user's employer. Hop's input capture, injection and clipboard sync must not run on it until the user confirms IT has approved it. Writing and compiling code on it is fine.
+- **Work Mac.** The Mac is managed by the user's employer. On 2026-10-17 the user confirmed their IT department has approved running Hop on it. Keep Hop transparent there: no hidden capture, nothing logged.
+- **The PC.** The Windows laptop is the user's personal machine (confirmed 2026-10-17).
 - **GitHub.** The GitHub CLI on the Mac is signed into the employer's GitHub Enterprise. Hop's repository belongs on the user's personal github.com account, which the user connects.
 - **Apple signing.** Mac builds are signed with the user's personal Apple Development identity, so macOS permission grants survive rebuilds. No paid programs are needed for personal use.
 

@@ -24,8 +24,9 @@ cargo test --workspace
 
 ## Rules
 
-- **The Mac is the user's employer-managed work laptop.** Do not run anything that captures or injects input, reads the clipboard, or syncs data to the other machine on it until the user confirms their IT department has approved it. Writing and compiling code on it is fine.
-- **The PC.** Before the first run of input capture or injection on the PC, confirm with the user that it is their personal machine.
+- **The Mac is the user's employer-managed work laptop.** Their IT department approved running Hop on it (2026-10-17). Keep Hop transparent there: no hidden capture, nothing logged.
+- **The PC is the user's personal machine** (confirmed 2026-10-17).
+- **Tell the user before input moves.** Before running anything that moves the cursor, types, or blocks the mouse and keyboard, tell the user what will happen and for how long, so they're not surprised mid-task.
 - **No secrets in logs.** Never log keystrokes, clipboard contents or file contents, even in debug builds.
 - **Fail open.** Any error, timeout or disconnect must return both machines to local control and release every key and button Hop pressed.
 - **OS code stays in `hop-platform`.** It is the only crate that calls OS APIs. Every other crate is pure, portable Rust with `#![forbid(unsafe_code)]`.

@@ -1,0 +1,14 @@
+[package]
+name = "hop-selftest"
+description = "Hop's guided self-test of the platform layer, and a Wi-Fi latency probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hop-core.workspace = true
+hop-keymap.workspace = true
+hop-platform.workspace = true
+hop-types.workspace = true
+thiserror.workspace = true

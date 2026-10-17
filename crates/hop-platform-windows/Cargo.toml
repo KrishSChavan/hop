@@ -1,0 +1,16 @@
+[package]
+name = "hop-platform-windows"
+description = "Hop's Windows backend: low-level hooks, Raw Input, SendInput, cursor control, displays, a Win32 test window"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hop-keymap.workspace = true
+hop-platform.workspace = true
+hop-types.workspace = true
+
+# The OS bindings exist only on Windows; elsewhere this crate is empty.
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
