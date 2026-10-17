@@ -1,15 +1,23 @@
 name: CI
 
+# Windows runs on every push. macOS is tested locally on each change, and
+# private repos bill macOS runner minutes at 10x, so it runs only on demand.
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Also run on macOS
+        type: boolean
+        default: true
 
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        os: ${{ github.event_name == 'workflow_dispatch' && inputs.macos && fromJSON('["windows-latest","macos-latest"]') || fromJSON('["windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
