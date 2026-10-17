@@ -12,11 +12,48 @@ hop-platform.workspace = true
 hop-types.workspace = true
 
 # The OS bindings exist only on macOS; elsewhere this crate is empty.
+#
+# The workspace takes these crates with their default features, which already
+# include everything below. The features this crate relies on are still listed,
+# so the build keeps working if the workspace ever trims the defaults.
 [target.'cfg(target_os = "macos")'.dependencies]
-dispatch2.workspace = true
-objc2.workspace = true
-objc2-app-kit.workspace = true
-objc2-application-services.workspace = true
-objc2-core-foundation.workspace = true
-objc2-core-graphics.workspace = true
-objc2-foundation.workspace = true
+dispatch2 = { workspace = true, features = ["std", "objc2"] }
+objc2 = { workspace = true, features = ["std"] }
+objc2-app-kit = { workspace = true, features = [
+    "std",
+    "NSApplication",
+    "NSButton",
+    "NSControl",
+    "NSEvent",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSText",
+    "NSTextField",
+    "NSView",
+    "NSWindow",
+] }
+objc2-application-services = { workspace = true, features = ["std", "HIServices", "AXUIElement"] }
+objc2-core-foundation = { workspace = true, features = [
+    "std",
+    "CFCGTypes",
+    "CFDate",
+    "CFDictionary",
+    "CFMachPort",
+    "CFNumber",
+    "CFRunLoop",
+    "CFString",
+] }
+objc2-core-graphics = { workspace = true, features = [
+    "std",
+    "libc",
+    "CGDirectDisplay",
+    "CGDisplayConfiguration",
+    "CGError",
+    "CGEvent",
+    "CGEventSource",
+    "CGEventTypes",
+    "CGRemoteOperation",
+] }
+objc2-foundation = { workspace = true, features = ["std", "NSDate", "NSGeometry", "NSObject", "NSProcessInfo", "NSString"] }
