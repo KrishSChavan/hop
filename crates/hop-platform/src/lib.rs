@@ -115,6 +115,12 @@ pub trait InputCapture: Send {
     /// `Passive` is permanent. `Suppress` lasts [`SUPPRESS_LEASE`] and is
     /// renewed by calling this again; when it lapses the backend returns to
     /// `Passive` and shows and frees the cursor by itself.
+    ///
+    /// A lapse means something in Hop stalled, and the cursor has already
+    /// been given back. Before renewing, the runtime checks
+    /// [`InputCapture::mode`]: if it reads `Passive` while the core still
+    /// believes it is controlling a peer, the runtime ends that session
+    /// instead of starting a new lease.
     fn set_mode(&mut self, mode: CaptureMode) -> Result<()>;
     /// The mode in effect now, after any lapse.
     fn mode(&self) -> CaptureMode;
@@ -139,8 +145,13 @@ pub trait InputInjector: Send {
 /// Hides and restores the local cursor while we control a peer.
 pub trait CursorControl: Send {
     fn position(&self) -> Result<Point>;
-    /// Hide the cursor and pin it so it can't drift toward an edge; relative
-    /// motion keeps arriving through capture.
+    /// Hide the cursor and pin it so it can't drift toward an edge, whatever
+    /// the capture mode; relative motion keeps arriving through capture.
+    ///
+    /// The core always parks together with [`CaptureMode::Suppress`]. The
+    /// backend gives a parked cursor back by itself when that lease lapses
+    /// and when the cursor control is dropped. The Windows backend also
+    /// frees a park that no lease has covered for 5 seconds.
     fn park(&mut self) -> Result<()>;
     /// Show the cursor again at `at`.
     fn restore(&mut self, at: Point) -> Result<()>;

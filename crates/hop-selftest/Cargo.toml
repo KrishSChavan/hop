@@ -8,7 +8,11 @@ publish.workspace = true
 
 [dependencies]
 hop-core.workspace = true
-hop-keymap.workspace = true
 hop-platform.workspace = true
 hop-types.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Cross-checks the typing helper against Hop's key table, and that both
+# OSes have a code for every key the self-test types.
+hop-keymap.workspace = true
