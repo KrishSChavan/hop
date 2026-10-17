@@ -297,6 +297,10 @@ dependencies = [
  "hop-config",
  "hop-core",
  "hop-keymap",
+ "hop-platform",
+ "hop-platform-macos",
+ "hop-platform-windows",
+ "hop-selftest",
  "hop-types",
  "toml",
 ]

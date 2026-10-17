@@ -12,5 +12,13 @@ clap.workspace = true
 hop-config.workspace = true
 hop-core.workspace = true
 hop-keymap.workspace = true
+hop-platform.workspace = true
+hop-selftest.workspace = true
 hop-types.workspace = true
 toml.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+hop-platform-macos.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+hop-platform-windows.workspace = true
