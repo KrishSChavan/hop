@@ -1,0 +1,46 @@
+# Hop configuration for Krish's MacBook, with the Windows PC to its right.
+#
+# On the Mac this file lives at ~/Library/Application Support/Hop/config.toml,
+# on Windows at %APPDATA%\Hop\config.toml. Every setting below shows its
+# default, so any of them can be left out. Hop skips settings it does not
+# know and warns about them.
+
+[device]
+# The name the PC shows for this Mac.
+name = "Krish's MacBook"
+# Made by Hop on first run: 16 random bytes as hex. The PC's config lists it as
+# its peer's id. From M2 on, the fingerprint of this Mac's key replaces it.
+id = "5f0c9a1e7b3d4c2a8e6f1b9d0a7c3e52"
+
+# One [[peers]] entry per other computer, and at most one on each side.
+[[peers]]
+name = "Windows PC"
+# The device.id from the PC's own config file.
+id = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d0"
+os = "windows"  # macos, windows or linux
+side = "right"  # left, right, above or below
+# A fixed address, in case Hop cannot find the PC on the network (from M2):
+# address = "192.168.1.42"
+
+[input]
+edge_delay_ms = 0        # how long to push against the edge before crossing, in ms (0 to 2000)
+corner_dead_zone = 10    # units at each end of the edge that never cross (0 to 200)
+pointer_speed = 1.0      # speed of cursor motion arriving from the PC (0.1 to 5.0)
+takeback_threshold = 4   # how far to move this Mac's own mouse to take control back (0 to 100)
+# Pressed together on the controlling computer, these keys end a session at once.
+emergency_chord = ["ControlLeft", "AltLeft", "ShiftLeft", "Escape"]
+
+[keymap]
+swap_cmd_ctrl = true  # Cmd+C typed here arrives on the PC as Ctrl+C, and the other way round
+
+[clipboard]
+enabled = true
+max_text_bytes = 1048576  # 1 MiB, the most the protocol carries (1 to 1048576)
+# Passwords copied from a password manager are never sent. There is no setting for that.
+
+[transfer]
+# When unset, files from the PC go to ~/Downloads/Hop Received.
+# received_dir = "/Users/krish/Documents/From the PC"
+
+[network]
+port = 47800  # 1024 to 65535
