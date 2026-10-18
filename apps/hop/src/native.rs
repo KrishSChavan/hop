@@ -25,3 +25,22 @@ mod unsupported {
         f()
     }
 }
+
+/// Keeps macOS from throttling Hop's timers (App Nap) while the agent runs:
+/// its 10 ms tick renews the input lease and sends heartbeats. Hold the
+/// returned guard on the main thread for as long as Hop runs. Elsewhere
+/// there is nothing to hold (the Windows backend opts out of power
+/// throttling when capture starts).
+#[cfg(target_os = "macos")]
+pub fn stay_responsive() -> hop_platform_macos::AppNapExemption {
+    hop_platform_macos::AppNapExemption::begin("Hop is sharing this Mac's keyboard and mouse")
+}
+
+/// Nothing to hold outside macOS.
+#[cfg(not(target_os = "macos"))]
+pub struct Responsive;
+
+#[cfg(not(target_os = "macos"))]
+pub fn stay_responsive() -> Responsive {
+    Responsive
+}

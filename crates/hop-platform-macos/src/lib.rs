@@ -45,6 +45,7 @@
 #![cfg(target_os = "macos")]
 #![warn(missing_docs)]
 
+mod activity;
 mod capture;
 mod convert;
 mod cursor;
@@ -56,6 +57,7 @@ mod permissions;
 mod shared;
 mod ui;
 
+pub use activity::AppNapExemption;
 pub use ui::{open_test_window, run_with_ui};
 
 use hop_platform::{Platform, Result};

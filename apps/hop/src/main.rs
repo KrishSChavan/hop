@@ -1,14 +1,21 @@
 //! The Hop agent.
 //!
-//! Until the network link lands (milestone M2), it can play a simulated
-//! session, check this computer's platform layer with a guided self-test,
-//! measure the network round trip to the other computer, and show the
-//! configuration.
+//! - `hop run` shares this computer's keyboard and mouse with the paired
+//!   computer (the agent: see the `agent` module).
+//! - `hop pair` pairs the two computers once, with a one-time code.
+//! - `hop simulate`, `selftest`, `displays`, `permissions`, `latency` and
+//!   `config` play a simulated session, check this computer's platform layer,
+//!   measure the network round trip and show the configuration.
 
 #![forbid(unsafe_code)]
 
+mod agent;
+mod logging;
 mod native;
+mod pair;
+mod paths;
 mod simulate;
+mod startup;
 
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -36,6 +43,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Share this computer's keyboard and mouse with the paired computer
+    /// until stopped with Ctrl+C. On the Mac, start it with
+    /// scripts/macos/run-agent.sh, so it runs as Hop.app.
+    Run,
+    /// Pair with the other computer, once. Run "hop pair" in a terminal on
+    /// one computer to show a code, then "hop pair CODE" on the other.
+    Pair {
+        /// The code the other computer shows. Leave it out to show a code
+        /// here instead.
+        code: Vec<String>,
+        /// The other computer's address (an IP address or host name, with
+        /// an optional :port) when it cannot be found on the network by
+        /// itself.
+        #[arg(long)]
+        address: Option<String>,
+    },
     /// Play a simulated session between a Mac and a Windows PC. Nothing
     /// touches this computer: input, cursors and the network are simulated.
     Simulate,
@@ -109,6 +132,11 @@ enum ConfigAction {
 
 fn main() -> Result<ExitCode> {
     match Cli::parse().command {
+        Command::Run => {
+            let _awake = native::stay_responsive();
+            native::run_with_ui(agent::start::main)
+        }
+        Command::Pair { code, address } => pair::run(&code, address.as_deref()),
         Command::Simulate => {
             simulate::run(true);
             Ok(ExitCode::SUCCESS)
