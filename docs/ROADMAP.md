@@ -84,9 +84,21 @@ Follow-ups:
 
 ## M6: App shell
 
+**Status (2026-10-18):** the first part, the app, is built and reviewed (see [M6-APP.md](M6-APP.md)), with 677 tests across the workspace; it has not yet run on the two laptops. One window on each computer pairs the two, says where the other computer sits, starts and stops sharing, and shows what is happening. A GitHub Release carries `Hop-macOS.zip` and `Hop-Windows.zip`: `scripts/macos/release.sh` builds the Mac zip and publishes the release, and the Release workflow adds the Windows zip. [INSTALL.md](INSTALL.md) walks the user through the first run on each computer.
+
+Left for M6:
+- the menu-bar and tray icon;
+- launch at login;
+- a Windows installer that creates the firewall rule;
+- signing Hop.exe and notarizing Hop.app (Smart App Control, when it is on, blocks the unsigned Hop.exe);
+- the quit sequence when Windows signs out or shuts down: the app needs to catch the window's end-session messages (today the Mac takes back its input after its 1.5 s timeout);
+- a diagnostics bundle;
+- renaming the computer, and the other settings, in the app;
+- the "done when" check below.
+
 - **Scope:**
   - menu-bar and tray UI;
-  - a settings window for pairing, permission status and screen layout;
+  - a settings window for pairing, permission status and screen layout (built: the app);
   - launch at login;
   - a Windows installer that creates the firewall rule;
   - a diagnostics bundle (never containing clipboard contents).
@@ -103,7 +115,7 @@ Decide these when the milestone in brackets is built.
 - **[M3] Corner dead zones between monitors.** Where two displays continue one edge, the dead zones leave a 20-unit band in the middle. That is what the spec says, but it may feel odd.
 - **[M2] Display changes.** Peers are not told when a device's displays change until they reconnect. Add a message for it.
 - **[M2] Peer addresses.** Decide whether `peers.address` is a host or `host:port`.
-- **[M6] Saving the config.** Saving drops comments and unknown keys. Keep them (`toml_edit`) once the settings UI writes the file.
+- **[M6] Saving the config.** Saving drops comments and unknown keys. Keep them (`toml_edit`) now that the app writes the file (Where is it?, Address, Forget… and pairing).
 - **[M2] Unknown values.** An unknown value (for example a future `os = "android"`) fails the whole config load, unlike unknown keys, which only warn.
 
 ## Later

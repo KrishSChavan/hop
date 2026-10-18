@@ -196,8 +196,8 @@ How events reach the core:
 - When the network queue is full, that connection is closed with `OVERLOADED`, since a reliable message must never be dropped. A `Motion` datagram that does not fit is simply dropped.
 - The core waits on both queues with a timeout, so a `Tick` runs every 10 ms even when nothing arrives, and ticks never queue behind events.
 
-On macOS, `hop run` runs inside Hop.app (launched with `open`), so Accessibility and Local Network belong to Hop. The app's main thread runs AppKit's event loop (`run_with_ui`) for the UI that comes later, and the core thread is `run_with_ui`'s worker.
-- Hop.app has no window, so macOS App Nap would throttle its timers (the 10 ms tick, the lease, QUIC) and could slow its event tap. While it runs, the agent holds an `NSProcessInfo` activity (user-initiated, latency-critical, allowing idle sleep) through `hop-platform-macos`.
+On macOS, `hop run` runs inside Hop.app (launched with `open`), so Accessibility and Local Network belong to Hop. Its main thread runs AppKit's event loop (`run_with_ui`), and the core thread is `run_with_ui`'s worker. In the app (docs/M6-APP.md), the window's event loop has the main thread and the core thread is the `hop-agent` thread.
+- `hop run` has no window, and the app's window may be hidden, so macOS App Nap would throttle Hop's timers (the 10 ms tick, the lease, QUIC) and could slow its event tap. While sharing, `hop run` and the app hold an `NSProcessInfo` activity (user-initiated, latency-critical, allowing idle sleep) through `hop-platform-macos`.
 - On the PC, check that a background `hop run` keeps its tick on time. If Windows power throttling slows it, opt out with `SetProcessInformation` through `hop-platform-windows`.
 
 Fail-open duties of the agent:
@@ -224,7 +224,7 @@ Fail-open duties of the agent:
 - **Panics.** Any panic on any thread is fatal, including one the platform layer catches. The build keeps `panic = "unwind"` (the default), because failing open relies on unwinding.
   - The core thread owns the `Platform`, so unwinding drops it: capture stops and gives the cursor back, and the injector releases what it holds. `run_with_ui` then re-raises the panic on the main thread and the process exits.
   - After a panic elsewhere (a network task, the mDNS daemon), the panic hook asks the core thread to quit as above.
-  - The hook logs the thread and the location, plus the message only when it is a fixed string, since a formatted one could quote input. It never blocks.
+  - The hook logs the thread and the location, plus the message only when it is a fixed string, since a formatted one could quote input. It never blocks, with one exception: in the app, a panic on the main thread waits up to 3 s for sharing to stop, because a panic there may abort without unwinding (AppKit calls the window's code through functions a panic cannot unwind out of). The agent never waits for the main thread, so this cannot deadlock.
 - **What is left.** If Hop is killed or aborts, the OS removes its event tap or hooks. The peer's core times out within 1.5 s and releases what it injected. Keys that this laptop had injected for the peer, however, stay down until they are pressed again. A watchdog process for that comes later.
 - **Logs.** Write to `~/Library/Logs/Hop/hop.log` and `%LOCALAPPDATA%\Hop\Logs\hop.log`.
   - What goes in: connections, sessions and errors, and fingerprints, which are public.

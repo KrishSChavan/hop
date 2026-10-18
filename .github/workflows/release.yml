@@ -1,0 +1,56 @@
+name: Release
+
+# Builds Hop.exe for a GitHub Release and adds Hop-Windows.zip to it.
+# scripts/macos/release.sh publishes the release from the Mac, with
+# Hop-macOS.zip, and publishing starts this. To rebuild the Windows zip of a
+# release, run this by hand with the release's tag.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release's tag, for example v0.1.0
+        type: string
+        required: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      # To add the zip to the release.
+      contents: write
+    env:
+      # The published release's tag, or the one given by hand. The script
+      # below reads it from the environment instead of having it pasted in.
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+          # The job's token can change the release. Keep it out of the
+          # checkout's git settings, where the build scripts of the crates
+          # cargo downloads could read it; only the upload step gets it.
+          persist-credentials: false
+      # rustup on the runner installs the toolchain pinned in rust-toolchain.toml.
+      - uses: Swatinem/rust-cache@v2
+      # The C runtime goes inside Hop.exe (crt-static), so it runs on a PC
+      # without the Visual C++ Redistributable (VCRUNTIME140.dll). Naming
+      # the target keeps the flag off build scripts and proc macros.
+      - name: Build Hop.exe
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked -p hop-app --target x86_64-pc-windows-msvc
+      - name: Zip Hop.exe and add it to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/hop-app.exe dist/Hop.exe
+          Copy-Item packaging/windows/README.txt dist/README.txt
+          Compress-Archive -Path dist/* -DestinationPath Hop-Windows.zip -Force
+          $sha256 = (Get-FileHash Hop-Windows.zip -Algorithm SHA256).Hash.ToLower()
+          Write-Output "SHA-256 of Hop-Windows.zip: $sha256"
+          gh release upload $env:TAG Hop-Windows.zip --clobber --repo ${{ github.repository }}

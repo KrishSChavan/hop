@@ -6,7 +6,10 @@
 # so macOS treats Hop itself as the app that uses Accessibility and Local
 # Network; run from Terminal, it would borrow Terminal's permissions. Build
 # the app first with scripts/macos/make-app.sh, and pair the two computers
-# first (in Terminal: "<target>/Hop.app/Contents/MacOS/hop" pair).
+# first (in the app's window, or in Terminal:
+# "<target>/Hop.app/Contents/MacOS/hop" pair). The app hands a first
+# argument that names a `hop` command, such as `run`, to the command line,
+# so `open ... --args run` runs the agent instead of opening the window.
 #
 # WARNING: while Hop runs, pushing the cursor past the screen edge facing
 # the other computer moves this Mac's keyboard and mouse over to it. Only
@@ -16,8 +19,8 @@
 #
 # Press Ctrl+C here to stop Hop: the script asks Hop to quit (SIGTERM), and
 # Hop gives the keyboard and mouse back before it exits. Closing this
-# Terminal window stops Hop the same way. The script also turns macOS App
-# Nap off for Hop (see below).
+# Terminal window stops Hop the same way. While it runs, Hop itself keeps
+# macOS App Nap from slowing it down.
 #
 # Hop's own log is ~/Library/Logs/Hop/hop.log. Its stdout (one status line
 # per connection or session change, shown here as it happens) goes to

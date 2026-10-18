@@ -4,7 +4,10 @@
 # Hop is launched through LaunchServices (`open`), not run from this shell,
 # so macOS treats Hop itself as the app asking for permissions; run from
 # Terminal, it would borrow Terminal's. Build the app first with
-# scripts/macos/make-app.sh.
+# scripts/macos/make-app.sh. The app hands a first argument that names a
+# `hop` command, such as `selftest`, to the command line, so
+# `open ... --args selftest` runs the self-test instead of opening the
+# app's window.
 #
 # WARNING: the self-test moves the cursor, clicks and types (inside its own
 # window) and may show macOS permission prompts. Only run it with the user

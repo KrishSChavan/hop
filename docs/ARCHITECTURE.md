@@ -20,19 +20,23 @@ Hop shares one keyboard and mouse between a Mac and a Windows laptop on the same
 | `hop-core` | Hand-off state machine, screen layout and edge mapping |
 | `hop-config` | TOML configuration |
 | `hop-platform` | OS traits, plus the macOS and Windows implementations (M1) |
-| `apps/hop` | The agent binary (a CLI for now; the menu-bar/tray app later) |
+| `hop-net` | QUIC link with pinned keys, pairing with a one-time code, mDNS discovery (M2) |
+| `hop-selftest` | The guided platform self-test and the latency probe (M1) |
+| `hop-agent` | The agent (core thread, platform and network wiring), the pairing flow, settings, the log, and the `hop` command line; shared by both apps (M6) |
+| `apps/hop` | The `hop` command line |
+| `apps/hop-app` | The app: one window (eframe/egui) to pair, set where the other computer is, and start and stop sharing (M6, see [M6-APP.md](M6-APP.md)) |
 
-Planned: `hop-net` (QUIC transport, pairing, discovery; M2), `hop-control` (local control API; M2), `hop-transfer` (file transfer; M5), `apps/hopctl` (CLI client), and the Tauri settings window (M6).
+Planned: `hop-control` (local control API), `hop-transfer` (file transfer; M5), `apps/hopctl` (CLI client), and the menu-bar and tray icon (M6).
 
 ## Process model
 
-**macOS:** one signed `.app` with `LSUIElement` set (menu bar only, no Dock icon).
-- Main thread: AppKit work, such as the status item, windows and pasteboard polling.
+**macOS:** one signed `.app`. Its Info.plist sets `LSUIElement`, so the `hop` commands that scripts start through LaunchServices show no Dock icon. The app's window asks for a regular app (Dock icon, app menu) while it is open.
+- Main thread: AppKit work: the app's window (winit and egui), and later the status item and pasteboard polling.
 - Input thread: a `CGEventTap` on its own `CFRunLoop`, plus event injection and cursor park/hide.
 - An async runtime: networking, the control API and file I/O.
 
-**Windows:** one tray executable that never runs elevated.
-- Main thread: tray and UI.
+**Windows:** one windowed executable (`Hop.exe`, the tray icon later) that never runs elevated.
+- Main thread: the window (winit and egui), and later the tray.
 - Hook thread: `WH_MOUSE_LL` and `WH_KEYBOARD_LL` with a message loop. Callbacks only enqueue, so they stay far below the 1000 ms hook timeout.
 - An injection thread.
 - An OLE/clipboard thread (STA).
