@@ -584,6 +584,12 @@ fn suppression(s: &mut Session, r: &mut StepReport) -> Result<Outcome, StepError
         .position()
         .doing("reading the cursor position")?;
     s.discard();
+    // The cursor has just disappeared, so nothing on screen says to move
+    // the mouse: both first runs on real hardware failed here by waiting.
+    s.update(
+        StepId::Suppression,
+        "Move the mouse now, and keep moving it until Hop says stop.",
+    );
     let drift = largest_drift(s, start, s.timing.suppress)?;
     let mut tally = Tally::default();
     tally.add_all(&s.drain());
@@ -714,6 +720,10 @@ fn park(s: &mut Session, r: &mut StepReport) -> Result<Outcome, StepError> {
         .position()
         .doing("reading the hidden cursor's position")?;
     s.discard();
+    s.update(
+        StepId::Park,
+        "The cursor is hidden: move the mouse a little now.",
+    );
     let drift = largest_drift(s, pinned, s.timing.park)?;
     let mut tally = Tally::default();
     tally.add_all(&s.drain());
