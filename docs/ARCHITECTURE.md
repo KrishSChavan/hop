@@ -218,6 +218,8 @@ Dragging a file across the edge sends it, and it lands in a "Hop Received" folde
 - **Pairing.** Each device has a long-term key. Devices pair once with a one-time code (SPAKE2), then pin each other's keys. There is no plaintext mode.
 - **Discovery.** mDNS, with a manual-address fallback.
 - **Wi-Fi.** On Wi-Fi (the only network here), the receiver smooths motion and the UI shows latency.
+- **Ports.** UDP 47800 carries sessions. Pairing runs as its own process (`hop pair`) on its own listener, UDP 47801, and only while pairing. `hop latency` uses UDP 47802.
+- **Full design.** The details, including the security review that shaped them, are in [M2-DESIGN.md](M2-DESIGN.md).
 
 ## Control API and extensions (M2 and later)
 

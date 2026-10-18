@@ -19,4 +19,7 @@ Do this once on the PC. Claude Code on the PC builds and tests the Windows side 
    ```
    In `gh auth login`, choose GitHub.com, HTTPS, Yes to authenticate Git, and "Login with a web browser". Every test should pass.
 5. **Smart App Control.** Open Windows Security → App & browser control → Smart App Control and note whether it says On, Evaluation or Off. Tell Claude. When it is On, Windows can block programs that aren't signed, which affects how we run test builds.
-6. **Firewall (from M2 on).** The first time Hop listens on the network, Windows asks whether to allow it. Pick **Private networks** and click **Allow**, as an administrator. If you click Cancel, Windows silently blocks Hop until the rule is fixed.
+6. **Home network and firewall (from M2 on).**
+   - First make sure Windows treats your home Wi-Fi as private: Settings → Network & internet → Wi-Fi → your network → Network profile type → **Private**. On a Public network, Windows blocks the other laptop from reaching Hop.
+   - The first time Hop listens on the network (`hop run` or `hop pair`), Windows asks whether to allow it. Pick **Private networks** and click **Allow**, as an administrator. If you click Cancel, Windows silently blocks Hop until the rule is fixed.
+   - Hop uses UDP port 47800 for the link, 47801 only while pairing, and 47802 for `hop latency`.

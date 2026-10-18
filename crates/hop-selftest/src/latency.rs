@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The UDP port the latency probe uses unless told otherwise, next to Hop's
 /// own 47800.
-pub const DEFAULT_LATENCY_PORT: u16 = 47801;
+pub const DEFAULT_LATENCY_PORT: u16 = 47802;
 
 /// A reply slower than this counts as lost: for moving a cursor it is as
 /// good as lost anyway. The probe also waits this long after its last packet.

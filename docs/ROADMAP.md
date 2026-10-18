@@ -33,6 +33,20 @@ Lessons from the first runs on the Mac:
 
 ## M2: The link
 
+**Status (2026-10-18):** built and tested on loopback; not yet run between the real laptops. It contains:
+- `hop-net`: identity, mutually pinned QUIC with Ed25519 and no resumption, SPAKE2 pairing bound to the TLS session, and mDNS discovery;
+- `hop run`, `hop pair` and `scripts/macos/run-agent.sh`;
+- 568 tests across the workspace.
+
+The design was security-reviewed before implementation (see [M2-DESIGN.md](M2-DESIGN.md)).
+
+Follow-ups:
+- `hop unpair`.
+- The agent checks macOS Secure Input, so keys meant for the PC don't go to a focused password field.
+- Peers learn about display changes without reconnecting.
+- The device key moves to the Keychain and Credential Manager.
+- A byte budget for peer messages, before M4.
+
 - **Scope:**
   - QUIC transport with pinned keys;
   - pairing with a one-time code;

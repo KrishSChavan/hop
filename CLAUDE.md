@@ -19,7 +19,8 @@ cargo test --workspace
 
 - The toolchain is pinned in `rust-toolchain.toml`.
 - On the Mac, rustup is Homebrew's keg-only build: put `/opt/homebrew/opt/rustup/bin` on PATH first.
-- To type-check Windows code from the Mac: `cargo check --workspace --target x86_64-pc-windows-msvc`.
+- To type-check and lint Windows code from the Mac, run `scripts/dev/check-windows.sh`. A plain `cargo check --target x86_64-pc-windows-msvc` fails there, because ring, under hop-net's TLS, needs the script's stub C headers on a Mac.
+- On the Mac, run the self-test with `scripts/macos/run-selftest.sh` and the agent with `scripts/macos/run-agent.sh`. Run `hop pair` from Terminal (`target/release/hop pair`), so the code shows there.
 - CI runs on Windows for every push. macOS CI runs only when triggered by hand, because private repos bill macOS minutes at 10x.
 
 ## Rules
