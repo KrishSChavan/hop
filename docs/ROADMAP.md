@@ -10,13 +10,16 @@ Each milestone ends with something you can try. Estimates assume Claude writes t
 
 ## M1: Platform spikes on the real machines
 
-**Status (2026-10-18):** the macOS half is done. All 7 self-test steps pass on the user's Mac (macOS 26.6.2), and the Rust approach is a go there. The Windows half waits for the self-test on the PC; its code passes CI on Windows but has not yet run on real hardware.
+**Status (2026-10-18):** both platform halves are done, and the Rust approach is a go on both. All 7 self-test steps pass on the user's Mac (macOS 26.6.2) and on the PC (Windows 11 Home, build 26200: a 150% laptop screen beside a 100% external one, and a 1000 Hz Razer mouse). On the PC, `cargo test --workspace` also passes (551 tests).
 
 Lessons from the first runs on the Mac:
 - Never point Hop's output into a folder macOS protects (Desktop, Documents, Downloads). Hop has no access there, so LaunchServices refused to start it at all, with error -10810. Logs go to `~/Library/Logs/Hop`.
 - An accessory (menu-bar-only) app needs a main menu with the Edit commands, or text fields ignore Cmd+A, Cmd+C and Cmd+V.
 - Signing every build with the one personal identity keeps the Accessibility grant across rebuilds.
 - A self-test the user follows must wait for them before each step, not run on a timer.
+
+Lessons from the first run on the PC:
+- Step 5 failed once only because the mouse was still during its 3 seconds: the cursor is hidden then, so nothing shows when to move it. It passed when rerun with the mouse moving (`hop selftest --steps 5`).
 
 - **Windows (on the PC):**
   - low-level mouse and keyboard hooks on a dedicated thread, with a watchdog;
