@@ -46,11 +46,32 @@ fi
 : > "$LOG"
 : > "$ERR_LOG"
 
-echo "==> Running the Hop self-test from $APP"
 # -n starts a new copy even if Hop is already running, so this one gets the
 # arguments; -W waits until it quits. `open` does not pass on Hop's exit
 # status, so the self-test's verdict is in the log.
-open -n -W --stdout "$LOG" --stderr "$ERR_LOG" "$APP" --args selftest "$@"
+launch() {
+    open -n -W --stdout "$LOG" --stderr "$ERR_LOG" "$APP" --args selftest "$@"
+}
+
+echo "==> Running the Hop self-test from $APP"
+status=0
+if ! launch "$@"; then
+    # The first launch of a newly built app can fail while macOS (or the
+    # Mac's security software) checks it, with LaunchServices error -10810.
+    # Try once more, but only if Hop never started: a run that wrote output
+    # really happened and must not be repeated.
+    if [ ! -s "$LOG" ] && [ ! -s "$ERR_LOG" ]; then
+        echo "==> macOS did not start Hop; trying once more in 2 seconds"
+        sleep 2
+        if ! launch "$@" && [ ! -s "$LOG" ] && [ ! -s "$ERR_LOG" ]; then
+            echo "error: macOS would not start Hop.app." >&2
+            echo "If a dialog said Hop can't be opened, open System Settings >" \
+                "Privacy & Security, click Open Anyway next to Hop, and run this" \
+                "script again." >&2
+            status=1
+        fi
+    fi
+fi
 
 echo "==> Output ($LOG)"
 cat "$LOG"
@@ -58,3 +79,4 @@ if [ -s "$ERR_LOG" ]; then
     echo "==> Errors and diagnostics ($ERR_LOG)"
     cat "$ERR_LOG"
 fi
+exit "$status"
