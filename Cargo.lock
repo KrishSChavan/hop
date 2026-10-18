@@ -336,6 +336,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hop-net"
+version = "0.1.0"
+dependencies = [
+ "hop-config",
+ "hop-proto",
+ "hop-types",
+]
+
+[[package]]
 name = "hop-platform"
 version = "0.1.0"
 dependencies = [

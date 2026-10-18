@@ -18,6 +18,7 @@ hop-platform = { path = "crates/hop-platform" }
 hop-platform-macos = { path = "crates/hop-platform-macos" }
 hop-platform-windows = { path = "crates/hop-platform-windows" }
 hop-selftest = { path = "crates/hop-selftest" }
+hop-net = { path = "crates/hop-net" }
 
 anyhow = "1.0.104"
 bitflags = "2.13.2"

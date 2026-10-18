@@ -1,0 +1,12 @@
+[package]
+name = "hop-net"
+description = "Hop's network layer: device identity, the encrypted QUIC link with pinned keys, pairing, and discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hop-config.workspace = true
+hop-proto.workspace = true
+hop-types.workspace = true
