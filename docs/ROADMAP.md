@@ -94,6 +94,7 @@ Left for M6:
 - the quit sequence when Windows signs out or shuts down: the app needs to catch the window's end-session messages (today the Mac takes back its input after its 1.5 s timeout);
 - a diagnostics bundle;
 - renaming the computer, and the other settings, in the app;
+- closing the last pairing gap: a joiner cancelled in the fraction of a second after the yes arrives forgets a pairing the other computer saved (pair_join should save before its goodbye; see [M6-APP.md](M6-APP.md));
 - the "done when" check below.
 
 - **Scope:**

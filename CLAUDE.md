@@ -36,7 +36,7 @@ cargo test --workspace
 - Only make a release when the user asks for one.
 - First set the version in the root `Cargo.toml` (`[workspace.package]`), run `cargo check --workspace` so `Cargo.lock` picks up the new version, and write `docs/releases/vX.Y.Z.md`. Commit (with `Cargo.lock`) and push.
 - Then run `scripts/macos/release.sh vX.Y.Z` on the Mac. It refuses unless the tag matches the version, the working tree is clean, `Cargo.lock` matches and HEAD is on origin. It builds and signs Hop.app and publishes the release on github.com with `Hop-macOS.zip`. Publishing starts `.github/workflows/release.yml`, which builds on Windows (with `--locked`, and the C runtime linked into Hop.exe) and adds `Hop-Windows.zip` (`Hop.exe` and `packaging/windows/README.txt`).
-- Running it again for an existing release only replaces the Mac zip. To rebuild the Windows zip, run the workflow by hand: `GH_HOST=github.com gh workflow run release.yml --repo KrishSChavan/hop -f tag=vX.Y.Z`. GitHub runs a workflow by hand only once it is on the default branch.
+- Running it again for an existing release only replaces the Mac zip. To rebuild the Windows zip, rerun the release's Windows run: `GH_HOST=github.com gh run list --repo KrishSChavan/hop --workflow release.yml`, then `GH_HOST=github.com gh run rerun RUN-ID --repo KrishSChavan/hop`. Running the workflow by hand (`gh workflow run release.yml --repo KrishSChavan/hop --ref vX.Y.Z -f tag=vX.Y.Z`) works only once `release.yml` is on the default branch (`main`).
 - The Windows zip is added after the release is published, so release immutability must stay off in the repository's settings.
 
 ## Rules

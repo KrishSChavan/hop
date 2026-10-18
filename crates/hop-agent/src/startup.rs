@@ -61,11 +61,7 @@ pub(crate) fn load_from(config_path: PathBuf, identity_path: &Path) -> Result<St
             identity_path.display()
         ));
         if config.peers.iter().any(|peer| peer.fingerprint.is_some()) {
-            notes.push(
-                "This computer has a new key, so the computers it was paired with must pair \
-                 with it again (hop pair)."
-                    .to_owned(),
-            );
+            notes.push(NEW_KEY_NOTE.to_owned());
         }
     }
     if loaded.tightened {
@@ -111,6 +107,26 @@ pub(crate) fn load_from(config_path: PathBuf, identity_path: &Path) -> Result<St
     })
 }
 
+/// The note after a new key replaced the one paired computers know, as the
+/// terminal says it.
+pub(crate) const NEW_KEY_NOTE: &str = "This computer has a new key, so the computers it was \
+                                       paired with must pair with it again (hop pair).";
+
+/// The same note in the app's words: the app pairs in its window.
+const NEW_KEY_NOTE_APP: &str = "This computer has a new key, so the computers it was paired \
+                                with must pair with it again: use Pair in Hop on both \
+                                computers.";
+
+/// A startup note as the app says it: only the new-key note names a
+/// terminal command, and the app has its own way to pair.
+pub(crate) fn app_note(note: &str) -> String {
+    if note == NEW_KEY_NOTE {
+        NEW_KEY_NOTE_APP.to_owned()
+    } else {
+        note.to_owned()
+    }
+}
+
 /// The name a computer gets on its first run. Plain on purpose: the name
 /// is announced on every network the computer joins, so it should not carry
 /// the user's name unless they put it there.
@@ -139,6 +155,37 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hop-startup-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn a_new_key_tells_the_terminal_to_run_hop_pair_and_the_app_to_use_pair() {
+        let dir = scratch("rekey");
+        let config_path = dir.join("config.toml");
+        let mut paired = Config::first_run("Mac").expect("config");
+        let fingerprint: String = std::iter::repeat_n('a', 64).collect();
+        paired.peers.push(hop_config::PeerConfig {
+            name: "Windows PC".to_owned(),
+            id: DeviceId::new(&fingerprint[..32]),
+            os: Os::Windows,
+            side: hop_config::Side::Right,
+            address: None,
+            fingerprint: Some(fingerprint),
+        });
+        paired.save(&config_path).expect("save");
+        // No key file yet: this start makes a new one.
+        let started = load_from(config_path, &dir.join("identity.pem")).expect("start");
+        assert!(
+            started.notes.iter().any(|note| note == NEW_KEY_NOTE),
+            "{:?}",
+            started.notes
+        );
+        assert!(NEW_KEY_NOTE.ends_with("must pair with it again (hop pair)."));
+        let app = app_note(NEW_KEY_NOTE);
+        assert!(!app.contains("hop pair"), "{app}");
+        assert!(app.contains("use Pair in Hop"), "{app}");
+        // Other notes read the same in both.
+        assert_eq!(app_note("Config: something."), "Config: something.");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

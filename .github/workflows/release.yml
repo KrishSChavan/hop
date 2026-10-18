@@ -2,8 +2,10 @@ name: Release
 
 # Builds Hop.exe for a GitHub Release and adds Hop-Windows.zip to it.
 # scripts/macos/release.sh publishes the release from the Mac, with
-# Hop-macOS.zip, and publishing starts this. To rebuild the Windows zip of a
-# release, run this by hand with the release's tag.
+# Hop-macOS.zip, and publishing starts this, from the tagged commit. To
+# rebuild the Windows zip of a release, rerun that run (gh run rerun), or
+# run this by hand with the release's tag (--ref TAG -f tag=TAG), which
+# GitHub allows only once this file is on the default branch.
 on:
   release:
     types: [published]

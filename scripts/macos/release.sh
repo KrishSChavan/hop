@@ -19,8 +19,10 @@
 # branch, so the release is built from exactly the commit that GitHub tags.
 # If a tag vX.Y.Z already exists on GitHub, it must point at HEAD too. When
 # the release already exists, this only replaces Hop-macOS.zip on it; the
-# Windows build does not start again (run the Release workflow by hand with
-# the tag for that).
+# Windows build does not start again. To rebuild it, rerun the release's
+# Windows run (gh run rerun RUN-ID --failed, for a run that failed), or run
+# the Release workflow by hand, which GitHub allows only once
+# .github/workflows/release.yml is on the default branch (main).
 #
 # The Windows zip is added after the release is published, so release
 # immutability must stay off in the repository's settings.
@@ -151,8 +153,19 @@ fi
 
 # Whether the release exists already. gh says "release not found" when it
 # does not; any other failure (the network, sign-in) stops here.
-if IS_DRAFT="$(gh release view "$TAG" --repo "$GITHUB_REPO" --json isDraft --jq .isDraft 2>"$WORK/view.err")"; then
+if RELEASE_INFO="$(gh release view "$TAG" --repo "$GITHUB_REPO" --json isDraft,targetCommitish \
+    --jq '"\(.isDraft) \(.targetCommitish)"' 2>"$WORK/view.err")"; then
     EXISTS=yes
+    IS_DRAFT="${RELEASE_INFO%% *}"
+    DRAFT_TARGET="${RELEASE_INFO#* }"
+    # A draft has no tag yet: publishing it tags its target, and the Windows
+    # build builds that. It must be HEAD, or the two zips would come from
+    # different code (a draft left behind by an interrupted run, say).
+    if [ "$IS_DRAFT" = true ] && [ "$DRAFT_TARGET" != "$HEAD_SHA" ]; then
+        echo "error: the draft release $TAG targets $DRAFT_TARGET, not HEAD ($HEAD_SHA)." \
+            "Point it at HEAD first: GH_HOST=github.com gh release edit $TAG --repo $GITHUB_REPO --target $HEAD_SHA" >&2
+        exit 1
+    fi
     echo "==> Release $TAG exists: Hop-macOS.zip on it will be replaced"
 elif grep -q "release not found" "$WORK/view.err"; then
     EXISTS=no
@@ -208,8 +221,12 @@ else
         echo "==> Release $TAG is a draft. Publishing it starts the Windows build:"
         echo "    GH_HOST=github.com gh release edit $TAG --repo $GITHUB_REPO --draft=false"
     else
-        echo "==> The Windows build does not start again by itself. To rebuild Hop-Windows.zip:"
-        echo "    GH_HOST=github.com gh workflow run release.yml --repo $GITHUB_REPO -f tag=$TAG"
+        echo "==> The Windows build does not start again by itself. To rebuild Hop-Windows.zip,"
+        echo "    rerun the release's Windows run (find it with the first command):"
+        echo "    GH_HOST=github.com gh run list --repo $GITHUB_REPO --workflow release.yml"
+        echo "    GH_HOST=github.com gh run rerun RUN-ID --repo $GITHUB_REPO"
+        echo "    or, once .github/workflows/release.yml is on main, run it by hand:"
+        echo "    GH_HOST=github.com gh workflow run release.yml --repo $GITHUB_REPO --ref $TAG -f tag=$TAG"
     fi
 fi
 

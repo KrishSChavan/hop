@@ -20,6 +20,11 @@ use crate::{startup, status};
 /// The network runtime's threads get this long to finish after the flow.
 const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
 
+/// How long a cancelled session's runtime keeps running before it stops,
+/// so the close its dropped connection queued (a joiner's EXPIRED, an
+/// unanswered question's DECLINED) actually leaves this computer.
+const CLOSE_FLUSH: Duration = Duration::from_millis(100);
+
 /// [`PairEvent::Finished`] after [`PairSession::cancel`].
 pub(crate) const CANCELLED: &str = "cancelled";
 
@@ -190,7 +195,7 @@ fn session(
         Err(error) => return Ending::Done(Err(error)),
     };
     for note in &setup.startup.notes {
-        status!("{note}");
+        status!("{}", startup::app_note(note));
     }
     let runtime = match runtime() {
         Ok(runtime) => Bounded(Some(runtime)),
@@ -205,6 +210,15 @@ fn session(
             outcome = pair(&setup, role, &mut *front) => Ending::Done(outcome),
         }
     });
+    // A cancel dropped the flow mid-way. Its connection only queued a close
+    // (EXPIRED from a joiner waiting for the yes, DECLINED from a question
+    // nobody answered), and only quinn's driver task, on this runtime, sends
+    // it. Stopping the runtime at once would usually cancel that task first:
+    // the other computer would never hear, and a yes there could save a
+    // pairing this computer never did.
+    if matches!(ending, Ending::Cancelled) {
+        runtime.flush();
+    }
     // The listener, any connection and the announcement went with the flow;
     // stopping the runtime also lets go of the port, so a new session can
     // listen on it as soon as this one has finished.
@@ -222,6 +236,14 @@ impl Bounded {
         match &self.0 {
             Some(runtime) => runtime.block_on(future),
             None => Ending::Done(Err(anyhow::anyhow!("the network runtime is gone"))),
+        }
+    }
+
+    /// Lets the runtime's tasks run for [`CLOSE_FLUSH`], so closes that were
+    /// queued go out. The timer is made inside the runtime, which it needs.
+    fn flush(&self) {
+        if let Some(runtime) = &self.0 {
+            runtime.block_on(async { tokio::time::sleep(CLOSE_FLUSH).await });
         }
     }
 }
@@ -323,7 +345,17 @@ pub(crate) fn app_reason(error: &PairError, joining: bool) -> String {
                                    Enter a code on the other"
             .to_owned(),
         PairError::Connection(why) => {
-            format!("the connection to the other computer was lost ({why})")
+            // hop-net's texts are the terminal's: they say laptop, and one
+            // tells the user to run hop pair.
+            let why = why
+                .replace("laptops", "computers")
+                .replace("laptop", "computer");
+            if why.contains("hop pair") {
+                "the connection to the other computer was lost. Pair again on both computers"
+                    .to_owned()
+            } else {
+                format!("the connection to the other computer was lost ({why})")
+            }
         }
         PairError::SelfPairing => "that is this computer itself".to_owned(),
         // The others say nothing about the terminal or laptops.

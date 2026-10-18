@@ -95,7 +95,12 @@ fn describe(startup: Startup) -> Overview {
         os: Os::current(),
         config_path: startup.config_path,
         peers,
-        notes: startup.notes,
+        // In the app's words: it pairs in its window, not with hop pair.
+        notes: startup
+            .notes
+            .iter()
+            .map(|note| startup::app_note(note))
+            .collect(),
     }
 }
 

@@ -444,6 +444,14 @@ fn the_apps_reasons_never_send_the_user_to_the_terminal() {
         PairError::NoAddress,
         PairError::Protocol("a bad frame".to_owned()),
         PairError::Connection("timed out".to_owned()),
+        // hop-net's own connection texts, which the app passes on.
+        PairError::Connection("the other laptop stopped answering".to_owned()),
+        PairError::Connection("the pairing listener stopped".to_owned()),
+        PairError::Connection(
+            "this laptop saved the pairing, but the other laptop may not have received the \
+             confirmation; if it reports a failure, run hop pair again on both laptops"
+                .to_owned(),
+        ),
         PairError::Save("disk full".to_owned()),
         PairError::SelfPairing,
         PairError::Discovery("mDNS: no interface".to_owned()),
@@ -463,6 +471,89 @@ fn the_apps_reasons_never_send_the_user_to_the_terminal() {
         taken.contains("0.0.0.0:47801") && taken.contains("another copy of Hop"),
         "{taken}"
     );
+}
+
+#[test]
+fn cancelling_while_the_other_computer_asks_tells_it_so_it_saves_nothing() {
+    // This computer typed the code and waits for the yes; the other one
+    // (hop-net's own host here) is asking its user.
+    let dir = scratch("cancel-join");
+    let runtime = runtime();
+    let host_key = Arc::new(Identity::generate().expect("key"));
+    let code = PairingCode::generate().expect("code");
+    let shown = Zeroizing::new(code.reveal());
+    let host = runtime
+        .block_on(PairingHost::bind(
+            host_key,
+            PairInfo {
+                name: "Test Mac".to_owned(),
+                os: Os::MacOs,
+            },
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            code,
+            PairingTiming::default(),
+            false,
+        ))
+        .expect("host");
+    let address = host.local_addr();
+    let asking = runtime.spawn(host.wait_for_joiner());
+    let (tx, events) = mpsc::channel();
+    let session = PairSession::spawn(
+        PairRole::Join {
+            code: shown,
+            address: Some(address.to_string()),
+        },
+        tx,
+        loopback(&dir, PairingTiming::default(), None),
+    )
+    .expect("session");
+    loop {
+        if let PairEvent::WaitingForConfirmation { .. } = next(&events) {
+            break;
+        }
+    }
+    let pending = runtime
+        .block_on(asking)
+        .expect("task")
+        .expect("the host is asking");
+    session.cancel();
+    let (_, result) = until_finished(&events);
+    assert_eq!(result, Err(CANCELLED.to_owned()));
+    ends(&session);
+    // The cancel's close has left this computer by the time the session
+    // ends; loopback delivers it at once.
+    std::thread::sleep(Duration::from_millis(100));
+    let mut saved = false;
+    let accepted = runtime.block_on(pending.accept(|_| {
+        saved = true;
+        Ok::<(), std::convert::Infallible>(())
+    }));
+    assert!(accepted.is_err(), "{accepted:?}");
+    assert!(!saved, "a yes after the cancel saves nothing there");
+    assert!(peers(&dir).is_empty(), "nor here");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn closing_while_this_computer_asks_tells_the_other_one_no() {
+    let dir = scratch("cancel-ask");
+    let (session, events, code, address) = show(&dir, PairingTiming::default());
+    let runtime = runtime();
+    let (_, joining) = join_with(&runtime, &code, address, PairingTiming::default());
+    assert!(matches!(next(&events), PairEvent::Confirm { .. }));
+    // The window closes (or Cancel is clicked) while the question is open.
+    session.cancel();
+    let (_, result) = until_finished(&events);
+    assert_eq!(result, Err(CANCELLED.to_owned()));
+    let started = Instant::now();
+    let joined = runtime.block_on(joining).expect("task");
+    assert!(matches!(joined, Err(PairError::Declined)), "{joined:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the other computer hears at once, not after a timeout"
+    );
+    assert!(peers(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -95,7 +95,8 @@ pub(crate) fn run(
     host: Host,
     load: impl FnOnce() -> Result<Startup>,
 ) -> Result<ExitCode> {
-    status!("Hop {} is starting.", env!("CARGO_PKG_VERSION"));
+    let words = Words::for_host(&host);
+    status!("{}", words.starting());
     let startup = load()?;
     for note in &startup.notes {
         status!("{note}");
@@ -122,7 +123,7 @@ pub(crate) fn run(
     // restart, or its window closing, while this run waited to begin): the
     // network and the input are never touched.
     if signals.quit_requested() {
-        status!("Hop stopped.");
+        status!("{}", words.stopped());
         return Ok(ExitCode::SUCCESS);
     }
     let platform = native::native().context("could not start Hop's platform layer")?;
@@ -159,7 +160,7 @@ pub(crate) fn run(
     if signals.quit_requested() {
         runtime.block_on(handle.shutdown())?;
         drop(runtime);
-        status!("Hop stopped.");
+        status!("{}", words.stopped());
         return Ok(ExitCode::SUCCESS);
     }
     check_accessibility(&platform)?;
@@ -191,7 +192,7 @@ pub(crate) fn run(
         }
         Host::App(updates) => {
             status!(
-                "Hop is running. Push the cursor past the {} edge of this computer's screen to \
+                "Sharing started. Push the cursor past the {} edge of this computer's screen to \
                  move to {}.",
                 edge_name(chosen.side),
                 chosen.pin.name,
@@ -208,15 +209,54 @@ pub(crate) fn run(
         }
     }
     agent.run();
-    status!("Quitting: giving the keyboard and mouse back.");
+    status!("{}", words.stopping());
     agent.quit();
     // Dropping the agent fails open once more (it is idempotent) and drops
     // the platform: capture stops and the injector lets go of everything.
     drop(agent);
     runtime.block_on(handle.shutdown())?;
     drop(runtime);
-    status!("Hop stopped.");
+    status!("{}", words.stopped());
     Ok(ExitCode::SUCCESS)
+}
+
+/// The status lines that differ by host. `hop run` quits as a whole, while
+/// an app only stops sharing and stays open: there, "Quitting" or "Hop
+/// stopped" would read as if the app itself had closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Words {
+    Terminal,
+    App,
+}
+
+impl Words {
+    fn for_host(host: &Host) -> Words {
+        match host {
+            Host::Terminal => Words::Terminal,
+            Host::App(_) => Words::App,
+        }
+    }
+
+    fn starting(self) -> String {
+        match self {
+            Words::Terminal => format!("Hop {} is starting.", env!("CARGO_PKG_VERSION")),
+            Words::App => "Starting to share this computer's keyboard and mouse.".to_owned(),
+        }
+    }
+
+    fn stopping(self) -> &'static str {
+        match self {
+            Words::Terminal => "Quitting: giving the keyboard and mouse back.",
+            Words::App => "Stopping sharing: giving the keyboard and mouse back.",
+        }
+    }
+
+    fn stopped(self) -> &'static str {
+        match self {
+            Words::Terminal => "Hop stopped.",
+            Words::App => "Sharing stopped.",
+        }
+    }
 }
 
 /// What to tell the user when Hop's port cannot be bound. A port in use
@@ -784,6 +824,34 @@ mod tests {
         let refused = format!("{refused:#}");
         assert!(!refused.contains("already running"), "{refused}");
         assert!(refused.contains("network.port in config.toml"), "{refused}");
+    }
+
+    #[test]
+    fn an_app_hears_about_sharing_and_hop_run_about_hop() {
+        // hop run's lines are unchanged.
+        assert_eq!(
+            Words::Terminal.starting(),
+            format!("Hop {} is starting.", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            Words::Terminal.stopping(),
+            "Quitting: giving the keyboard and mouse back."
+        );
+        assert_eq!(Words::Terminal.stopped(), "Hop stopped.");
+        // An app stays open when sharing stops, so its lines never say that
+        // Hop quit or stopped.
+        for line in [
+            Words::App.starting(),
+            Words::App.stopping().to_owned(),
+            Words::App.stopped().to_owned(),
+        ] {
+            assert!(!line.contains("Quitting"), "{line}");
+            assert!(!line.contains("Hop stopped"), "{line}");
+            assert!(line.contains("shar") || line.contains("Shar"), "{line}");
+        }
+        let (tx, _rx) = std::sync::mpsc::channel();
+        assert_eq!(Words::for_host(&Host::App(tx)), Words::App);
+        assert_eq!(Words::for_host(&Host::Terminal), Words::Terminal);
     }
 
     #[test]

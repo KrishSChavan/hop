@@ -154,7 +154,8 @@ impl PairSession {
   - The save rules and their tests (`add_peer`, `save_peer`, `replaced_old_key`) moved unchanged.
   - The session trims the code and the address; an empty address means "look for it on the network".
 - **Errors:** pairing errors reach the app as plain sentences. Fixed ones: "cancelled", "nothing was saved on either computer", "no answer in time, so nothing was saved on either computer". The reason can quote the address the user typed, so it is shown but never logged. Only the app shows the code, and the code is dropped (zeroized) when the session ends.
-- **A joiner that stops early** (the app's Cancel, or its window closing, while it waits for the answer) closes its connection with `EXPIRED`, never with the normal close the other computer takes as "the yes arrived". So the computer showing the code never reports a pairing the joiner did not save.
+- **A joiner that stops early** (the app's Cancel, or its window closing, while it waits for the answer) closes its connection with `EXPIRED`, never with the normal close the other computer takes as "the yes arrived". A cancelled session keeps its network running for another 100 ms, so that close (or the `DECLINED` of a question nobody answered) actually leaves the computer. So the computer showing the code does not report a pairing the joiner did not save.
+- **One narrow gap is left:** a Cancel that lands in the fraction of a second after the yes arrived, while the joiner says goodbye but before it saves. The computer showing the code then reports a pairing that the joiner forgot. Pairing again fixes it. Closing the gap means saving before the goodbye, inside hop-net's `pair_join`; that is on the roadmap.
 
 ```rust
 // settings: read and change the config file. Each change re-reads the file, validates, and saves atomically.
