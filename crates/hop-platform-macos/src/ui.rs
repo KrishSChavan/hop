@@ -23,8 +23,8 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSControl, NSEvent,
-    NSEventModifierFlags, NSEventType, NSFloatingWindowLevel, NSResponder, NSTextField, NSView,
-    NSWindow, NSWindowStyleMask,
+    NSEventModifierFlags, NSEventType, NSFloatingWindowLevel, NSMenu, NSMenuItem, NSResponder,
+    NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, ns_string};
 
@@ -81,6 +81,7 @@ pub fn run_with_ui<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) ->
     };
     let app = NSApplication::sharedApplication(mtm);
     let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    install_edit_menu(mtm, &app);
     let done = Arc::new(AtomicBool::new(false));
     let worker = thread::spawn({
         let stop = StopLoopOnDrop(Arc::clone(&done));
@@ -99,6 +100,48 @@ pub fn run_with_ui<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) ->
         Ok(result) => result,
         Err(panic) => resume_unwind(panic),
     }
+}
+
+/// Gives the app a main menu holding the standard Edit commands.
+///
+/// Hop runs as an accessory app, so this menu is never shown. AppKit still
+/// looks up key equivalents in it, though, and without it a text field
+/// ignores Cmd+A, Cmd+C, Cmd+V and the rest: in every Mac app those
+/// shortcuts belong to the Edit menu, not to the text field. The first
+/// self-test on a real Mac failed its select-all check for this reason.
+fn install_edit_menu(mtm: MainThreadMarker, app: &NSApplication) {
+    let edit = NSMenu::initWithTitle(NSMenu::alloc(mtm), ns_string!("Edit"));
+    // An upper-case key equivalent includes Shift: Redo is Shift+Cmd+Z.
+    let commands = [
+        ("Undo", sel!(undo:), "z"),
+        ("Redo", sel!(redo:), "Z"),
+        ("Cut", sel!(cut:), "x"),
+        ("Copy", sel!(copy:), "c"),
+        ("Paste", sel!(paste:), "v"),
+        ("Select All", sel!(selectAll:), "a"),
+    ];
+    for (title, action, key) in commands {
+        // SAFETY: each selector is a standard responder action. AppKit sends
+        // it along the responder chain to the first object that implements
+        // it, and disables the item where none does, so it is never sent to
+        // an object that cannot handle it.
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        edit.addItem(&item);
+    }
+    let edit_item = NSMenuItem::new(mtm);
+    edit_item.setSubmenu(Some(&edit));
+    let main = NSMenu::new(mtm);
+    // AppKit treats a main menu's first item as the application menu.
+    main.addItem(&NSMenuItem::new(mtm));
+    main.addItem(&edit_item);
+    app.setMainMenu(Some(&main));
 }
 
 /// Marks the work done and stops the main event loop when dropped.

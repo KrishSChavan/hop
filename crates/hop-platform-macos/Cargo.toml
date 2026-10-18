@@ -27,6 +27,8 @@ objc2-app-kit = { workspace = true, features = [
     "NSEvent",
     "NSGraphics",
     "NSGraphicsContext",
+    "NSMenu",
+    "NSMenuItem",
     "NSResponder",
     "NSRunningApplication",
     "NSText",
