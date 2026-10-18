@@ -12,11 +12,13 @@
 #
 # Usage: scripts/macos/run-selftest.sh [extra arguments for `hop selftest`]
 #
-# The output goes to target/hop-selftest.log (stdout) and
-# target/hop-selftest.err.log (stderr), or the same names in
-# $CARGO_TARGET_DIR. They are separate files because nothing documents
-# whether LaunchServices appends when both point at one file, and two
-# writers that do not append overwrite each other.
+# The output goes to ~/Library/Logs/Hop/selftest-stdout.log and
+# selftest-stderr.log, next to the self-test's own report. Never point
+# them into a folder macOS protects (Desktop, Documents, Downloads): Hop
+# has no access there, and LaunchServices then refuses to start it at all,
+# with the unhelpful error -10810. They are separate files because nothing
+# documents whether LaunchServices appends when both point at one file, and
+# two writers that do not append overwrite each other.
 
 set -euo pipefail
 
@@ -29,8 +31,10 @@ case "$TARGET_DIR" in
     *) TARGET_DIR="$PWD/$TARGET_DIR" ;;
 esac
 APP="$TARGET_DIR/Hop.app"
-LOG="$TARGET_DIR/hop-selftest.log"
-ERR_LOG="$TARGET_DIR/hop-selftest.err.log"
+LOG_DIR="$HOME/Library/Logs/Hop"
+LOG="$LOG_DIR/selftest-stdout.log"
+ERR_LOG="$LOG_DIR/selftest-stderr.log"
+mkdir -p "$LOG_DIR"
 
 if [ ! -d "$APP" ]; then
     echo "error: $APP does not exist; build it with scripts/macos/make-app.sh" >&2
@@ -56,21 +60,8 @@ launch() {
 echo "==> Running the Hop self-test from $APP"
 status=0
 if ! launch "$@"; then
-    # The first launch of a newly built app can fail while macOS (or the
-    # Mac's security software) checks it, with LaunchServices error -10810.
-    # Try once more, but only if Hop never started: a run that wrote output
-    # really happened and must not be repeated.
-    if [ ! -s "$LOG" ] && [ ! -s "$ERR_LOG" ]; then
-        echo "==> macOS did not start Hop; trying once more in 2 seconds"
-        sleep 2
-        if ! launch "$@" && [ ! -s "$LOG" ] && [ ! -s "$ERR_LOG" ]; then
-            echo "error: macOS would not start Hop.app." >&2
-            echo "If a dialog said Hop can't be opened, open System Settings >" \
-                "Privacy & Security, click Open Anyway next to Hop, and run this" \
-                "script again." >&2
-            status=1
-        fi
-    fi
+    echo "error: macOS would not start Hop.app (see the message above)." >&2
+    status=1
 fi
 
 echo "==> Output ($LOG)"
