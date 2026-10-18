@@ -754,7 +754,12 @@ pub async fn pair_join(
         };
         on_confirmed(&peer);
         let mut recv = recv;
+        // Declared after `recv`, so it is dropped first: a join dropped while
+        // it waits (the app's Cancel) closes with EXPIRED before the stream
+        // could send anything.
+        let mut stop_waiting = CloseIfDropped(Some(conn.clone()));
         let verdict = wait_for_verdict(&mut recv, timing.verdict_timeout).await;
+        stop_waiting.disarm();
         // The host takes a normal close (SHUTDOWN, 0) as proof that its
         // "accepted" arrived, so it is sent only then. Otherwise a host
         // whose user said yes just as this side stopped waiting would report
@@ -773,6 +778,28 @@ pub async fn pair_join(
         return verdict.map(|()| peer).map_err(|failure| failure.error);
     }
     Err(last_error)
+}
+
+/// Closes a joiner's connection with `EXPIRED` when the join is dropped
+/// while it waits for the host's answer. quinn would otherwise close it by
+/// itself with code 0, which the host takes as proof that its "accepted"
+/// arrived: a host whose user said yes at that moment would then report a
+/// pairing this side never saved.
+struct CloseIfDropped(Option<quinn::Connection>);
+
+impl CloseIfDropped {
+    /// The join closes the connection itself from here on.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CloseIfDropped {
+    fn drop(&mut self) {
+        if let Some(conn) = self.0.take() {
+            conn.close(CloseCode::Expired.varint(), b"stopped waiting");
+        }
+    }
 }
 
 /// The joiner's steps 2 and 3 on one connection.

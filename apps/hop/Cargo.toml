@@ -1,39 +1,13 @@
 [package]
 name = "hop"
-description = "The Hop agent"
+description = "The hop command: Hop's command line"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Everything the command does lives in hop-agent, which the Hop app shares.
+hop-agent.workspace = true
+# Only for the type `main` returns, so an error prints the way it always has.
 anyhow.workspace = true
-clap.workspace = true
-hop-config.workspace = true
-hop-core.workspace = true
-hop-keymap.workspace = true
-hop-net.workspace = true
-hop-platform.workspace = true
-hop-selftest.workspace = true
-hop-types.workspace = true
-thiserror.workspace = true
-toml.workspace = true
-tracing.workspace = true
-# The async runtime the network layer runs on (MIT), at the exact version
-# hop-net uses. `signal` turns Ctrl+C, SIGTERM and SIGHUP (and, on Windows,
-# closing the console) into a request to quit, so Hop gives the keyboard and
-# mouse back before it exits instead of being killed mid-session.
-tokio = { version = "=1.53.3", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time"] }
-# Wipes the pairing code `hop pair` shows or reads from memory after use
-# (Apache-2.0 OR MIT), the version hop-net uses.
-zeroize = "=1.9.1"
-
-[dev-dependencies]
-# Only to build the `PeerUp` events a fake network hands the agent in tests.
-hop-proto.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
-hop-platform-macos.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-hop-platform-windows.workspace = true

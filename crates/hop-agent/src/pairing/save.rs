@@ -1,316 +1,13 @@
-//! `hop pair`: pairs this computer with the other one, once
-//! (docs/M2-DESIGN.md, "Pairing").
-//!
-//! Without a code, this computer shows one and waits; with a code, it joins
-//! the computer showing it. Pairing runs in a terminal on both computers,
-//! never through `open` on the Mac: `open` would send the output, and so
-//! the code, to a log file. The code is printed on screen only and never
-//! logged.
+//! Saving a pairing in the config (docs/M2-DESIGN.md, "Saving"): which
+//! `[[peers]]` entry the other computer goes into, and on which side.
 
-use std::io::{self, BufRead as _, Write as _};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::{Context, Result};
 use hop_config::{Config, ConfigError, PeerConfig, Side};
-use hop_net::{
-    Identity, PairError, PairInfo, PairedPeer, PairingCode, PairingHost, PairingTiming,
-    find_pairing_hosts, pair_join, resolve_address,
-};
+use hop_net::PairedPeer;
 use hop_types::{DeviceId, Os};
-use zeroize::Zeroizing;
 
-use crate::logging::{Destination, Filter, Log};
-use crate::paths;
-use crate::startup::{self, Startup, default_device_name};
-
-/// How long the joiner listens for a computer showing a code.
-const FIND_WAIT: Duration = Duration::from_secs(3);
-
-/// How long a host name given with `--address` may take to look up.
-const RESOLVE_WAIT: Duration = Duration::from_secs(5);
-
-/// Runs `hop pair`: shows a code when `code` is empty, joins otherwise.
-pub(crate) fn run(code: &[String], address: Option<&str>) -> Result<ExitCode> {
-    let log = start_log();
-    let startup = startup::load()?;
-    for note in &startup.notes {
-        println!("{note}");
-    }
-    let port =
-        startup.config.network.port.checked_add(1).context(
-            "network.port must be at most 65534, because pairing uses the port after it",
-        )?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .context("could not start the network threads")?;
-    let result = if code.is_empty() {
-        runtime.block_on(host(&startup, port))
-    } else {
-        // "482 913" may arrive as two arguments.
-        let typed = Zeroizing::new(code.join(" "));
-        runtime.block_on(join(&startup, &typed, address, port))
-    };
-    // Waiting for the y/N answer may leave a thread reading the terminal;
-    // the process ends anyway.
-    runtime.shutdown_timeout(Duration::from_secs(1));
-    if let Some(log) = log {
-        log.flush(Duration::from_secs(1));
-    }
-    result
-}
-
-/// Pairing writes its own log next to the agent's. Only warnings from the
-/// network layer end up there (never the code).
-fn start_log() -> Option<Log> {
-    let path = paths::log_dir()?.join("pair.log");
-    let log = Log::start(Destination::File(path)).ok()?;
-    log.install(Filter::AGENT);
-    Some(log)
-}
-
-/// What this computer tells the other one about itself.
-fn pair_info(startup: &Startup) -> PairInfo {
-    PairInfo {
-        name: startup.config.device.name.clone(),
-        os: Os::current(),
-    }
-}
-
-/// Binds the pairing listener with a new code, and returns it with the
-/// code to show.
-async fn bind_host(
-    startup: &Startup,
-    address: SocketAddr,
-    advertise: bool,
-) -> Result<(PairingHost, Zeroizing<String>), PairError> {
-    let code = PairingCode::generate()?;
-    let shown = Zeroizing::new(code.reveal());
-    let host = PairingHost::bind(
-        startup.identity.clone(),
-        pair_info(startup),
-        address,
-        code,
-        PairingTiming::default(),
-        advertise,
-    )
-    .await?;
-    Ok((host, shown))
-}
-
-/// Shows a code and waits for the other computer.
-async fn host(startup: &Startup, port: u16) -> Result<ExitCode> {
-    let address = SocketAddr::from(([0, 0, 0, 0], port));
-    let (mut host, shown) = match bind_host(startup, address, true).await {
-        Ok(bound) => bound,
-        Err(PairError::Discovery(reason)) => {
-            // Pairing still works with --address. The first code was never
-            // shown; a new one goes with the new listener.
-            println!(
-                "Could not announce this computer on the local network ({reason}). On the \
-                 other computer, add --address with this computer's IP address."
-            );
-            let mut retries = 0;
-            loop {
-                // The first listener closes in the background; until it has,
-                // the port is still taken.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                match bind_host(startup, address, false).await {
-                    Ok(bound) => break bound,
-                    Err(PairError::Bind { .. }) if retries < 5 => retries += 1,
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-        Err(error) => return Err(error.into()),
-    };
-    println!();
-    println!("Pairing code: {}", shown.as_str());
-    println!();
-    println!(
-        "On the other computer, open a terminal and run hop pair with this code, for example: \
-         hop pair {}",
-        shown.as_str()
-    );
-    println!(
-        "The code works once, for 2 minutes. Never show it in a screen share. Waiting for the \
-         other computer..."
-    );
-    drop(shown);
-    host.on_failed_attempt(|failures| {
-        println!("Someone entered a wrong code ({failures} of 3 tries used).");
-    });
-    let pending = match host.wait_for_joiner().await {
-        Ok(pending) => pending,
-        Err(error) => {
-            println!("Not paired: {error}.");
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-    let joiner = pending.peer().clone();
-    // Said before the answer, not only after: a yes forgets the old key.
-    let replaces = match replaced_old_key(&startup.config_path, &joiner) {
-        Some(old) => {
-            format!(" This replaces the pairing with {old}, whose old key will stop working.")
-        }
-        None => String::new(),
-    };
-    let question = format!(
-        "{name} ({os}) entered the code. Pair with it?{replaces} Answer y only if {name} says \
-         it is waiting for you. [y/N] ",
-        name = joiner.name,
-        os = joiner.os,
-    );
-    if !ask_yes_no(&question, pending.remaining()).await {
-        pending.decline().await;
-        println!("Not paired. Nothing was saved on either computer.");
-        return Ok(ExitCode::FAILURE);
-    }
-    let mut saved = None;
-    let own_id = startup.identity.device_id();
-    let result = pending
-        .accept(|peer| -> Result<(), SaveError> {
-            saved = Some(save_peer(&startup.config_path, &own_id, peer)?);
-            Ok(())
-        })
-        .await;
-    match (result, saved) {
-        (Ok(_), Some(saved)) => {
-            print_saved(&saved);
-            Ok(ExitCode::SUCCESS)
-        }
-        (Err(error), Some(saved)) => {
-            // Saved here, but the other computer may not have heard.
-            print_saved(&saved);
-            println!("However: {error}.");
-            Ok(ExitCode::FAILURE)
-        }
-        (Err(error), None) => {
-            println!("Not paired: {error}.");
-            Ok(ExitCode::FAILURE)
-        }
-        (Ok(peer), None) => {
-            // `accept` succeeds only after the save ran.
-            println!("Paired with {}, but nothing was recorded here.", peer.name);
-            Ok(ExitCode::FAILURE)
-        }
-    }
-}
-
-/// Asks a y/N question, taking "no" if no answer comes within `within`.
-async fn ask_yes_no(question: &str, within: Duration) -> bool {
-    print!("{question}");
-    let _ = io::stdout().flush();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    // A plain thread, not the runtime's blocking pool: a terminal read
-    // cannot be cancelled, and the runtime must not wait for it on exit.
-    let reader = std::thread::Builder::new()
-        .name("hop-pair-answer".into())
-        .spawn(move || {
-            let mut line = String::new();
-            let answer = io::stdin().lock().read_line(&mut line).ok().map(|_| line);
-            let _ = tx.send(answer);
-        });
-    if reader.is_err() {
-        return false;
-    }
-    match tokio::time::timeout(within, rx).await {
-        Ok(Ok(Some(line))) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
-        Ok(_) => false,
-        Err(_) => {
-            println!();
-            println!("No answer in time.");
-            false
-        }
-    }
-}
-
-/// Joins the computer showing the code.
-async fn join(
-    startup: &Startup,
-    typed: &str,
-    address: Option<&str>,
-    port: u16,
-) -> Result<ExitCode> {
-    let code = PairingCode::parse(typed)?;
-    let addresses = match address {
-        Some(text) => resolve_address(text, port, RESOLVE_WAIT)
-            .await
-            .with_context(|| format!("could not find {text}"))?,
-        None => match find_host(&startup.identity).await? {
-            Some(addresses) => addresses,
-            None => return Ok(ExitCode::FAILURE),
-        },
-    };
-    println!("Connecting...");
-    let result = pair_join(
-        startup.identity.clone(),
-        pair_info(startup),
-        code,
-        &addresses,
-        PairingTiming::default(),
-        |host| println!("Waiting for you to confirm on {}.", host.name),
-    )
-    .await;
-    let peer = match result {
-        Ok(peer) => peer,
-        Err(error) => {
-            println!("Not paired: {error}.");
-            return Ok(ExitCode::FAILURE);
-        }
-    };
-    match save_peer(&startup.config_path, &startup.identity.device_id(), &peer) {
-        Ok(saved) => {
-            print_saved(&saved);
-            Ok(ExitCode::SUCCESS)
-        }
-        Err(error) => {
-            println!(
-                "{} said yes, but this computer could not save the pairing: {error}. Run hop \
-                 pair again on both computers.",
-                peer.name
-            );
-            Ok(ExitCode::FAILURE)
-        }
-    }
-}
-
-/// Looks for exactly one computer showing a code. `None` (after saying
-/// why) when there is none, or more than one: then the user picks with
-/// `--address`, because choosing for them could pick an impostor.
-async fn find_host(identity: &Arc<Identity>) -> Result<Option<Vec<SocketAddr>>> {
-    println!("Looking for the computer showing the code...");
-    let hosts = find_pairing_hosts(identity.device_id(), FIND_WAIT)
-        .await
-        .context("could not look for the other computer on the local network")?;
-    match hosts.as_slice() {
-        [] => {
-            println!(
-                "Could not find a computer showing a pairing code. Check that hop pair is \
-                 waiting on the other computer, or add --address with its IP address."
-            );
-            Ok(None)
-        }
-        [only] => Ok(Some(
-            only.addresses.iter().copied().map(SocketAddr::V4).collect(),
-        )),
-        several => {
-            println!("More than one computer is showing a pairing code:");
-            for found in several {
-                let addresses: Vec<String> =
-                    found.addresses.iter().map(|a| a.ip().to_string()).collect();
-                println!("  {} at {}", found.name, addresses.join(", "));
-            }
-            println!("Run hop pair again with --address and the address of the one you mean.");
-            Ok(None)
-        }
-    }
-}
+use crate::startup::default_device_name;
 
 /// Why the pairing could not be saved.
 #[derive(Debug, thiserror::Error)]
@@ -328,18 +25,23 @@ pub(crate) enum SaveError {
 
 /// What pairing saved.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Saved {
-    pub(crate) name: String,
-    pub(crate) os: Os,
-    pub(crate) side: Side,
+pub struct Saved {
+    /// The other computer's name, as it gave it (or a plain one, such as
+    /// "Windows PC", if it gave none).
+    pub name: String,
+    /// Its OS.
+    pub os: Os,
+    /// Where it sits: the side of this computer's screens that leads to it.
+    pub side: Side,
     /// Which entry it went into.
-    pub(crate) replaced: Replaced,
-    pub(crate) path: PathBuf,
+    pub replaced: Replaced,
+    /// The config file it was saved in.
+    pub path: PathBuf,
 }
 
 /// Which `[[peers]]` entry a pairing went into.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Replaced {
+pub enum Replaced {
     /// None: a new entry was added.
     Nothing,
     /// The entry of the same computer (same key), or one that was never
@@ -440,7 +142,7 @@ pub(crate) fn add_peer(
 
 /// The computer whose pairing saving `peer` would replace because it used
 /// another key (see [`add_peer`]), as the config is now.
-fn replaced_old_key(path: &Path, peer: &PairedPeer) -> Option<String> {
+pub(crate) fn replaced_old_key(path: &Path, peer: &PairedPeer) -> Option<String> {
     let (mut config, _) = Config::load(path).ok()?;
     match add_peer(&mut config, peer, Os::current())? {
         (_, Replaced::OldKey(old)) => Some(old),
@@ -478,43 +180,6 @@ fn display_name(peer: &PairedPeer) -> String {
     } else {
         peer.name.clone()
     }
-}
-
-fn print_saved(saved: &Saved) {
-    println!();
-    println!(
-        "Paired with {} ({}). {} {}.",
-        saved.name,
-        saved.os,
-        if saved.replaced == Replaced::Nothing {
-            "Saved it in"
-        } else {
-            "Updated its entry in"
-        },
-        saved.path.display()
-    );
-    if let Replaced::OldKey(old) = &saved.replaced {
-        println!(
-            "It replaces the pairing with {old}, which used a different key: that key can no \
-             longer connect to this computer."
-        );
-    }
-    let (placement, edge) = match saved.side {
-        Side::Left => ("to the left of", "left"),
-        Side::Right => ("to the right of", "right"),
-        Side::Above => ("above", "top"),
-        Side::Below => ("below", "bottom"),
-    };
-    println!(
-        "It sits {placement} this computer's screen: push the cursor past the {edge} edge to \
-         move to it."
-    );
-    println!(
-        "To put it on another side, change side = \"{}\" in its [[peers]] entry in that file \
-         to left, right, above or below.",
-        saved.side
-    );
-    println!("If Hop is running, quit it and start it again to use the new pairing.");
 }
 
 #[cfg(test)]

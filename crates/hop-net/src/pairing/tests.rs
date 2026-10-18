@@ -506,6 +506,58 @@ async fn a_joiner_that_stops_waiting_never_looks_paired_to_the_host() {
     assert_eq!(saved.load(Ordering::SeqCst), 0);
 }
 
+/// The same for a join that is dropped while it waits (the app's Cancel, or
+/// its window closing): quinn's own close would carry code 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_dropped_while_it_waits_never_looks_paired_to_the_host() {
+    let host_id = Arc::new(Identity::generate().unwrap());
+    let joiner_id = Arc::new(Identity::generate().unwrap());
+    let host = host_with(&host_id, code("464646"), timing()).await;
+    let address = host.local_addr();
+    let (confirmed_tx, confirmed) = tokio::sync::oneshot::channel();
+    let joiner = tokio::spawn(async move {
+        pair_join(
+            joiner_id,
+            joiner_info(),
+            code("464646"),
+            &[address],
+            timing(),
+            move |_| {
+                let _ = confirmed_tx.send(());
+            },
+        )
+        .await
+    });
+    let pending = host.wait_for_joiner().await.unwrap();
+    // The joiner now waits for the answer; it is dropped while the user on
+    // the host still decides.
+    confirmed.await.unwrap();
+    joiner.abort();
+    assert!(joiner.await.unwrap_err().is_cancelled());
+    let closed = tokio::time::timeout(Duration::from_secs(3), pending.conn.closed())
+        .await
+        .unwrap();
+    let quinn::ConnectionError::ApplicationClosed(close) = closed else {
+        panic!("{closed:?}");
+    };
+    assert_eq!(
+        CloseCode::from_code(close.error_code.into_inner()),
+        Some(CloseCode::Expired)
+    );
+    let saved = AtomicU32::new(0);
+    let result = pending
+        .accept(|_| {
+            saved.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), Infallible>(())
+        })
+        .await;
+    assert!(
+        matches!(result, Err(PairError::Connection(_))),
+        "{result:?}"
+    );
+    assert_eq!(saved.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_save_tells_the_joiner_no() {
     let host_id = Arc::new(Identity::generate().unwrap());

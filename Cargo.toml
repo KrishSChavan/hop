@@ -19,6 +19,7 @@ hop-platform-macos = { path = "crates/hop-platform-macos" }
 hop-platform-windows = { path = "crates/hop-platform-windows" }
 hop-selftest = { path = "crates/hop-selftest" }
 hop-net = { path = "crates/hop-net" }
+hop-agent = { path = "crates/hop-agent" }
 
 anyhow = "1.0.104"
 bitflags = "2.13.2"
@@ -30,6 +31,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 toml = "1.1.8"
 tracing = "0.1.44"
+
+# The Hop app's window (eframe and egui; MIT OR Apache-2.0). No default
+# features here: apps/hop-app turns on only what it uses.
+eframe = { version = "0.37.0", default-features = false }
 
 # macOS bindings
 dispatch2 = "0.3.1"

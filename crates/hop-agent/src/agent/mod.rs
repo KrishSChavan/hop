@@ -26,6 +26,9 @@
 //!   network says goodbye (the caller shuts the link down afterwards). A
 //!   panic on this thread unwinds through the [`Executor`], whose `Drop`
 //!   gives input back the same way.
+//! - **Updates for an app** ([`Agent::report_to`]): connections and session
+//!   changes also go to an unbounded channel, with a `send` that never
+//!   waits, so a slow app can never hold this thread up.
 
 pub(crate) mod exec;
 pub(crate) mod link;
@@ -37,7 +40,7 @@ pub(crate) mod fake;
 mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -50,6 +53,7 @@ use hop_types::{DeviceId, DisplayInfo, Edge, Os};
 
 use self::exec::Executor;
 use self::link::Link;
+use crate::service::{AgentUpdate, Session};
 use crate::status;
 
 /// How often the core gets a `Tick`.
@@ -173,6 +177,40 @@ pub(crate) struct Agent<L: Link> {
     displays: Vec<DisplayInfo>,
     next_display_check: Instant,
     told_local_network: bool,
+    updates: Option<Updates>,
+}
+
+/// Where the core thread tells an app what is happening.
+struct Updates {
+    tx: Sender<AgentUpdate>,
+    /// The session kind last reported, so only changes go out.
+    session: Session,
+}
+
+impl Updates {
+    /// Never waits: the channel is unbounded. A gone app is no error; the
+    /// agent runs on until it is asked to quit.
+    fn send(&self, update: AgentUpdate) {
+        let _ = self.tx.send(update);
+    }
+
+    /// Reports `now` if it is not the kind reported last.
+    fn session(&mut self, now: Session) {
+        if now != self.session {
+            self.session = now;
+            self.send(AgentUpdate::Session(now));
+        }
+    }
+}
+
+/// The session kind an app shows for `state`. Entering counts as
+/// controlling: input is already held back from this computer's apps.
+fn session_of(state: &State) -> Session {
+    match state {
+        State::Idle => Session::Idle,
+        State::Entering { .. } | State::Controlling { .. } => Session::Controlling,
+        State::Controlled { .. } => Session::Controlled,
+    }
 }
 
 impl<L: Link> Agent<L> {
@@ -222,7 +260,20 @@ impl<L: Link> Agent<L> {
             displays,
             next_display_check: Instant::now() + DISPLAY_CHECK,
             told_local_network: false,
+            updates: None,
         })
+    }
+
+    /// From now on, also tells `updates` about connections
+    /// ([`AgentUpdate::Connected`], [`AgentUpdate::Disconnected`]) and
+    /// session changes ([`AgentUpdate::Session`], only when the kind
+    /// changes). Sending never waits.
+    pub(crate) fn report_to(&mut self, updates: Sender<AgentUpdate>) {
+        let session = session_of(&self.core.state());
+        self.updates = Some(Updates {
+            tx: updates,
+            session,
+        });
     }
 
     /// Runs until [`Signals::request_quit`]. Call [`Agent::quit`] next.
@@ -347,6 +398,17 @@ impl<L: Link> Agent<L> {
             let actions = self.core.handle(now, Event::LocalStall);
             let _ = self.exec.execute(actions);
         }
+        // Every change of state goes through here, so this sees them all.
+        if let Some(updates) = &mut self.updates {
+            updates.session(session_of(&self.core.state()));
+        }
+    }
+
+    /// Tells the app, if one listens.
+    fn report(&self, update: AgentUpdate) {
+        if let Some(updates) = &self.updates {
+            updates.send(update);
+        }
     }
 
     fn on_input(&mut self, captured: CapturedEvent) {
@@ -371,6 +433,10 @@ impl<L: Link> Agent<L> {
                     "connected"
                 );
                 status!("Connected to {} ({}).", up.name, up.os);
+                self.report(AgentUpdate::Connected {
+                    name: up.name.clone(),
+                    os: up.os,
+                });
                 self.exec.set_peer_name(up.peer.clone(), up.name.clone());
                 self.feed(Event::PeerConnected {
                     peer: up.peer,
@@ -386,6 +452,9 @@ impl<L: Link> Agent<L> {
                         self.exec.name_of(&peer)
                     );
                 }
+                // Before the core hears it, so a session it ends is
+                // reported after the connection.
+                self.report(AgentUpdate::Disconnected);
                 self.feed(Event::PeerDisconnected { peer });
             }
             NetEvent::Message { from, msg } => self.feed(Event::PeerMessage { from, msg }),

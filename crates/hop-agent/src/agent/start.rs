@@ -1,14 +1,19 @@
-//! `hop run`: everything around the core loop. It loads the config and the
-//! key, starts the network (binding the port first, so a second copy of Hop
-//! stops before it touches input), starts capture, runs the core loop on
-//! this thread, and on the way out gives input back before it says goodbye
-//! to the peer.
+//! Everything around the core loop, for `hop run` and for the app's agent
+//! thread alike ([`run`]). It loads the config and the key, starts the
+//! network (binding the port first, so a second copy of Hop stops before it
+//! touches input), starts capture, runs the core loop on this thread, and on
+//! the way out gives input back before it says goodbye to the peer.
+//!
+//! Only `hop run` ([`main`]) adds a log of its own, OS signals and its
+//! panic hook; an app has its log and hook already, and stops the agent
+//! through [`Signals`].
 
 use std::io;
-use std::panic::{self, AssertUnwindSafe};
+use std::panic::{self, AssertUnwindSafe, PanicHookInfo};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,6 +28,8 @@ use tokio::runtime::Runtime;
 use super::link::NetLink;
 use super::{Agent, AgentError, PeerPlacement, Settings, Signals};
 use crate::logging::{Destination, Filter, Log};
+use crate::service::AgentUpdate;
+use crate::startup::Startup;
 use crate::{native, paths, startup, status};
 
 /// How long the log gets to write its last lines before Hop exits.
@@ -31,7 +38,18 @@ const LOG_FLUSH: Duration = Duration::from_secs(1);
 /// The network runtime's own threads get this long to finish on the way out.
 const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(1);
 
-/// Runs the agent on this thread until asked to quit. On macOS this is
+/// Who runs the agent, which decides what stops it and how it reports.
+pub(crate) enum Host {
+    /// `hop run` in a terminal: Ctrl+C, SIGTERM and SIGHUP (on Windows, the
+    /// console closing, signing out or shutting down) ask it to quit, and a
+    /// status line says how.
+    Terminal,
+    /// An app: it asks the agent to quit through [`Signals`], and hears
+    /// what happens through these updates. OS signals stay the app's.
+    App(Sender<AgentUpdate>),
+}
+
+/// Runs `hop run` on this thread until asked to quit. On macOS this is
 /// `run_with_ui`'s worker thread, so AppKit keeps the main thread.
 pub(crate) fn main() -> Result<ExitCode> {
     let signals = Arc::new(Signals::default());
@@ -43,7 +61,9 @@ pub(crate) fn main() -> Result<ExitCode> {
     // this point (unwinding dropped the agent and the platform); catching
     // it only gives the log a moment to write the hook's report before the
     // panic goes on to end the process.
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&signals)));
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        run(&signals, Host::Terminal, startup::load)
+    }));
     if let Ok(Err(error)) = &outcome {
         tracing::error!(error = %format!("{error:#}"), "Hop stopped");
     }
@@ -61,9 +81,22 @@ pub(crate) fn main() -> Result<ExitCode> {
     })
 }
 
-fn run(signals: &Arc<Signals>) -> Result<ExitCode> {
+/// The agent's whole run, on this thread, which becomes the core thread:
+/// `load` gives the config and the key (normally [`startup::load`]), and the
+/// run ends, failing open, once `signals` asks it to quit.
+///
+/// # Errors
+///
+/// Why the agent could not start: not paired, the port in use, no
+/// Accessibility permission, and so on. Nothing has been suppressed or
+/// injected then.
+pub(crate) fn run(
+    signals: &Arc<Signals>,
+    host: Host,
+    load: impl FnOnce() -> Result<Startup>,
+) -> Result<ExitCode> {
     status!("Hop {} is starting.", env!("CARGO_PKG_VERSION"));
-    let startup = startup::load()?;
+    let startup = load()?;
     for note in &startup.notes {
         status!("{note}");
     }
@@ -85,6 +118,13 @@ fn run(signals: &Arc<Signals>) -> Result<ExitCode> {
         },
     };
 
+    // Asked to quit before anything started (an app's Stop sharing, a
+    // restart, or its window closing, while this run waited to begin): the
+    // network and the input are never touched.
+    if signals.quit_requested() {
+        status!("Hop stopped.");
+        return Ok(ExitCode::SUCCESS);
+    }
     let platform = native::native().context("could not start Hop's platform layer")?;
     let displays = platform
         .displays
@@ -110,8 +150,18 @@ fn run(signals: &Arc<Signals>) -> Result<ExitCode> {
             }
             other => anyhow::Error::new(other).context("could not start the network"),
         })?;
-    runtime.spawn(quit_on_signal(signals.clone()));
+    if let Host::Terminal = host {
+        runtime.spawn(quit_on_signal(signals.clone()));
+    }
 
+    // Asked to quit while starting (Ctrl+C, or an app's Stop sharing):
+    // capture never starts, and nothing asks for a permission.
+    if signals.quit_requested() {
+        runtime.block_on(handle.shutdown())?;
+        drop(runtime);
+        status!("Hop stopped.");
+        return Ok(ExitCode::SUCCESS);
+    }
     check_accessibility(&platform)?;
     let link = NetLink::new(handle.clone(), events);
     let mut agent =
@@ -123,18 +173,40 @@ fn run(signals: &Arc<Signals>) -> Result<ExitCode> {
             ),
             other => anyhow::Error::new(other),
         })?;
-    status!(
-        "Hop is running. Push the cursor past the {} edge of this computer's screen to move to \
-         {}. Quit with Ctrl+C{}.",
-        chosen.side,
-        chosen.pin.name,
-        if cfg!(target_os = "macos") {
-            " in the Terminal window that started Hop"
-        } else {
-            ""
+    let emergency_keys = emergency_keys_note(&emergency);
+    match host {
+        Host::Terminal => {
+            status!(
+                "Hop is running. Push the cursor past the {} edge of this computer's screen to \
+                 move to {}. Quit with Ctrl+C{}.",
+                chosen.side,
+                chosen.pin.name,
+                if cfg!(target_os = "macos") {
+                    " in the Terminal window that started Hop"
+                } else {
+                    ""
+                }
+            );
+            status!("{emergency_keys}");
         }
-    );
-    status!("{}", emergency_keys_note(&emergency));
+        Host::App(updates) => {
+            status!(
+                "Hop is running. Push the cursor past the {} edge of this computer's screen to \
+                 move to {}.",
+                edge_name(chosen.side),
+                chosen.pin.name,
+            );
+            status!("{emergency_keys}");
+            // Before the core loop runs, so Started comes before anything
+            // the agent reports.
+            let _ = updates.send(AgentUpdate::Started {
+                peer: chosen.pin.name.clone(),
+                side: chosen.side,
+                emergency_keys,
+            });
+            agent.report_to(updates);
+        }
+    }
     agent.run();
     status!("Quitting: giving the keyboard and mouse back.");
     agent.quit();
@@ -206,21 +278,7 @@ fn open_log(dir: Option<PathBuf>) -> Option<(Log, Option<PathBuf>)> {
 /// blocks.
 fn install_panic_hook(signals: Arc<Signals>, log: Option<Log>) {
     panic::set_hook(Box::new(move |info| {
-        let thread = std::thread::current();
-        let name = thread.name().unwrap_or("unnamed");
-        let place = info
-            .location()
-            .map(|at| format!("{}:{}", at.file(), at.line()))
-            .unwrap_or_else(|| "an unknown place".to_owned());
-        let message = info
-            .payload()
-            .downcast_ref::<&'static str>()
-            .copied()
-            .unwrap_or("its message is not logged");
-        let text = format!(
-            "Hop hit an internal error (thread {name}, {place}: {message}). Giving the keyboard \
-             and mouse back and quitting."
-        );
+        let text = panic_report(info, "Giving the keyboard and mouse back and quitting.");
         match &log {
             Some(log) => log.write_status(&text),
             None => eprintln!("{text}"),
@@ -228,6 +286,24 @@ fn install_panic_hook(signals: Arc<Signals>, log: Option<Log>) {
         signals.mark_panicked();
         signals.request_quit();
     }));
+}
+
+/// What a panic hook writes about `info`: the thread and the place, and the
+/// message only when it is a fixed string, because a formatted one could
+/// quote input; then `next`, the sentence saying what happens now.
+pub(crate) fn panic_report(info: &PanicHookInfo<'_>, next: &str) -> String {
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("unnamed");
+    let place = info
+        .location()
+        .map(|at| format!("{}:{}", at.file(), at.line()))
+        .unwrap_or_else(|| "an unknown place".to_owned());
+    let message = info
+        .payload()
+        .downcast_ref::<&'static str>()
+        .copied()
+        .unwrap_or("its message is not logged");
+    format!("Hop hit an internal error (thread {name}, {place}: {message}). {next}")
 }
 
 /// The paired computer to share with, as `hop-net` pins it.
@@ -309,6 +385,17 @@ pub(crate) fn chord(names: &[String]) -> Chord {
     }
 }
 
+/// The edge of this computer's screens that leads to a peer on `side`, for
+/// sentences.
+fn edge_name(side: Side) -> &'static str {
+    match side {
+        Side::Left => "left",
+        Side::Right => "right",
+        Side::Above => "top",
+        Side::Below => "bottom",
+    }
+}
+
 /// Says how to end a session at once from this computer's keyboard.
 fn emergency_keys_note(chord: &Chord) -> String {
     let keys = if *chord != Chord::default() {
@@ -353,8 +440,10 @@ async fn quit_on_signal(signals: Arc<Signals>) {
     std::process::exit(130);
 }
 
+/// Waits for the OS's next request to quit, and says which it was. The
+/// app's window waits for these too ([`crate::service::on_quit_signal`]).
 #[cfg(unix)]
-async fn next_quit_signal() -> &'static str {
+pub(crate) async fn next_quit_signal() -> &'static str {
     use tokio::signal::unix::{SignalKind, signal};
 
     async fn wait(kind: SignalKind) {
@@ -630,6 +719,9 @@ mod tests {
         let signals = Arc::new(Signals::default());
         // The hook is process-wide: install it only around the two panics.
         // A panic in another test meanwhile only lands in this log too.
+        let _one_hook_at_a_time = crate::PANIC_HOOK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = panic::take_hook();
         install_panic_hook(signals.clone(), Some(log.clone()));
         let fixed = std::thread::Builder::new()

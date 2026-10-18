@@ -1,16 +1,17 @@
 //! Tests of the agent with fake platforms: the action executor, the core
-//! loop's fail-open duties, and two agents talking over loopback hop-net.
-//! Nothing here captures or injects real input, and the network tests bind
-//! 127.0.0.1 only, with discovery off (no multicast).
+//! loop's fail-open duties, the updates an app hears, and two agents talking
+//! over loopback hop-net. Nothing here captures or injects real input, and
+//! the network tests bind 127.0.0.1 only, with discovery off (no multicast).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use hop_core::{Action, CaptureMode as CoreMode, Chord, CoreConfig, State};
 use hop_keymap::ModifierPolicy;
-use hop_net::{Identity, NetConfig, NetEvent, PeerUp, PinnedPeer};
+use hop_net::{DownReason, Identity, NetConfig, NetEvent, PeerUp, PinnedPeer};
 use hop_platform::CaptureMode;
 use hop_proto::{Capability, Negotiated, PROTO_MAJOR, caps};
 use hop_types::{
@@ -21,9 +22,11 @@ use hop_types::{
 use super::exec::Executor;
 use super::fake::{Call, Fake, FakeLink};
 use super::link::NetLink;
+use super::start::Host;
 use super::{Agent, INPUT_QUEUE, PeerPlacement, Settings, Signals};
 use crate::agent::start::chord;
 use crate::logging;
+use crate::service::{AgentHandle, AgentUpdate, PANICKED, Session};
 
 const C: KeyCode = KeyCode::keyboard(0x06);
 const Q: KeyCode = KeyCode::keyboard(0x14);
@@ -678,6 +681,232 @@ fn a_display_change_reaches_the_core_and_the_network() {
     let layout = agent.core.layout();
     let me = layout.device(&mac_id()).expect("this computer");
     assert_eq!(me.displays(), [bigger]);
+}
+
+// ----- updates for an app -----------------------------------------------------
+
+/// A Mac with the PC on its right that reports to an app; not connected
+/// yet.
+fn reporting_mac_agent() -> (Agent<FakeLink>, Fake, FakeLink, mpsc::Receiver<AgentUpdate>) {
+    let (platform, fake) = Fake::new(1512.0, 982.0);
+    let link = FakeLink::default();
+    let mut agent = Agent::start(
+        platform,
+        link.clone(),
+        settings(mac_id(), Os::MacOs, pc_id(), "PC", Edge::Right),
+        Arc::new(Signals::default()),
+    )
+    .expect("agent");
+    let (tx, updates) = mpsc::channel();
+    agent.report_to(tx);
+    (agent, fake, link, updates)
+}
+
+fn connected(name: &str, os: Os) -> AgentUpdate {
+    AgentUpdate::Connected {
+        name: name.to_owned(),
+        os,
+    }
+}
+
+#[test]
+fn a_connection_reaches_the_app_as_connected_then_disconnected() {
+    let (mut agent, _, link, updates) = reporting_mac_agent();
+    link.deliver(peer_up(pc_id(), "PC", Os::Windows, display(1536.0, 864.0)));
+    let _ = agent.poll();
+    link.deliver(NetEvent::PeerDown {
+        peer: pc_id(),
+        reason: DownReason::TimedOut,
+    });
+    let _ = agent.poll();
+    assert_eq!(
+        updates.try_iter().collect::<Vec<_>>(),
+        [connected("PC", Os::Windows), AgentUpdate::Disconnected]
+    );
+}
+
+#[test]
+fn a_crossing_reports_controlling_once_then_idle() {
+    let (mut agent, fake, link, updates) = reporting_mac_agent();
+    link.deliver(peer_up(pc_id(), "PC", Os::Windows, display(1536.0, 864.0)));
+    let _ = agent.poll();
+    // Entering, then controlling once the PC accepts: one kind, one update.
+    cross_to_the_pc(&mut agent, &fake, &link);
+    agent.tick();
+    agent.tick();
+    // The lease lapsed: the session ends, failing open.
+    fake.state().mode = CaptureMode::Passive;
+    agent.tick();
+    assert_eq!(agent.state(), State::Idle);
+    assert_eq!(
+        updates.try_iter().collect::<Vec<_>>(),
+        [
+            connected("PC", Os::Windows),
+            AgentUpdate::Session(Session::Controlling),
+            AgentUpdate::Session(Session::Idle),
+        ]
+    );
+}
+
+#[test]
+fn being_controlled_is_reported_and_quitting_ends_it() {
+    let (platform, _) = Fake::new(1536.0, 864.0);
+    let link = FakeLink::default();
+    let mut agent = Agent::start(
+        platform,
+        link.clone(),
+        settings(pc_id(), Os::Windows, mac_id(), "Mac", Edge::Left),
+        Arc::new(Signals::default()),
+    )
+    .expect("agent");
+    let (tx, updates) = mpsc::channel();
+    agent.report_to(tx);
+    link.deliver(peer_up(mac_id(), "Mac", Os::MacOs, display(1512.0, 982.0)));
+    let _ = agent.poll();
+    mac_enters(&mut agent, &link);
+    agent.quit();
+    assert_eq!(
+        updates.try_iter().collect::<Vec<_>>(),
+        [
+            connected("Mac", Os::MacOs),
+            AgentUpdate::Session(Session::Controlled),
+            AgentUpdate::Session(Session::Idle),
+        ]
+    );
+}
+
+#[test]
+fn without_an_app_nothing_is_reported() {
+    // `hop run`: no channel, and the core loop works as before.
+    let (mut agent, fake, link, _) = mac_agent();
+    cross_to_the_pc(&mut agent, &fake, &link);
+    agent.quit();
+    assert_eq!(agent.state(), State::Idle);
+}
+
+#[test]
+fn the_agent_thread_reports_a_session_and_stopped_comes_last() {
+    let (platform, fake) = Fake::new(1512.0, 982.0);
+    let link = FakeLink::default();
+    let thread_link = link.clone();
+    let (tx, updates) = mpsc::channel();
+    let handle = AgentHandle::spawn(tx, move |signals, updates| {
+        let mut agent = Agent::start(
+            platform,
+            thread_link,
+            settings(mac_id(), Os::MacOs, pc_id(), "PC", Edge::Right),
+            signals.clone(),
+        )?;
+        agent.report_to(updates);
+        agent.run();
+        agent.quit();
+        Ok(())
+    })
+    .expect("thread");
+    let wait = Duration::from_secs(10);
+    link.deliver(peer_up(pc_id(), "PC", Os::Windows, display(1536.0, 864.0)));
+    assert_eq!(updates.recv_timeout(wait), Ok(connected("PC", Os::Windows)));
+
+    // Push past the Mac's right edge until the core sends Enter, then the
+    // PC accepts.
+    fake.state().cursor = Point::new(1505.0, 400.0);
+    wait_until(wait, "the Enter", || {
+        fake.motion(20.0, 0.0);
+        thread::sleep(Duration::from_millis(20));
+        link.sent()
+            .iter()
+            .any(|msg| matches!(msg, CoreMessage::Enter { .. }))
+    });
+    assert_eq!(
+        updates.recv_timeout(wait),
+        Ok(AgentUpdate::Session(Session::Controlling))
+    );
+    let seq = enter_seq(&link);
+    link.deliver(NetEvent::Message {
+        from: pc_id(),
+        msg: CoreMessage::EnterAck { seq },
+    });
+    wait_until(wait, "suppression", || {
+        let state = fake.state();
+        state.mode == CaptureMode::Suppress && state.parked
+    });
+
+    // Stop sharing: input back, then the thread ends with Stopped.
+    handle.stop();
+    assert!(handle.wait(wait), "the agent thread ended");
+    assert_eq!(
+        updates.try_iter().collect::<Vec<_>>(),
+        [
+            AgentUpdate::Session(Session::Idle),
+            AgentUpdate::Stopped { error: None }
+        ]
+    );
+    assert!(link.sent().contains(&CoreMessage::Release { seq }));
+    let state = fake.state();
+    assert_eq!(state.mode, CaptureMode::Passive);
+    assert!(!state.parked, "the cursor was given back");
+    assert_eq!(state.calls.last(), Some(&Call::StopCapture));
+}
+
+#[test]
+fn stopped_is_the_last_update_even_when_starting_fails() {
+    let (tx, updates) = mpsc::channel();
+    let handle = AgentHandle::spawn(tx, |_, _| {
+        Err(anyhow::anyhow!("UDP port 47800 is already in use").context("could not start"))
+    })
+    .expect("thread");
+    assert!(handle.wait(Duration::from_secs(10)));
+    assert_eq!(
+        updates.try_iter().collect::<Vec<_>>(),
+        [AgentUpdate::Stopped {
+            error: Some("could not start: UDP port 47800 is already in use".to_owned())
+        }],
+        "the whole chain of causes"
+    );
+}
+
+#[test]
+fn a_panic_on_the_agent_thread_still_ends_with_stopped() {
+    let (tx, updates) = mpsc::channel();
+    let handle = AgentHandle::spawn(tx, |_, updates| {
+        let _ = updates.send(AgentUpdate::Disconnected);
+        panic!("a test panic on the agent thread");
+    })
+    .expect("thread");
+    assert!(handle.wait(Duration::from_secs(10)));
+    assert_eq!(
+        updates.try_iter().collect::<Vec<_>>(),
+        [
+            AgentUpdate::Disconnected,
+            AgentUpdate::Stopped {
+                error: Some(PANICKED.to_owned())
+            }
+        ]
+    );
+}
+
+#[test]
+fn an_unpaired_computer_stops_with_the_reason_before_touching_input() {
+    // The real start-up sequence, with files of the test's own. It stops at
+    // the pairing check, before the platform, the network or any permission.
+    let dir = std::env::temp_dir().join(format!("hop-agent-unpaired-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (config, key) = (dir.join("config.toml"), dir.join("identity.pem"));
+    let (tx, updates) = mpsc::channel();
+    let handle = AgentHandle::spawn(tx, move |signals, updates| {
+        super::start::run(signals, Host::App(updates), || {
+            crate::startup::load_from(config, &key)
+        })
+        .map(drop)
+    })
+    .expect("thread");
+    assert!(handle.wait(Duration::from_secs(10)));
+    let all: Vec<AgentUpdate> = updates.try_iter().collect();
+    let [AgentUpdate::Stopped { error: Some(error) }] = all.as_slice() else {
+        panic!("only Stopped, with the reason: {all:?}");
+    };
+    assert!(error.contains("not paired"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ----- two agents over loopback ---------------------------------------------

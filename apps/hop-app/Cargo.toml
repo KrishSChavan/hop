@@ -1,0 +1,46 @@
+[package]
+name = "hop-app"
+description = "The Hop app: a window to pair the two computers, say where the other one sits, and start and stop sharing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Everything Hop does (sharing, pairing, settings, the log) and, on a Mac,
+# the hop command line, which Hop.app's scripts still use.
+hop-agent.workspace = true
+# Only for the type `main` returns, so a command-line error prints the way
+# it does from the hop command.
+anyhow.workspace = true
+# The app's own log lines; hop-agent's log writes them.
+tracing.workspace = true
+# The window: egui, drawn by wgpu. Only what Hop uses:
+# - default_fonts: egui's own fonts, so text never depends on system fonts;
+# - wgpu: the renderer (Metal on a Mac, Direct3D 12 or Vulkan on Windows);
+# - clipboard: copy and paste in the Code and Address fields.
+eframe = { workspace = true, features = ["default_fonts", "wgpu", "clipboard"] }
+
+# On a Mac, only to ask winit (eframe's windowing library, Apache-2.0; the
+# same version eframe uses) for a regular app with a Dock icon while the
+# window is open: Hop.app's Info.plist says LSUIElement, for the hop
+# commands its scripts start.
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = { version = "0.30.13", default-features = false }
+
+# Linux has no Hop backend yet. This only keeps the app compiling there:
+# winit needs a window system to build for.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { workspace = true, features = ["x11"] }
+
+[build-dependencies]
+# Puts Hop's icon and version details into Hop.exe (MIT). It does nothing
+# when building for other systems.
+embed-resource = "3.0.12"
+
+[features]
+# Development only: save the first frame to the PNG file that the
+# EFRAME_SCREENSHOT_TO environment variable names, then exit. eframe does
+# this only with its OpenGL renderer (glow), so this adds that renderer and
+# the app picks it when the variable is set.
+screenshot = ["eframe/__screenshot", "eframe/glow"]

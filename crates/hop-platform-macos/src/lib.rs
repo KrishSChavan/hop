@@ -61,6 +61,17 @@ pub use activity::AppNapExemption;
 pub use ui::{open_test_window, run_with_ui};
 
 use hop_platform::{Platform, Result};
+use objc2::rc::autoreleasepool;
+use objc2_foundation::{NSProcessInfo, NSString};
+
+/// Sets the name AppKit knows this process by. The app menu's "About",
+/// "Hide" and "Quit" items use it; without this it is the executable's
+/// name, which Hop.app keeps lower-case (`Contents/MacOS/hop`). Call it on
+/// the main thread, before the menu is built (before the window's event
+/// loop starts): macOS does not make changing the name thread-safe.
+pub fn set_process_name(name: &str) {
+    autoreleasepool(|_| NSProcessInfo::processInfo().setProcessName(&NSString::from_str(name)));
+}
 
 /// The macOS implementation of every `hop-platform` trait.
 ///

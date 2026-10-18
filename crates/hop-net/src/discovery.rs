@@ -201,6 +201,20 @@ impl Discovery {
     }
 }
 
+impl Drop for Discovery {
+    /// mdns-sd's responder thread stops only when told to, so a `Discovery`
+    /// dropped without [`Discovery::shutdown`] (a search cancelled while it
+    /// listens, or a failed advertisement) stops it here, without goodbyes.
+    /// Otherwise it would stay on UDP 5353 for the rest of the process. After
+    /// a shutdown, telling it again only returns an error, which is ignored.
+    fn drop(&mut self) {
+        if let Some(browser) = self.browser.take() {
+            browser.abort();
+        }
+        let _ = self.daemon.shutdown();
+    }
+}
+
 /// Looks for `hop pair` instances for `wait`, and returns those found other
 /// than this device's own. The joiner uses it when no `--address` is given;
 /// if more than one laptop advertises pairing, it must ask the user to pick

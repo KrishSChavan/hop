@@ -9,10 +9,13 @@
 //!
 //! - Lines go to `hop.log` in the log folder, capped at 10 MiB plus one old
 //!   file (`hop.old.log`), so a stranger on the network who triggers
-//!   warnings cannot fill the disk.
+//!   warnings cannot fill the disk. The app writes `hop-app.log` (and
+//!   `hop-app.old.log`) the same way: see [`start_app_log`].
 //! - Status lines (see [`status!`](crate::status)) go to stdout as well: one
 //!   short line per connection or session change. In Hop.app stdout goes to a
-//!   file too, so status lines follow the same rules as the log.
+//!   file too, so status lines follow the same rules as the log. The app
+//!   prints nothing; it hands each status line to a tap instead
+//!   ([`Options`]), which feeds its Activity list.
 //! - Hop's own crates log at `info` and above; every other crate (quinn,
 //!   mdns-sd) at `warn` and above.
 //! - Control characters in a line are escaped, so text that came from the
@@ -43,9 +46,13 @@ use tracing::{Event, Level, Metadata, Subscriber};
 /// The `tracing` target of status lines.
 pub const STATUS_TARGET: &str = "hop::status";
 
+/// The app's log file inside [`log_dir`]. It rotates to `hop-app.old.log`,
+/// while `hop run` keeps `hop.log`.
+pub const APP_LOG_FILE: &str = "hop-app.log";
+
 /// Writes a status line: one short sentence about a connection or session
-/// change, printed on stdout and written to the log. Never put keys,
-/// clipboard text or codes in one.
+/// change, printed on stdout (or handed to the app's tap) and written to
+/// the log. Never put keys, clipboard text or codes in one.
 #[macro_export]
 macro_rules! status {
     ($($arg:tt)+) => {
@@ -100,7 +107,9 @@ fn is_hop_target(target: &str) -> bool {
 /// Where the writer thread puts lines.
 pub enum Destination {
     /// A log file (created with its folder if missing), plus stdout for
-    /// status lines.
+    /// status lines. When it reaches 10 MiB it is moved aside as the one
+    /// old file, `<name>.old.log` (`hop.log` → `hop.old.log`, `hop-app.log`
+    /// → `hop-app.old.log`).
     File(PathBuf),
     /// Status lines on stdout and nothing else, for when the log file
     /// cannot be opened: status lines are the user's only view of what Hop
@@ -111,10 +120,37 @@ pub enum Destination {
     Memory(Arc<Mutex<Vec<String>>>),
 }
 
+/// Called with the text of each status line (no time stamp), on the log's
+/// writer thread.
+pub type StatusTap = Box<dyn FnMut(&str) + Send>;
+
+/// What a [`Log`] does with status lines besides writing them to its
+/// [`Destination`].
+pub struct Options {
+    /// Print each status line on stdout too, as `hop run` does. Off for the
+    /// app, which has no terminal.
+    pub echo_status: bool,
+    /// Hands each status line to the app (its Activity list), after it is
+    /// written. It runs on the log's writer thread, never on the thread that
+    /// logged, so a slow tap can delay only the log's own writing; keep it
+    /// short all the same (store the line and ask for a repaint).
+    pub status_tap: Option<StatusTap>,
+}
+
+impl Default for Options {
+    /// What `hop run` uses: status lines on stdout, no tap.
+    fn default() -> Self {
+        Options {
+            echo_status: true,
+            status_tap: None,
+        }
+    }
+}
+
 /// One item for the writer thread.
 enum Entry {
     Line(String),
-    /// A status line: `line` for the log, `text` for stdout.
+    /// A status line: `line` for the log, `text` for stdout and the tap.
     Status {
         line: String,
         text: String,
@@ -131,14 +167,33 @@ pub struct Log {
 }
 
 impl Log {
-    /// Starts the writer thread.
+    /// Starts the writer thread, with status lines echoed on stdout.
     ///
     /// # Errors
     ///
     /// The log file or its folder could not be opened or created, or the
     /// thread could not start.
     pub fn start(destination: Destination) -> io::Result<Log> {
-        let mut writer = Writer::open(destination)?;
+        Log::start_with(destination, Options::default())
+    }
+
+    /// Starts the writer thread with `options`: whether status lines are
+    /// echoed on stdout, and the tap that receives them.
+    ///
+    /// # Errors
+    ///
+    /// The log file or its folder could not be opened or created, or the
+    /// thread could not start.
+    pub fn start_with(destination: Destination, options: Options) -> io::Result<Log> {
+        Log::spawn(Target::open(destination)?, options)
+    }
+
+    fn spawn(target: Target, options: Options) -> io::Result<Log> {
+        let mut writer = Writer {
+            target,
+            echo: options.echo_status,
+            tap: options.status_tap,
+        };
         let (tx, rx) = mpsc::sync_channel(QUEUE_LINES);
         thread::Builder::new()
             .name("hop-log".into())
@@ -217,6 +272,74 @@ impl Log {
         );
         self.send(Entry::Status { line, text });
     }
+}
+
+/// The folder Hop's logs go in: `~/Library/Logs/Hop` on macOS and
+/// `%LOCALAPPDATA%\Hop\Logs` on Windows. `None` when the variable it rests
+/// on is missing.
+pub fn log_dir() -> Option<PathBuf> {
+    crate::paths::log_dir()
+}
+
+/// Starts the app's log, for the whole life of the app, and makes it the
+/// process's `tracing` destination (with [`Filter::AGENT`]): it writes
+/// [`APP_LOG_FILE`] in [`log_dir`], rotated like `hop.log`, prints nothing,
+/// and hands every status line to `tap` on the log's writer thread (see
+/// [`Options::status_tap`]). Returns the log, for the panic hook and for a
+/// last flush, and the file it writes.
+///
+/// Without a usable log folder the app still runs: status lines still reach
+/// `tap` (the first one says the log could not be opened), and the file is
+/// `None`.
+///
+/// # Errors
+///
+/// Only when the writer thread could not start.
+pub fn start_app_log(tap: impl FnMut(&str) + Send + 'static) -> io::Result<(Log, Option<PathBuf>)> {
+    let (log, file) = open_app_log(log_dir(), Box::new(tap))?;
+    // Only one destination per process: if something got there first, the
+    // log still takes the lines written to it directly.
+    log.install(Filter::AGENT);
+    Ok((log, file))
+}
+
+/// [`start_app_log`] in `dir`, without installing the log.
+fn open_app_log(dir: Option<PathBuf>, tap: StatusTap) -> io::Result<(Log, Option<PathBuf>)> {
+    let options = Options {
+        echo_status: false,
+        status_tap: Some(tap),
+    };
+    let (target, file, why) = match dir {
+        Some(dir) => {
+            let path = dir.join(APP_LOG_FILE);
+            match FileLog::open(path.clone()) {
+                Ok(log) => (Target::File(log), Some(path), None),
+                Err(error) => (
+                    Target::StatusOnly,
+                    None,
+                    Some(format!(
+                        "Could not open the log {} ({error}), so this session is not written \
+                         to a file.",
+                        path.display()
+                    )),
+                ),
+            }
+        }
+        None => (
+            Target::StatusOnly,
+            None,
+            Some(
+                "Could not work out where the log folder is, so this session is not written to \
+                 a file."
+                    .to_owned(),
+            ),
+        ),
+    };
+    let log = Log::spawn(target, options)?;
+    if let Some(why) = why {
+        log.write_status(&why);
+    }
+    Ok((log, file))
 }
 
 /// The `tracing` subscriber: formats events into lines for a [`Log`].
@@ -361,6 +484,10 @@ fn truncate(text: &mut String, max: usize) {
 /// The writer thread's side.
 struct Writer {
     target: Target,
+    /// Whether status lines go to stdout too.
+    echo: bool,
+    /// The app's tap, if any.
+    tap: Option<StatusTap>,
 }
 
 enum Target {
@@ -370,17 +497,18 @@ enum Target {
     Memory(Arc<Mutex<Vec<String>>>),
 }
 
-impl Writer {
-    fn open(destination: Destination) -> io::Result<Writer> {
-        let target = match destination {
+impl Target {
+    fn open(destination: Destination) -> io::Result<Target> {
+        Ok(match destination {
             Destination::File(path) => Target::File(FileLog::open(path)?),
             Destination::StatusOnly => Target::StatusOnly,
             #[cfg(test)]
             Destination::Memory(lines) => Target::Memory(lines),
-        };
-        Ok(Writer { target })
+        })
     }
+}
 
+impl Writer {
     fn run(&mut self, rx: Receiver<Entry>) {
         // `recv` fails only when every sender is gone; the subscriber keeps
         // one for the life of the process, so this runs until exit.
@@ -406,6 +534,11 @@ impl Writer {
                     let mut out = io::stdout().lock();
                     let _ = writeln!(out, "{text}");
                     let _ = out.flush();
+                }
+                // Here, on the writer thread, for the same reason: an app
+                // that is slow to take the line holds up nobody who logs.
+                if let Some(tap) = &mut self.tap {
+                    tap(&text);
                 }
             }
             Entry::Flush(done) => {
@@ -436,10 +569,11 @@ impl Writer {
         }
     }
 
-    /// Status lines go to stdout too, except in tests.
+    /// Status lines go to stdout too, unless the log was started without
+    /// echo (the app) or for a test.
     fn prints_status(&self) -> bool {
         match self.target {
-            Target::File(_) | Target::StatusOnly => true,
+            Target::File(_) | Target::StatusOnly => self.echo,
             #[cfg(test)]
             Target::Memory(_) => false,
         }
@@ -653,6 +787,154 @@ pub(crate) mod tests {
         assert!(old <= MAX_LOG_BYTES && old > MAX_LOG_BYTES - 2048, "{old}");
         assert_eq!(size + old, 12 * 1024 * 1024);
         drop(log);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh folder for one test's files.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hop-log-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    type Tapped = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    /// A tap that records each line with the name of the thread it ran on.
+    fn recording_tap() -> (StatusTap, Tapped) {
+        let tapped: Tapped = Arc::new(Mutex::new(Vec::new()));
+        let seen = tapped.clone();
+        let tap: StatusTap = Box::new(move |text: &str| {
+            let thread = thread::current().name().map(str::to_owned);
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((text.to_owned(), thread));
+        });
+        (tap, tapped)
+    }
+
+    fn texts(tapped: &Tapped) -> Vec<String> {
+        tapped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(text, _)| text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_tap_gets_each_status_line_on_the_writer_thread() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let (tap, tapped) = recording_tap();
+        let log = Log::start_with(
+            Destination::Memory(lines.clone()),
+            Options {
+                echo_status: false,
+                status_tap: Some(tap),
+            },
+        )
+        .expect("log");
+        log.write_status("Connected to PC (Windows).");
+        log.send(Entry::Line("INFO  hop_net: not a status line".to_owned()));
+        log.write_status("PC\nWARN a forged line");
+        log.flush(Duration::from_secs(5));
+
+        assert_eq!(
+            texts(&tapped),
+            ["Connected to PC (Windows).", "PC\\nWARN a forged line"],
+            "status lines only, cleaned, in order"
+        );
+        for (_, thread) in tapped.lock().unwrap_or_else(PoisonError::into_inner).iter() {
+            assert_eq!(
+                thread.as_deref(),
+                Some("hop-log"),
+                "never the logging thread"
+            );
+        }
+        assert_eq!(
+            lines.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            3,
+            "every line is still written"
+        );
+    }
+
+    #[test]
+    fn only_a_log_started_with_echo_prints_status_lines() {
+        let writer = |echo| Writer {
+            target: Target::StatusOnly,
+            echo,
+            tap: None,
+        };
+        assert!(writer(true).prints_status(), "hop run");
+        assert!(!writer(false).prints_status(), "the app");
+        assert!(Options::default().echo_status);
+    }
+
+    #[test]
+    fn the_app_writes_hop_app_log_which_rotates_to_hop_app_old_log() {
+        assert_eq!(
+            old_path(&Path::new("Logs").join(APP_LOG_FILE)),
+            Path::new("Logs").join("hop-app.old.log")
+        );
+        assert_eq!(
+            old_path(&Path::new("Logs").join(crate::paths::LOG_FILE)),
+            Path::new("Logs").join("hop.old.log"),
+            "hop run keeps its own files"
+        );
+
+        let dir = scratch("app");
+        let (tap, tapped) = recording_tap();
+        let (log, file) = open_app_log(Some(dir.clone()), tap).expect("log");
+        assert_eq!(file, Some(dir.join(APP_LOG_FILE)));
+        log.write_status("Hop is starting.");
+        log.flush(Duration::from_secs(5));
+        let written = fs::read_to_string(dir.join(APP_LOG_FILE)).expect("hop-app.log");
+        assert!(written.contains("Hop is starting."), "{written}");
+        assert_eq!(texts(&tapped), ["Hop is starting."]);
+        assert!(!dir.join(crate::paths::LOG_FILE).exists());
+
+        // A full app log moves aside as hop-app.old.log. (In a folder of its
+        // own: Windows cannot rename the file the log above still has open.)
+        let rotating = scratch("app-rotate");
+        let mut file_log = FileLog::open(rotating.join(APP_LOG_FILE)).expect("open");
+        file_log.write_line("the first line");
+        file_log.rotate();
+        file_log.write_line("the second line");
+        file_log.flush();
+        let old = fs::read_to_string(rotating.join("hop-app.old.log")).expect("old log");
+        let new = fs::read_to_string(rotating.join(APP_LOG_FILE)).expect("new log");
+        assert_eq!(
+            (old.as_str(), new.as_str()),
+            ("the first line\n", "the second line\n")
+        );
+        drop(file_log);
+        let _ = fs::remove_dir_all(&rotating);
+        // The writer thread may still hold hop-app.log open; on Windows the
+        // folder then stays behind in the temp folder, which is harmless.
+        drop(log);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_log_file_the_app_still_gets_its_status_lines() {
+        let dir = scratch("app-no-file");
+        fs::create_dir_all(&dir).expect("dir");
+        // A log folder inside a file can never be made.
+        let blocker = dir.join("not-a-folder");
+        fs::write(&blocker, "").expect("file");
+        for unusable in [Some(blocker.join("Logs")), None] {
+            let (tap, tapped) = recording_tap();
+            let (log, file) = open_app_log(unusable.clone(), tap).expect("log");
+            assert_eq!(file, None, "{unusable:?}");
+            log.write_status("Hop is starting.");
+            log.flush(Duration::from_secs(5));
+            let texts = texts(&tapped);
+            assert_eq!(texts.len(), 2, "{texts:?}");
+            assert!(
+                texts[0].contains("not written to a file"),
+                "the app hears why: {texts:?}"
+            );
+            assert_eq!(texts[1], "Hop is starting.");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
