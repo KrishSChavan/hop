@@ -7,6 +7,40 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-hop-config.workspace = true
+# No hop-config: the agent maps its config to `NetConfig` and `PinnedPeer`,
+# so this crate does not depend on the file format.
 hop-proto.workspace = true
 hop-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Datagram payloads for quinn (MIT).
+bytes = "=1.12.1"
+# OS random numbers for pairing codes and backoff jitter (MIT OR Apache-2.0).
+getrandom = "=0.4.3"
+# HMAC-SHA256 for pairing key confirmation (MIT OR Apache-2.0). The 0.12
+# line is the RustCrypto release that spake2 0.4 builds on.
+hmac = "=0.12.1"
+# mDNS advertise and browse (Apache-2.0 OR MIT). `logging` is off, so the
+# library writes nothing to Hop's log.
+mdns-sd = { version = "=0.21.5", default-features = false, features = ["async"] }
+# QUIC (MIT OR Apache-2.0). Default features off: no aws-lc-rs (it needs
+# CMake and NASM on Windows) and no platform certificate verifier.
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Self-signed certificate from the device key (MIT OR Apache-2.0), with the
+# ring backend.
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
+# TLS 1.3 for QUIC (Apache-2.0 OR ISC OR MIT), ring provider only, no TLS 1.2.
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std"] }
+# SHA-256 for fingerprints and HMAC (MIT OR Apache-2.0).
+sha2 = "=0.10.9"
+# SPAKE2 for pairing (MIT OR Apache-2.0). Its default `getrandom` feature
+# gives it the OS random number generator.
+spake2 = "=0.4.0"
+# Wiping key material from memory after use (Apache-2.0 OR MIT).
+zeroize = "=1.9.1"
+# Async runtime (MIT). The agent owns the runtime; this crate spawns onto it.
+tokio = { version = "=1.53.3", features = ["macros", "net", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "=1.53.3", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
