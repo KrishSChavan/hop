@@ -17,6 +17,9 @@ fn fast() -> SelfTestOptions {
         report_path: None,
         time_limit: Duration::from_secs(60),
         print_to_stdout: false,
+        // Most tests check what steps do, not how they start; the start
+        // click has its own tests below.
+        wait_for_start: false,
         timing: Timing {
             countdown: Duration::from_millis(20),
             capture: Duration::from_millis(250),
@@ -644,5 +647,36 @@ fn without_a_window_only_the_steps_that_need_it_are_skipped() {
         );
     }
     assert_pass(&report, StepId::Park);
+    assert_handed_back(&fake);
+}
+
+// ----- starting each step ----------------------------------------------------------------
+
+#[test]
+fn each_step_waits_for_the_start_click_and_does_not_count_it() {
+    let mut fake = Fake::new(Script::cooperative(), |_| {});
+    let mut options = fast();
+    options.wait_for_start = true;
+    let report = fake.run(&options, &[StepId::Capture, StepId::Clicking]);
+    // The clicking step expects exactly one click on the button, so a start
+    // click counted as its own would fail it.
+    assert_pass(&report, StepId::Capture);
+    assert_pass(&report, StepId::Clicking);
+}
+
+#[test]
+fn without_a_start_click_nothing_runs_and_the_time_limit_ends_the_wait() {
+    let script = Script {
+        clicks_start: false,
+        ..Script::cooperative()
+    };
+    let mut fake = Fake::new(script, |_| {});
+    let mut options = fast();
+    options.wait_for_start = true;
+    options.time_limit = Duration::from_millis(400);
+    let report = fake.run(&options, &[StepId::Clicking]);
+    assert_eq!(report.stop, Some(Stop::TimeLimit(StepId::Clicking)));
+    // Nothing was clicked for the user, and everything was handed back.
+    assert_eq!(fake.world().clicks, 0);
     assert_handed_back(&fake);
 }

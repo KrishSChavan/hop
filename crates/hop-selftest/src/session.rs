@@ -112,6 +112,10 @@ impl StepId {
     }
 }
 
+/// What the test window says when a step waits for the user to start it.
+pub(crate) const START_PROMPT: &str =
+    "When you have read this, click the button below to start this step.";
+
 /// The state of one self-test run. Dropping it gives everything back.
 pub(crate) struct Session<'a> {
     pub(crate) platform: &'a mut Platform,
@@ -119,6 +123,8 @@ pub(crate) struct Session<'a> {
     pub(crate) os: Os,
     pub(crate) timing: Timing,
     print: bool,
+    /// Each step waits for the user to click the button before it starts.
+    wait_for_start: bool,
     pub(crate) time_limit: Duration,
     deadline: Instant,
     /// Set by the capture sink when the emergency chord is pressed.
@@ -150,6 +156,7 @@ impl<'a> Session<'a> {
             os: Os::current(),
             timing: options.timing.clone().sanitized(),
             print: options.print_to_stdout,
+            wait_for_start: options.wait_for_start,
             time_limit: options.time_limit,
             // A limit too large for the clock means no limit.
             deadline: now
@@ -407,6 +414,9 @@ impl<'a> Session<'a> {
     /// Counts down before a step acts, so nothing moves by surprise.
     pub(crate) fn countdown(&mut self, step: StepId, text: &str) -> Result<(), StepError> {
         let body = format!("{}\n\n{text}", step.heading());
+        if self.wait_for_start {
+            self.wait_for_start_click(&body)?;
+        }
         let total = self.timing.countdown;
         if !total.is_zero() {
             let ticks = u32::try_from(total.as_millis().div_ceil(1000))
@@ -427,6 +437,29 @@ impl<'a> Session<'a> {
         }
         self.show(&format!("{body}\n\nGo!"));
         Ok(())
+    }
+
+    /// Shows a step's instructions and waits until the user clicks the test
+    /// window's button, so every step starts only once it has been read.
+    /// The wait ends early only by the emergency chord or the overall time
+    /// limit. Steps read the button's click count after this, so the start
+    /// click is never mistaken for one of theirs.
+    fn wait_for_start_click(&mut self, body: &str) -> Result<(), StepError> {
+        let Ok(before) = self.window.button_clicks() else {
+            // No usable window: carry on, and the steps that need it say so.
+            return Ok(());
+        };
+        self.show(&format!("{body}\n\n{START_PROMPT}"));
+        self.say(START_PROMPT);
+        let interval = self.timing.poll_interval.max(Duration::from_millis(20));
+        loop {
+            self.sleep(interval)?;
+            match self.window.button_clicks() {
+                Ok(now) if now > before => return Ok(()),
+                Ok(_) => {}
+                Err(_) => return Ok(()),
+            }
+        }
     }
 
     // ----- giving everything back ---------------------------------------------

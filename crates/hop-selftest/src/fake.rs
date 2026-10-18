@@ -24,6 +24,7 @@ use crate::keys::{KEY_A, KEY_C, command_key, key_for_char};
 use crate::observe::Sink;
 use crate::options::SelfTestOptions;
 use crate::report::{Report, StepId};
+use crate::session::START_PROMPT;
 
 pub(crate) type Shared = Arc<Mutex<World>>;
 
@@ -548,6 +549,8 @@ pub(crate) struct Script {
     pub chord_in: Option<StepId>,
     /// Presses the emergency chord while the cursor is parked.
     pub chord_while_parked: bool,
+    /// Clicks the button whenever a step asks to be started.
+    pub clicks_start: bool,
 }
 
 impl Script {
@@ -557,6 +560,7 @@ impl Script {
             follows_capture: true,
             wiggles: true,
             push: Some(25.0),
+            clicks_start: true,
             ..Self::default()
         }
     }
@@ -663,6 +667,14 @@ fn spawn_user(world: Shared, script: Script, stop: Arc<AtomicBool>) -> JoinHandl
                     press_chord(&mut w);
                 }
                 wiggle = -wiggle;
+                if script.clicks_start && w.instructions.contains(START_PROMPT) {
+                    for pressed in [true, false] {
+                        w.physical(InputEvent::Button {
+                            button: MouseButton::Left,
+                            pressed,
+                        });
+                    }
+                }
                 match step {
                     Some(StepId::Capture) if script.follows_capture => {
                         let command = command_key(Os::current());

@@ -7,8 +7,9 @@ use std::time::Duration;
 use hop_platform::SUPPRESS_LEASE;
 
 /// The default hard limit on a whole self-test run. The steps themselves
-/// take about a minute, countdowns included.
-pub const DEFAULT_TIME_LIMIT: Duration = Duration::from_secs(120);
+/// take about a minute, but each one first waits for the user to read it and
+/// click Start, so the limit is generous. It is a safety net, not a pace.
+pub const DEFAULT_TIME_LIMIT: Duration = Duration::from_secs(15 * 60);
 
 /// How long each part of the self-test takes.
 ///
@@ -112,6 +113,10 @@ pub struct SelfTestOptions {
     /// Print each step's instructions and result to stdout as well as
     /// showing them in the test window.
     pub print_to_stdout: bool,
+    /// Before each step, show its instructions and wait until the user
+    /// clicks the test window's button, so nothing starts before it has been
+    /// read. Only the emergency chord or the time limit ends the wait.
+    pub wait_for_start: bool,
 }
 
 impl Default for SelfTestOptions {
@@ -121,6 +126,7 @@ impl Default for SelfTestOptions {
             time_limit: DEFAULT_TIME_LIMIT,
             timing: Timing::default(),
             print_to_stdout: true,
+            wait_for_start: true,
         }
     }
 }
