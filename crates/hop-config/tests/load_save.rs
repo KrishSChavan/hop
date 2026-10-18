@@ -3,7 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use hop_config::{Config, ConfigError, PeerConfig, Side, ValidationError, Warning};
+use hop_config::{
+    Config, ConfigError, PeerConfig, Side, ValidationError, Warning, device_id_from_fingerprint,
+};
 use hop_types::{DeviceId, Os};
 
 /// A fresh, empty folder for one test inside Cargo's scratch folder for
@@ -28,6 +30,10 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
+/// The fingerprint of the PC's key, as pairing writes it.
+const PC_FINGERPRINT: &str = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d05a3f19c7e2b8d4a60f1e9c3b7d2a8e45";
+
+/// A paired PC: its id is the start of its fingerprint.
 fn windows_pc() -> PeerConfig {
     PeerConfig {
         name: "Windows PC".to_owned(),
@@ -35,6 +41,7 @@ fn windows_pc() -> PeerConfig {
         os: Os::Windows,
         side: Side::Right,
         address: Some("192.168.1.42".to_owned()),
+        fingerprint: Some(PC_FINGERPRINT.to_owned()),
     }
 }
 
@@ -73,6 +80,7 @@ fn every_setting_round_trips() {
         os: Os::MacOs,
         side: Side::Above,
         address: None,
+        fingerprint: None,
     });
     config.input.edge_delay_ms = 150;
     config.input.corner_dead_zone = 12.5;
@@ -87,6 +95,84 @@ fn every_setting_round_trips() {
 
     config.save(&path).unwrap();
     assert_eq!(Config::load(&path).unwrap(), (config, vec![]));
+}
+
+/// A file saved by M0, before pairing existed: peers without fingerprints
+/// and a random device id.
+const M0_FILE: &str = "\
+[device]
+name = \"Krish's MacBook\"
+id = \"5f0c9a1e7b3d4c2a8e6f1b9d0a7c3e52\"
+
+[[peers]]
+name = \"Windows PC\"
+id = \"0c41d8e2b9a7f4e06b3d5a1f8e9c2b7d\"
+os = \"windows\"
+side = \"right\"
+";
+
+#[test]
+fn an_m0_file_still_loads_with_its_peers_unpaired() {
+    let path = scratch("m0").join("config.toml");
+    fs::write(&path, M0_FILE).unwrap();
+    let (config, warnings) = Config::load(&path).unwrap();
+    assert_eq!(warnings, []);
+    assert_eq!(config.peers[0].fingerprint, None);
+    assert_eq!(config.peers[0].pinned_fingerprint(), None);
+}
+
+#[test]
+fn the_first_m2_start_replaces_the_random_id_with_the_one_from_the_key() {
+    let path = scratch("m2-id").join("config.toml");
+    fs::write(&path, M0_FILE).unwrap();
+
+    // What the agent does at every start, with this Mac's own fingerprint.
+    let mac_fingerprint = "9e1f6a3c5b7d2e4f8a0c1b3d5e7f9a2b4c6d8e0f1a3b5c7d9e2f4a6b8c0d1e3f";
+    let id = device_id_from_fingerprint(mac_fingerprint).unwrap();
+    let (mut config, _) = Config::load(&path).unwrap();
+    assert!(config.set_device_id(id.clone()));
+    config.save(&path).unwrap();
+
+    let (mut config, warnings) = Config::load(&path).unwrap();
+    assert_eq!(warnings, []);
+    assert_eq!(
+        config.device.id,
+        DeviceId::new("9e1f6a3c5b7d2e4f8a0c1b3d5e7f9a2b")
+    );
+    assert_eq!(config.device.name, "Krish's MacBook");
+    assert_eq!(config.peers.len(), 1, "the peers are kept");
+    // The next start finds the id already right and has nothing to save.
+    assert!(!config.set_device_id(id));
+}
+
+#[test]
+fn a_malformed_fingerprint_fails_to_load_with_the_path() {
+    let path = scratch("bad-fingerprint").join("config.toml");
+    let text = format!("{M0_FILE}fingerprint = \"not a fingerprint\"\n");
+    fs::write(&path, text).unwrap();
+    let error = Config::load(&path).unwrap_err();
+    let ConfigError::Invalid {
+        path: Some(reported),
+        errors,
+    } = &error
+    else {
+        panic!("expected Invalid, got {error:?}");
+    };
+    assert_eq!(reported, &path);
+    assert_eq!(errors, &[ValidationError::InvalidFingerprint { index: 0 }]);
+    // The bad value is not repeated: it could be anything pasted by mistake.
+    assert!(!error.to_string().contains("not a fingerprint"), "{error}");
+}
+
+#[test]
+fn a_peer_whose_id_does_not_match_its_fingerprint_loads_with_a_warning() {
+    let path = scratch("mismatch").join("config.toml");
+    // The M0 peer id is not the start of this fingerprint.
+    let text = format!("{M0_FILE}fingerprint = \"{PC_FINGERPRINT}\"\n");
+    fs::write(&path, text).unwrap();
+    let (config, warnings) = Config::load(&path).unwrap();
+    assert_eq!(warnings, [Warning::PeerIdMismatch { index: 0 }]);
+    assert_eq!(config.peers[0].pinned_fingerprint(), None);
 }
 
 #[test]

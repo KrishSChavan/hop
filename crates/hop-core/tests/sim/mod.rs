@@ -14,6 +14,14 @@
 //! held, so it checks that no key or button is ever left stuck, that the
 //! emergency chord's last key never reaches the peer, and that crossings and
 //! exits respect held buttons.
+//!
+//! [`Sim::stall`] feeds `LocalStall` as the agent does when it can no longer
+//! vouch for a device's input, and checks that any session ends failing open
+//! and that no key is left down for local apps afterwards. The core forgets
+//! the keys it believed held at a stall, by design (docs/M2-DESIGN.md), so a
+//! key the user keeps holding through a stall is not carried to the peer at
+//! the next crossing: lost, never stuck. The simulation tracks those keys and
+//! checks that no `Enter` ever carries one.
 
 // Each test binary uses a different subset of the helpers.
 #![allow(dead_code)]
@@ -132,6 +140,15 @@ pub struct Device {
     /// `ReleaseAllInjected`. A real injector adds held modifiers to every
     /// later event, so a stale one would change what the user types.
     pub injector_keys: BTreeSet<KeyCode>,
+    /// Keys the user has held down on this device since the last
+    /// `LocalStall` without pressing or releasing them again. The core
+    /// forgot them at the stall, so they are not carried to the peer.
+    pub stalled_keys: BTreeSet<KeyCode>,
+    /// Keys whose key-up the core missed ([`Sim::lose_key_up`]), until the
+    /// stall that reports the loss.
+    pub unheard: BTreeSet<KeyCode>,
+    /// The state each `LocalStall` found this device in.
+    pub stalls: Vec<State>,
     pub release_all: usize,
     pub notices: Vec<Notice>,
     pub sent: Vec<(Millis, CoreMessage)>,
@@ -383,6 +400,9 @@ impl Sim {
                 os_keys: BTreeSet::new(),
                 os_buttons: BTreeSet::new(),
                 injector_keys: BTreeSet::new(),
+                stalled_keys: BTreeSet::new(),
+                unheard: BTreeSet::new(),
+                stalls: Vec::new(),
                 release_all: 0,
                 notices: Vec::new(),
                 sent: Vec::new(),
@@ -521,6 +541,8 @@ impl Sim {
                 if passes {
                     set_held(&mut dev.os_keys, code, pressed);
                 }
+                // The core hears about this key again, so it knows its state.
+                dev.stalled_keys.remove(&code);
             }
             InputEvent::Button { button, pressed } => {
                 set_held(&mut dev.physical_buttons, button, pressed);
@@ -563,6 +585,131 @@ impl Sim {
                 "the chord's {event:?} was forwarded at t={at}: {actions:?}"
             );
         }
+    }
+
+    // ----- stalls ---------------------------------------------------------
+
+    /// The user lets go of `code` on device `d`, but the core never hears of
+    /// it, as when the agent's input queue is full. The local OS still sees
+    /// the key-up if capture lets it through. Nothing is checked yet: the
+    /// agent reports the loss at once, so follow this with [`Sim::stall`].
+    pub fn lose_key_up(&mut self, d: usize, code: KeyCode) {
+        let dev = &mut self.dev[d];
+        if !dev.physical_keys.remove(&code) {
+            return;
+        }
+        if dev.capture == CaptureMode::Passive {
+            dev.os_keys.remove(&code);
+        }
+        // A key held since the last stall is one the core already forgot, so
+        // missing its key-up changes nothing it believes.
+        if !dev.stalled_keys.remove(&code) {
+            dev.unheard.insert(code);
+        }
+    }
+
+    /// The agent tells device `d`'s core that it can no longer vouch for the
+    /// device's input (`LocalStall`: a lapsed lease, lost input or a failed
+    /// platform call).
+    ///
+    /// Checks that any session ends at once and that the peer is told, as
+    /// for the emergency chord; that the only local injections are key-ups
+    /// for what the injector held for local apps (modifiers pressed again
+    /// when the cursor came home), so nothing is left in the injector; and
+    /// that with no session and no key believed held the stall acts exactly
+    /// like a plain `Tick`.
+    pub fn stall(&mut self, d: usize) -> Vec<Action> {
+        let before = self.state(d);
+        let dev = &self.dev[d];
+        // While idle the injector holds only modifiers pressed again on the
+        // way home; while controlled, `ReleaseAllInjected` frees it instead.
+        let expected_releases = if before == State::Idle {
+            dev.injector_keys.clone()
+        } else {
+            BTreeSet::new()
+        };
+        // What the core believes is held: every key it saw go down since the
+        // last stall and not come up, which includes keys whose key-up it
+        // missed.
+        let believed: BTreeSet<KeyCode> = dev
+            .physical_keys
+            .difference(&dev.stalled_keys)
+            .chain(&dev.unheard)
+            .copied()
+            .collect();
+        let twin = (before == State::Idle && believed.is_empty()).then(|| {
+            let mut twin = dev.core.clone();
+            let actions = twin.handle(self.now, Event::Tick);
+            (twin, actions)
+        });
+
+        let actions = self.handle(d, Event::LocalStall);
+
+        let at = self.now;
+        let dev = &mut self.dev[d];
+        let ctx = || {
+            format!(
+                "{} stalled at t={at} while {before:?}: {actions:#?}",
+                dev.id
+            )
+        };
+        assert_eq!(dev.core.state(), State::Idle, "{}", ctx());
+        let sent = |want: CoreMessage| {
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Send { msg, .. } if *msg == want))
+        };
+        match before {
+            State::Entering { seq, .. } | State::Controlling { seq, .. } => {
+                assert!(sent(CoreMessage::Release { seq }), "no Release, {}", ctx());
+            }
+            State::Controlled { seq, .. } => {
+                assert!(
+                    sent(CoreMessage::TakeBack { seq }),
+                    "no TakeBack, {}",
+                    ctx()
+                );
+            }
+            State::Idle => {}
+        }
+        let mut released = BTreeSet::new();
+        for action in &actions {
+            if let Action::Inject { event, source_os } = action
+                && *source_os == dev.os
+            {
+                let InputEvent::Key {
+                    code,
+                    pressed: false,
+                    ..
+                } = *event
+                else {
+                    panic!("a stall injected {event:?} locally, {}", ctx());
+                };
+                released.insert(code);
+            }
+        }
+        assert_eq!(released, expected_releases, "local key-ups, {}", ctx());
+        assert!(
+            dev.injector_keys.is_empty(),
+            "the injector still holds {:?}, {}",
+            dev.injector_keys,
+            ctx()
+        );
+        if let Some((twin, expected)) = twin {
+            assert_eq!(actions, expected, "an idle stall acted, {}", ctx());
+            assert_eq!(
+                format!("{:?}", dev.core),
+                format!("{twin:?}"),
+                "an idle stall changed the core, {}",
+                ctx()
+            );
+        }
+
+        // Every key still held is now unknown to the core.
+        dev.stalled_keys = dev.physical_keys.clone();
+        dev.unheard.clear();
+        dev.stalls.push(before);
+        actions
     }
 
     // ----- time and network ---------------------------------------------
@@ -742,13 +889,28 @@ impl Sim {
                     assert_eq!(*to, self.dev[1 - d].id, "only the peer exists");
                     let dev = &self.dev[d];
                     match msg {
-                        // Crossing rule: no mouse button physically held.
-                        CoreMessage::Enter { .. } => assert!(
-                            dev.physical_buttons.is_empty(),
-                            "{} crossed with {:?} held at t={now}",
-                            dev.id,
-                            dev.physical_buttons
-                        ),
+                        CoreMessage::Enter { held_keys, .. } => {
+                            // Crossing rule: no mouse button physically held.
+                            assert!(
+                                dev.physical_buttons.is_empty(),
+                                "{} crossed with {:?} held at t={now}",
+                                dev.id,
+                                dev.physical_buttons
+                            );
+                            // The peer presses only keys the user is holding
+                            // here and the core has heard go down since the
+                            // last stall; a key-up missed before a stall must
+                            // not become a stuck modifier.
+                            assert!(
+                                held_keys.iter().all(|k| dev.physical_keys.contains(k)
+                                    && !dev.stalled_keys.contains(k)),
+                                "{} sent held keys {held_keys:?} at t={now}, the user holds \
+                                 {:?} ({:?} since a stall)",
+                                dev.id,
+                                dev.physical_keys,
+                                dev.stalled_keys
+                            );
+                        }
                         // Rule 5: no exit while an injected button is held.
                         CoreMessage::Leave { .. } => assert!(
                             dev.remote_buttons.is_empty(),
@@ -923,9 +1085,10 @@ impl Sim {
     /// controlled device holds down exactly the buttons the user holds on
     /// the controller, every modifier the user holds there, and no key the
     /// user is not holding. (Only modifiers travel with `Enter`, so another
-    /// key already down at the crossing is not pressed on the far side.)
-    /// Skipped after a blackhole swallowed a reliable message, which a real
-    /// connection never does without closing.
+    /// key already down at the crossing is not pressed on the far side, and
+    /// neither is a modifier held since a `LocalStall`, which the core has
+    /// forgotten on purpose.) Skipped after a blackhole swallowed a reliable
+    /// message, which a real connection never does without closing.
     fn check_remote_keys(&self) {
         if self.net.dropped_reliable || self.net.in_flight() > 0 || !self.net.stalled.is_empty() {
             return;
@@ -942,7 +1105,7 @@ impl Sim {
         let (controller, controlled) = (&self.dev[c], &self.dev[d]);
         let modifiers: BTreeSet<KeyCode> = controller
             .physical_keys
-            .iter()
+            .difference(&controller.stalled_keys)
             .copied()
             .filter(|k| k.is_modifier())
             .collect();

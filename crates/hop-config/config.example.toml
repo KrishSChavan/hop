@@ -8,19 +8,26 @@
 [device]
 # The name the PC shows for this Mac.
 name = "Krish's MacBook"
-# Made by Hop on first run: 16 random bytes as hex. The PC's config lists it as
-# its peer's id. From M2 on, the fingerprint of this Mac's key replaces it.
+# Set by Hop at every start from this Mac's key: the first 32 characters of the
+# key's fingerprint. (Before pairing existed, Hop made a random id; the first
+# start of a newer Hop replaces it.) The PC's config lists it as its peer's id.
 id = "5f0c9a1e7b3d4c2a8e6f1b9d0a7c3e52"
 
 # One [[peers]] entry per other computer, and at most one on each side.
+# Pairing (`hop pair`) writes the name, id, os and fingerprint.
 [[peers]]
 name = "Windows PC"
-# The device.id from the PC's own config file.
+# The device.id from the PC's own config file: the first 32 characters of the
+# fingerprint below.
 id = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d0"
 os = "windows"  # macos, windows or linux
 side = "right"  # left, right, above or below
-# A fixed address, in case Hop cannot find the PC on the network (from M2):
+# A fixed address, in case Hop cannot find the PC on the network:
 # address = "192.168.1.42"
+# The fingerprint of the PC's key (64 lowercase hex characters). Hop connects
+# only to a computer that proves it holds that key; without a fingerprint the
+# PC is not paired yet, and Hop does not connect to it.
+fingerprint = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d05a3f19c7e2b8d4a60f1e9c3b7d2a8e45"
 
 [input]
 edge_delay_ms = 0        # how long to push against the edge before crossing, in ms (0 to 2000)

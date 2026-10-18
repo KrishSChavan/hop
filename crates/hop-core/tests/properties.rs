@@ -2,8 +2,9 @@
 //! bursts of input on one device (so sessions last long enough to type, drag
 //! and come back), message delivery with random latency, lost motion
 //! datagrams, ticks, disconnects, network outages that lose or delay
-//! messages, the emergency chord and a monitor plugged in and out. The
-//! simulation (see `sim`) checks the spec's invariants after every event,
+//! messages, the emergency chord, a monitor plugged in and out, and the
+//! agent reporting a stall (`LocalStall`), sometimes after losing a key-up.
+//! The simulation (see `sim`) checks the spec's invariants after every event,
 //! including that messages from stale sessions change nothing and that no
 //! key or button is left stuck on either side; these tests add made-up stale
 //! messages, eventual agreement once input stops, and determinism.
@@ -74,6 +75,10 @@ enum Step {
     /// typing with modifiers, dragging and coming back, without the other
     /// device's input taking control back at once.
     Burst { dev: usize, acts: Vec<Act> },
+    /// The agent on `dev` can no longer vouch for its input and feeds
+    /// `LocalStall`. With `lose` set, the user first lets go of that key
+    /// (if held) without the core hearing of it: the loss being reported.
+    Stall { dev: usize, lose: Option<usize> },
 }
 
 /// One input in a [`Step::Burst`].
@@ -96,17 +101,27 @@ enum Act {
     Wait {
         ms: u64,
     },
+    /// A [`Step::Stall`] in the middle of the burst, on the burst's device
+    /// (usually the controller by then) or, with `peer`, on the other one.
+    Stall {
+        peer: bool,
+        lose: Option<usize>,
+    },
 }
 
 fn act() -> impl Strategy<Value = Act> {
+    // Stalls are rare, so they land mid-session with keys or a button held
+    // without cutting most sessions short.
     prop_oneof![
-        5 => (-120.0f64..120.0, -80.0f64..80.0)
+        20 => (-120.0f64..120.0, -80.0f64..80.0)
             .prop_map(|(dx, dy)| Act::Move { toward: None, dx, dy }),
-        2 => (any::<bool>(), 50.0f64..1500.0, -40.0f64..40.0)
+        8 => (any::<bool>(), 50.0f64..1500.0, -40.0f64..40.0)
             .prop_map(|(toward, dx, dy)| Act::Move { toward: Some(toward), dx, dy }),
-        3 => (0..KEYS.len(), any::<bool>()).prop_map(|(key, pressed)| Act::Key { key, pressed }),
-        2 => any::<bool>().prop_map(|pressed| Act::Button { pressed }),
-        4 => (0u64..60).prop_map(|ms| Act::Wait { ms }),
+        12 => (0..KEYS.len(), any::<bool>()).prop_map(|(key, pressed)| Act::Key { key, pressed }),
+        8 => any::<bool>().prop_map(|pressed| Act::Button { pressed }),
+        16 => (0u64..60).prop_map(|ms| Act::Wait { ms }),
+        1 => (any::<bool>(), prop::option::of(0..KEYS.len()))
+            .prop_map(|(peer, lose)| Act::Stall { peer, lose }),
     ]
 }
 
@@ -158,8 +173,10 @@ fn step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Monitor),
         2 => (dev.clone(), 0u8..8, 1u64..4)
             .prop_map(|(dev, kind, offset)| Step::Stale { dev, kind, offset }),
-        4 => (dev, prop::collection::vec(act(), 1..40))
+        4 => (dev.clone(), prop::collection::vec(act(), 1..40))
             .prop_map(|(dev, acts)| Step::Burst { dev, acts }),
+        1 => (dev, prop::option::of(0..KEYS.len()))
+            .prop_map(|(dev, lose)| Step::Stall { dev, lose }),
     ]
 }
 
@@ -267,12 +284,25 @@ fn run(config: SimConfig, steps: &[Step]) -> Sim {
                         Act::Key { key, pressed } => sim.key(dev, KEYS[key], pressed),
                         Act::Button { pressed } => sim.button(dev, MouseButton::Left, pressed),
                         Act::Wait { ms } => sim.advance(ms),
+                        Act::Stall { peer, lose } => {
+                            stall(&mut sim, if peer { 1 - dev } else { dev }, lose);
+                        }
                     }
                 }
             }
+            Step::Stall { dev, lose } => stall(&mut sim, dev, lose),
         }
     }
     sim
+}
+
+/// The agent on `dev` reports a stall, after losing the key-up of
+/// `KEYS[lose]` if that key is held.
+fn stall(sim: &mut Sim, dev: usize, lose: Option<usize>) {
+    if let Some(key) = lose {
+        sim.lose_key_up(dev, KEYS[key]);
+    }
+    sim.stall(dev);
 }
 
 /// "Messages from stale sessions change nothing": delivering one must have
@@ -402,8 +432,8 @@ proptest! {
 /// Guards against a vacuous property test: random runs from a fixed seed
 /// must start sessions in both directions, bring the cursor back through the
 /// edge from both sides, press buttons on both sides for the peer (drags that
-/// block exits) and reach every common kind of session ending, each several
-/// times.
+/// block exits), stall in every role, and reach every common kind of session
+/// ending, each several times.
 ///
 /// The other endings are left to targeted tests because random runs reach
 /// them too rarely to count on, or not at all: `Superseded` and
@@ -452,6 +482,16 @@ fn random_runs_exercise_every_kind_of_ending() {
                 };
                 *counts.entry(name).or_default() += 1;
             }
+            for state in &dev.stalls {
+                let role = match state {
+                    State::Idle => "idle",
+                    State::Entering { .. } | State::Controlling { .. } => "controlling",
+                    State::Controlled { .. } => "controlled",
+                };
+                *counts
+                    .entry(format!("LocalStall while {role}"))
+                    .or_default() += 1;
+            }
         }
     }
     println!("{counts:#?}");
@@ -465,8 +505,11 @@ fn random_runs_exercise_every_kind_of_ending() {
         EndReason::Disconnected,
         EndReason::LostTieBreak,
         EndReason::BufferFull,
+        EndReason::Stalled,
     ];
-    let names = endings.iter().map(|reason| format!("{reason:?}"));
+    let names = endings.iter().map(|reason| format!("{reason:?}")).chain(
+        ["idle", "controlling", "controlled"].map(|role| format!("LocalStall while {role}")),
+    );
     let per_device = ["mac", "pc"].into_iter().flat_map(|id| {
         [
             format!("ControlStarted by {id}"),

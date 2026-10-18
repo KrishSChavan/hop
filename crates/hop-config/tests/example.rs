@@ -28,6 +28,10 @@ fn the_example_for_a_mac_with_the_pc_on_the_right_loads() {
     assert_eq!(pc.side, Side::Right);
     assert_eq!(pc.side.edge(), Edge::Right);
     assert_eq!(pc.address, None);
+    // Paired: the id is the start of the fingerprint, so Hop pins it.
+    let fingerprint = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d05a3f19c7e2b8d4a60f1e9c3b7d2a8e45";
+    assert_eq!(pc.fingerprint.as_deref(), Some(fingerprint));
+    assert_eq!(pc.pinned_fingerprint(), Some(fingerprint));
 
     // The comments say every other setting shows its default.
     let mut rest = config.clone();

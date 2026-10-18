@@ -10,7 +10,7 @@ use serde::Deserializer;
 use serde::de::{self, Unexpected, Visitor};
 
 use crate::config::is_blank;
-use crate::{Config, ConfigError, Side};
+use crate::{Config, ConfigError, Side, is_fingerprint};
 
 const EDGE_DELAY_MS: RangeInclusive<u64> = 0..=2000;
 const CORNER_DEAD_ZONE: RangeInclusive<f64> = 0.0..=200.0;
@@ -90,6 +90,18 @@ pub enum ValidationError {
         id: DeviceId,
     },
 
+    /// A peer's fingerprint is not 64 lowercase hex characters. The value is
+    /// not repeated in the message: whatever was pasted there by mistake
+    /// should not end up in a log.
+    #[error(
+        "peers[{index}].fingerprint must be 64 lowercase hex characters (0-9 and a-f), \
+         as pairing writes it; pair the two computers again to fix it"
+    )]
+    InvalidFingerprint {
+        /// The peer's position in the peer list.
+        index: usize,
+    },
+
     /// The folder for received files is not a full path.
     #[error(
         "transfer.received_dir is \"{}\", but it must be a full path (\"~\" is not expanded)",
@@ -103,9 +115,14 @@ pub enum ValidationError {
 
 impl Config {
     /// Checks every rule: number ranges, at most one peer per side, unique
-    /// peer ids that differ from this device's, and no empty names. Key
-    /// names in the emergency chord are only checked for being non-empty;
-    /// `hop-keymap` decides whether it knows them.
+    /// peer ids that differ from this device's, no empty names, and peer
+    /// fingerprints in their fixed format. Key names in the emergency chord
+    /// are only checked for being non-empty; `hop-keymap` decides whether it
+    /// knows them.
+    ///
+    /// A peer whose id and fingerprint disagree is not an error here:
+    /// [`Config::load`] warns about it, and Hop refuses to connect to it
+    /// (see [`PeerConfig::pinned_fingerprint`](crate::PeerConfig::pinned_fingerprint)).
     ///
     /// A device without an id (one not set up yet) passes, so the defaults
     /// are valid.
@@ -178,6 +195,15 @@ impl Config {
             }
             if peer.address.as_deref().is_some_and(is_blank) {
                 errors.push(empty(format!("peers[{index}].address")));
+            }
+            // A malformed pin could never match any key, so it is an error
+            // rather than a peer that silently never connects.
+            if peer
+                .fingerprint
+                .as_deref()
+                .is_some_and(|f| !is_fingerprint(f))
+            {
+                errors.push(ValidationError::InvalidFingerprint { index });
             }
             match sides.iter().find(|(side, _)| *side == peer.side) {
                 Some(&(side, first)) => errors.push(ValidationError::SideTaken {
@@ -356,8 +382,11 @@ mod tests {
             os: Os::Windows,
             side,
             address: None,
+            fingerprint: None,
         }
     }
+
+    const FINGERPRINT: &str = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d05a3f19c7e2b8d4a60f1e9c3b7d2a8e45";
 
     fn out_of_range(key: &'static str, value: &str, min: &str, max: &str) -> ValidationError {
         ValidationError::OutOfRange {
@@ -652,6 +681,48 @@ mod tests {
             config.problems()[0].to_string(),
             "transfer.received_dir is \"\", but it must be a full path (\"~\" is not expanded)"
         );
+    }
+
+    #[test]
+    fn a_paired_peer_is_valid() {
+        let mut config = mac();
+        config.peers[0].id = DeviceId::new(&FINGERPRINT[..32]);
+        config.peers[0].fingerprint = Some(FINGERPRINT.to_owned());
+        assert_eq!(config.problems(), []);
+    }
+
+    #[test]
+    fn fingerprints_must_be_64_lowercase_hex_characters() {
+        let upper = FINGERPRINT.to_uppercase();
+        let short = &FINGERPRINT[..63];
+        let long = format!("{FINGERPRINT}0");
+        let not_hex = format!("{}z", &FINGERPRINT[..63]);
+        let spaced = format!("{FINGERPRINT} ");
+        for bad in ["", "  ", short, &long, &upper, &not_hex, &spaced] {
+            let mut config = mac();
+            config.peers[0].fingerprint = Some(bad.to_owned());
+            assert_eq!(
+                config.problems(),
+                [ValidationError::InvalidFingerprint { index: 0 }],
+                "{bad:?}"
+            );
+        }
+        let error = ValidationError::InvalidFingerprint { index: 2 };
+        assert_eq!(
+            error.to_string(),
+            "peers[2].fingerprint must be 64 lowercase hex characters (0-9 and a-f), \
+             as pairing writes it; pair the two computers again to fix it"
+        );
+    }
+
+    #[test]
+    fn an_id_that_does_not_match_its_fingerprint_is_left_to_a_warning() {
+        // Refusing the whole file would keep Hop from starting at all; the
+        // peer is refused instead (see `PeerConfig::pinned_fingerprint`).
+        let mut config = mac();
+        config.peers[0].fingerprint = Some(FINGERPRINT.to_owned());
+        assert_eq!(config.problems(), []);
+        assert_eq!(config.peers[0].pinned_fingerprint(), None);
     }
 
     #[test]

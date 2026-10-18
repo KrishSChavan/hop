@@ -782,6 +782,230 @@ fn emergency_chord_works_while_entering() {
     assert!(ended(&sim, MAC, EndReason::EmergencyChord));
 }
 
+// ----- stalls (`LocalStall`, docs/M2-DESIGN.md) ------------------------------
+
+/// The last `Enter` the Mac sent: its held keys.
+fn last_enter_held_keys(sim: &Sim) -> Vec<KeyCode> {
+    let enters = sim.dev[MAC].sent_matching(|m| matches!(m, CoreMessage::Enter { .. }));
+    match enters.last() {
+        Some(CoreMessage::Enter { held_keys, .. }) => held_keys.clone(),
+        _ => panic!("the Mac sent no Enter"),
+    }
+}
+
+#[test]
+fn a_stall_while_controlling_gives_input_back_and_frees_the_pc() {
+    let mut sim = Sim::mac_and_pc();
+    cross_mac_to_pc(&mut sim);
+    sim.key(MAC, KeyCode::LEFT_META, true);
+    sim.key(MAC, KEY_A, true);
+    sim.settle();
+    assert!(sim.dev[PC].remote_keys.contains(&KEY_A));
+
+    // The agent finds the Mac's suppression lease lapsed.
+    let actions = sim.stall(MAC);
+    assert_eq!(sim.state(MAC), State::Idle);
+    assert_eq!(sim.dev[MAC].capture, CaptureMode::Passive);
+    assert_eq!(sim.cursor(MAC), Point::new(1511.0, 491.0), "the exit point");
+    assert!(actions.contains(&Action::Send {
+        to: sim.id(PC),
+        msg: CoreMessage::Release { seq: 1 }
+    }));
+    assert!(ended(&sim, MAC, EndReason::Stalled));
+    // Nothing was injected for the Mac's own apps: the keys typed while
+    // controlling never reached them.
+    assert!(sim.dev[MAC].injected.is_empty());
+
+    sim.settle();
+    assert_eq!(sim.state(PC), State::Idle);
+    assert!(ended(&sim, PC, EndReason::Released));
+    assert_eq!(
+        sim.dev[PC].release_all, 2,
+        "once as the session began, once as it ended"
+    );
+    assert!(sim.dev[PC].remote_keys.is_empty());
+
+    // The edge is disarmed: pushing on does not cross straight back.
+    sim.motion(MAC, 30.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), State::Idle);
+}
+
+#[test]
+fn a_stall_while_entering_gives_the_crossing_up_and_frees_the_pc() {
+    let mut sim = Sim::mac_and_pc();
+    sim.motion(MAC, 2000.0, 0.0);
+    // Typed while waiting for the ack, so it sits in the buffer.
+    sim.tap(MAC, KEY_A);
+    assert!(matches!(sim.state(MAC), State::Entering { .. }));
+    sim.stall(MAC);
+    assert_eq!(sim.state(MAC), State::Idle);
+    assert_eq!(sim.cursor(MAC), Point::new(1511.0, 491.0));
+    assert!(ended(&sim, MAC, EndReason::Stalled));
+    // The PC accepts the Enter that was already on its way; the Release
+    // right behind it ends that session again, and its late ack is stale.
+    sim.settle();
+    assert_eq!(sim.state(PC), State::Idle);
+    assert!(ended(&sim, PC, EndReason::Released));
+    assert_eq!(sim.state(MAC), State::Idle);
+    // The buffered A was dropped with the crossing, never sent.
+    assert!(
+        sim.dev[MAC]
+            .sent_matching(|m| matches!(m, CoreMessage::Input { .. }))
+            .is_empty()
+    );
+    assert!(sim.dev[PC].injected.is_empty());
+}
+
+#[test]
+fn a_stall_while_controlled_takes_control_back() {
+    let mut sim = Sim::mac_and_pc();
+    cross_mac_to_pc(&mut sim);
+    sim.key(MAC, KEY_A, true);
+    sim.settle();
+    assert!(sim.dev[PC].remote_keys.contains(&KEY_A));
+
+    // An injection fails on the PC, say, and its agent reports it.
+    let actions = sim.stall(PC);
+    assert_eq!(sim.state(PC), State::Idle);
+    assert!(actions.contains(&Action::ReleaseAllInjected));
+    assert!(sim.dev[PC].remote_keys.is_empty());
+    assert_eq!(
+        sim.dev[PC].sent.last().map(|(_, m)| m.clone()),
+        Some(CoreMessage::TakeBack { seq: 1 })
+    );
+    assert!(ended(&sim, PC, EndReason::Stalled));
+
+    sim.settle();
+    assert_eq!(sim.state(MAC), State::Idle);
+    assert!(ended(&sim, MAC, EndReason::TakenBack));
+    assert_eq!(sim.cursor(MAC), Point::new(1511.0, 491.0), "the exit point");
+}
+
+#[test]
+fn a_stall_with_nothing_going_on_changes_nothing() {
+    let mut sim = Sim::mac_and_pc();
+    // The simulation also checks that each acts exactly like a tick.
+    assert_eq!(sim.stall(MAC), vec![]);
+    assert_eq!(sim.stall(MAC), vec![]);
+    cross_mac_to_pc(&mut sim);
+}
+
+/// The reason the core stops vouching for held keys: a key-up missed with
+/// the stall must not leave a modifier stuck down on the peer.
+#[test]
+fn a_key_up_lost_before_a_stall_does_not_stick_on_the_pc() {
+    let mut sim = Sim::mac_and_pc();
+    sim.key(MAC, KeyCode::LEFT_META, true);
+    // The user lets go of Cmd, but the agent's input queue is full, so the
+    // core never hears of it; the agent reports the loss.
+    sim.lose_key_up(MAC, KeyCode::LEFT_META);
+    sim.stall(MAC);
+    cross_mac_to_pc(&mut sim);
+    assert_eq!(last_enter_held_keys(&sim), vec![]);
+    assert!(sim.dev[PC].remote_keys.is_empty());
+}
+
+/// Lost, never stuck: a key the user keeps holding through a stall does not
+/// follow the cursor until it is pressed again.
+#[test]
+fn a_modifier_held_through_a_stall_is_not_pressed_on_the_pc() {
+    let mut sim = Sim::mac_and_pc();
+    cross_mac_to_pc(&mut sim);
+    sim.key(MAC, KeyCode::LEFT_META, true);
+    sim.settle();
+    sim.stall(MAC);
+    sim.settle();
+    // Back across, still holding Cmd.
+    sim.motion(MAC, -3.0, 0.0);
+    sim.motion(MAC, 20.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), controlling(&sim, 3));
+    assert_eq!(last_enter_held_keys(&sim), vec![]);
+    assert!(sim.dev[PC].remote_keys.is_empty());
+    // Letting go is forwarded as a harmless key-up, and pressing Cmd again
+    // works as usual.
+    sim.key(MAC, KeyCode::LEFT_META, false);
+    sim.key(MAC, KeyCode::LEFT_META, true);
+    sim.settle();
+    assert!(sim.dev[PC].remote_keys.contains(&KeyCode::LEFT_META));
+}
+
+/// Forgetting a key outright would leave it stuck down on the Mac: no
+/// key-up at the crossing, and then capture swallows the real one.
+#[test]
+fn a_key_held_through_a_stall_is_released_locally_at_the_next_crossing() {
+    let mut sim = Sim::mac_and_pc();
+    sim.key(MAC, KeyCode::LEFT_SHIFT, true);
+    assert_eq!(sim.stall(MAC), vec![], "the stall leaves local apps alone");
+    assert!(sim.dev[MAC].os_keys.contains(&KeyCode::LEFT_SHIFT));
+    cross_mac_to_pc(&mut sim);
+    assert_eq!(
+        sim.dev[MAC].injected_events(),
+        vec![(key(KeyCode::LEFT_SHIFT, false), Os::MacOs)]
+    );
+    // Capture swallows the real key-up, and no Mac app sees Shift stuck down
+    // (the simulation checks that after every event).
+    sim.key(MAC, KeyCode::LEFT_SHIFT, false);
+    sim.settle();
+    assert!(sim.dev[MAC].os_keys.is_empty());
+}
+
+#[test]
+fn a_stall_releases_a_modifier_pressed_again_at_home() {
+    let mut sim = Sim::mac_and_pc();
+    come_home_holding_shift(&mut sim);
+    // Its physical key-up may be what the stall missed, so the injector's
+    // copy goes at once.
+    let actions = sim.stall(MAC);
+    assert_eq!(
+        actions,
+        vec![Action::Inject {
+            event: key(KeyCode::LEFT_SHIFT, false),
+            source_os: Os::MacOs
+        }]
+    );
+    assert!(sim.dev[MAC].injector_keys.is_empty());
+    // Letting go of Shift afterwards injects nothing more.
+    let injected = sim.dev[MAC].injected.len();
+    sim.key(MAC, KeyCode::LEFT_SHIFT, false);
+    assert_eq!(sim.dev[MAC].injected.len(), injected);
+}
+
+#[test]
+fn the_emergency_chord_works_with_its_keys_held_through_a_stall() {
+    let mut sim = Sim::mac_and_pc();
+    for code in [
+        KeyCode::LEFT_CONTROL,
+        KeyCode::LEFT_ALT,
+        KeyCode::LEFT_SHIFT,
+    ] {
+        sim.key(MAC, code, true);
+    }
+    sim.stall(MAC);
+    cross_mac_to_pc(&mut sim);
+    sim.key(MAC, KeyCode::ESCAPE, true);
+    assert_eq!(sim.state(MAC), State::Idle);
+    assert!(ended(&sim, MAC, EndReason::EmergencyChord));
+}
+
+#[test]
+fn a_button_held_through_a_stall_still_blocks_crossing() {
+    let mut sim = Sim::mac_and_pc();
+    sim.button(MAC, MouseButton::Left, true);
+    sim.stall(MAC);
+    sim.motion(MAC, 2000.0, 0.0);
+    assert_eq!(
+        sim.state(MAC),
+        State::Idle,
+        "no crossing in the middle of a drag"
+    );
+    sim.button(MAC, MouseButton::Left, false);
+    sim.motion(MAC, 10.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), controlling(&sim, 1));
+}
+
 #[test]
 fn stale_session_messages_change_nothing() {
     let mut sim = Sim::mac_and_pc();

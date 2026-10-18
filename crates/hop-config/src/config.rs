@@ -43,9 +43,11 @@ impl Config {
     /// `device.id` made of 16 random bytes written as 32 lowercase hex
     /// characters.
     ///
-    /// The random id is temporary: from M2 on, a device's id is the
-    /// fingerprint of its long-term key, and that fingerprint replaces this
-    /// id.
+    /// The random id is only a placeholder. From M2 on, a device's id comes
+    /// from its long-term key, and the agent puts that id in place with
+    /// [`Config::set_device_id`] at every start, before anything else uses
+    /// it. That is also how the first M2 run replaces the random id an M0
+    /// build saved.
     ///
     /// # Errors
     ///
@@ -70,6 +72,26 @@ impl Config {
             },
             ..Config::default()
         })
+    }
+
+    /// Sets this device's id, `device.id`.
+    ///
+    /// The agent calls this at every start with the id derived from the
+    /// device's key: [`device_id_from_fingerprint`](crate::device_id_from_fingerprint)
+    /// of the key's fingerprint. The first M2 run replaces M0's random id
+    /// this way, and a key replaced on purpose gets its new id.
+    ///
+    /// Returns whether the id changed, which is when the file needs saving.
+    /// The new id is checked like every other setting when the config is
+    /// saved: it must not be a peer's id, and the device needs a name (a
+    /// config that has none yet can take its `device` from
+    /// [`Config::first_run`] first).
+    pub fn set_device_id(&mut self, id: DeviceId) -> bool {
+        if self.device.id == id {
+            return false;
+        }
+        self.device.id = id;
+        true
     }
 }
 
@@ -116,7 +138,8 @@ impl Default for DeviceConfig {
 pub struct PeerConfig {
     /// The name shown for the peer, such as "Windows PC".
     pub name: String,
-    /// The peer's id: the `device.id` in the peer's own config file.
+    /// The peer's id: the `device.id` in the peer's own config file. Once
+    /// the peer is paired, it is the first 32 characters of `fingerprint`.
     pub id: DeviceId,
     /// The peer's operating system: `macos`, `windows` or `linux`.
     pub os: Os,
@@ -127,6 +150,29 @@ pub struct PeerConfig {
     /// network (from M2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// The fingerprint of the peer's key, written by pairing: the SHA-256 of
+    /// its public key as 64 lowercase hex characters (see
+    /// [`is_fingerprint`](crate::is_fingerprint)). Hop connects only to a
+    /// computer that proves it holds that key, so a peer without one cannot
+    /// connect until the two computers are paired. Unset by default, which
+    /// is how files from before pairing existed load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+}
+
+impl PeerConfig {
+    /// The fingerprint Hop pins for this peer: `fingerprint`, when it is set,
+    /// well formed, and `id` is its first 32 characters.
+    ///
+    /// `None` means Hop must not connect to the peer: it is not paired yet,
+    /// or its id and fingerprint disagree. Pairing always writes the two
+    /// together, so a disagreement means the entry was edited, and Hop
+    /// cannot tell which computer it names. [`Config::load`] warns about that
+    /// case ([`Warning::PeerIdMismatch`](crate::Warning::PeerIdMismatch)).
+    pub fn pinned_fingerprint(&self) -> Option<&str> {
+        let fingerprint = self.fingerprint.as_deref()?;
+        (crate::device_id_from_fingerprint(fingerprint)? == self.id).then_some(fingerprint)
+    }
 }
 
 /// Where a peer's screens sit relative to this computer's screens. The
@@ -361,6 +407,46 @@ mod tests {
                 key: "device.name".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn the_id_from_the_key_replaces_the_random_one() {
+        let fingerprint = "5f0c9a1e7b3d4c2a8e6f1b9d0a7c3e52c41d8e2b9a7f4e06b3d5a1f8e9c2b7d0";
+        let mut config = Config::first_run("Krish's MacBook").unwrap();
+        let id = crate::device_id_from_fingerprint(fingerprint).unwrap();
+        assert!(config.set_device_id(id.clone()), "the random id differs");
+        assert_eq!(config.device.id, id);
+        assert_eq!(config.device.name, "Krish's MacBook");
+        assert!(config.validate().is_ok());
+        // At the next start the id is already right, so nothing needs saving.
+        assert!(!config.set_device_id(id));
+    }
+
+    #[test]
+    fn a_peer_is_pinned_only_when_its_id_matches_its_fingerprint() {
+        let fingerprint = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d05a3f19c7e2b8d4a60f1e9c3b7d2a8e45";
+        let mut peer = PeerConfig {
+            name: "Windows PC".to_owned(),
+            id: DeviceId::new("c41d8e2b9a7f4e06b3d5a1f8e9c2b7d0"),
+            os: Os::Windows,
+            side: Side::Right,
+            address: None,
+            fingerprint: None,
+        };
+        assert_eq!(peer.pinned_fingerprint(), None, "not paired yet");
+        peer.fingerprint = Some(fingerprint.to_owned());
+        assert_eq!(peer.pinned_fingerprint(), Some(fingerprint));
+        peer.id = DeviceId::new("0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            peer.pinned_fingerprint(),
+            None,
+            "id and fingerprint disagree"
+        );
+        peer.id = DeviceId::new("C41D8E2B9A7F4E06B3D5A1F8E9C2B7D0");
+        assert_eq!(peer.pinned_fingerprint(), None, "ids are compared exactly");
+        peer.id = DeviceId::new("c41d8e2b9a7f4e06b3d5a1f8e9c2b7d0");
+        peer.fingerprint = Some(fingerprint.to_uppercase());
+        assert_eq!(peer.pinned_fingerprint(), None, "not a fingerprint");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use toml::{Table, Value};
 
-use crate::{Config, ConfigError};
+use crate::{Config, ConfigError, is_fingerprint};
 
 /// Written at the top of every saved file.
 const HEADER: &str = "\
@@ -20,7 +20,10 @@ const HEADER: &str = "\
 /// one `[[peers]]` entry. A test checks this against the settings types.
 const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("device", &["name", "id"]),
-    ("peers", &["name", "id", "os", "side", "address"]),
+    (
+        "peers",
+        &["name", "id", "os", "side", "address", "fingerprint"],
+    ),
     (
         "input",
         &[
@@ -49,6 +52,17 @@ pub enum Warning {
         /// Where it is, such as `input.pointer_sped` or `peers[0].nickname`.
         key: String,
     },
+    /// A peer whose `id` is not the first 32 characters of its
+    /// `fingerprint`. Pairing always writes the two together, so the entry
+    /// was edited; Hop cannot tell which computer it names and will not
+    /// connect to it (see [`PeerConfig::pinned_fingerprint`]). Pairing the
+    /// two computers again fixes it.
+    ///
+    /// [`PeerConfig::pinned_fingerprint`]: crate::PeerConfig::pinned_fingerprint
+    PeerIdMismatch {
+        /// The peer's position in the peer list.
+        index: usize,
+    },
 }
 
 impl fmt::Display for Warning {
@@ -57,6 +71,12 @@ impl fmt::Display for Warning {
             Warning::UnknownKey { key } => write!(
                 f,
                 "ignored unknown setting {key} (a typo, or a setting from a newer version of Hop)"
+            ),
+            Warning::PeerIdMismatch { index } => write!(
+                f,
+                "ignored peers[{index}]: its id is not the first 32 characters of its \
+                 fingerprint, so Hop cannot tell which computer it is and will not connect \
+                 to it; pair the two computers again to fix it"
             ),
         }
     }
@@ -68,7 +88,9 @@ impl Config {
     /// A missing file gives the defaults, as on a first run. Settings the
     /// file leaves out take their defaults. Settings this version of Hop does
     /// not know are skipped and reported as warnings, so an older Hop can
-    /// read a file written by a newer one.
+    /// read a file written by a newer one. A peer whose id does not match its
+    /// fingerprint is reported as a warning too ([`Warning::PeerIdMismatch`]):
+    /// it stays in the file, but Hop does not connect to it.
     ///
     /// # Errors
     ///
@@ -129,13 +151,32 @@ impl Config {
     }
 }
 
-/// Reads config text into settings, plus a warning for every key ignored.
+/// Reads config text into settings, plus a warning for every key ignored
+/// and every peer Hop will not connect to because its id and fingerprint
+/// disagree.
 pub(crate) fn parse(text: &str) -> Result<(Config, Vec<Warning>), toml::de::Error> {
     // Reading the text twice keeps the typed read's precise error messages,
     // while the untyped read shows which keys the typed one skipped.
     let config: Config = toml::from_str(text)?;
     let table: Table = toml::from_str(text)?;
-    Ok((config, unknown_keys(&table)))
+    let mut warnings = unknown_keys(&table);
+    warnings.extend(mismatched_peers(&config));
+    warnings.sort();
+    Ok((config, warnings))
+}
+
+/// A warning for every peer whose well-formed fingerprint does not give its
+/// id. A malformed fingerprint is left to validation, which rejects it.
+fn mismatched_peers(config: &Config) -> impl Iterator<Item = Warning> + '_ {
+    config
+        .peers
+        .iter()
+        .enumerate()
+        .filter(|(_, peer)| {
+            peer.fingerprint.as_deref().is_some_and(is_fingerprint)
+                && peer.pinned_fingerprint().is_none()
+        })
+        .map(|(index, _)| Warning::PeerIdMismatch { index })
 }
 
 fn invalid_at(path: &Path, config: &Config) -> Result<(), ConfigError> {
@@ -273,13 +314,17 @@ mod tests {
         unknown(key.to_owned())
     }
 
+    const PC_FINGERPRINT: &str = "c41d8e2b9a7f4e06b3d5a1f8e9c2b7d05a3f19c7e2b8d4a60f1e9c3b7d2a8e45";
+
+    /// A paired PC: its id is the start of its fingerprint.
     fn windows_pc() -> PeerConfig {
         PeerConfig {
             name: "Windows PC".to_owned(),
-            id: DeviceId::new("bbbb"),
+            id: DeviceId::new(&PC_FINGERPRINT[..32]),
             os: Os::Windows,
             side: Side::Right,
             address: Some("192.168.1.20".to_owned()),
+            fingerprint: Some(PC_FINGERPRINT.to_owned()),
         }
     }
 
@@ -467,6 +512,79 @@ anything = 1
     }
 
     #[test]
+    fn a_peer_without_a_fingerprint_loads_unpaired() {
+        // Every file from before pairing existed looks like this.
+        let text = "[[peers]]\nname = \"PC\"\nid = \"bbbb\"\nos = \"windows\"\nside = \"right\"\n";
+        let (config, warnings) = parse(text).unwrap();
+        assert_eq!(warnings, []);
+        assert_eq!(config.peers[0].fingerprint, None);
+        assert_eq!(config.peers[0].pinned_fingerprint(), None);
+        assert_eq!(config.problems(), []);
+    }
+
+    #[test]
+    fn a_paired_peer_loads_with_its_pin() {
+        let text = format!(
+            "[[peers]]\nname = \"PC\"\nid = \"{}\"\nos = \"windows\"\nside = \"right\"\n\
+             fingerprint = \"{PC_FINGERPRINT}\"\n",
+            &PC_FINGERPRINT[..32]
+        );
+        let (config, warnings) = parse(&text).unwrap();
+        assert_eq!(warnings, []);
+        assert_eq!(config.peers[0].pinned_fingerprint(), Some(PC_FINGERPRINT));
+        assert_eq!(config.problems(), []);
+    }
+
+    #[test]
+    fn a_peer_whose_id_does_not_match_its_fingerprint_is_warned_about() {
+        let text = format!(
+            "[[peers]]\nname = \"PC\"\nid = \"bbbb\"\nos = \"windows\"\nside = \"right\"\n\
+             fingerprint = \"{PC_FINGERPRINT}\"\nnickname = \"pc\"\n"
+        );
+        let (config, warnings) = parse(&text).unwrap();
+        // Unknown keys first, then peers, so the order never depends on
+        // how the TOML library stores tables.
+        assert_eq!(
+            warnings,
+            [
+                unknown_key("peers[0].nickname"),
+                Warning::PeerIdMismatch { index: 0 },
+            ]
+        );
+        assert_eq!(
+            warnings[1].to_string(),
+            "ignored peers[0]: its id is not the first 32 characters of its fingerprint, \
+             so Hop cannot tell which computer it is and will not connect to it; \
+             pair the two computers again to fix it"
+        );
+        // The entry is kept, so saving does not lose it, but it is not pinned.
+        assert_eq!(config.peers[0].fingerprint.as_deref(), Some(PC_FINGERPRINT));
+        assert_eq!(config.peers[0].pinned_fingerprint(), None);
+        assert_eq!(config.problems(), []);
+    }
+
+    #[test]
+    fn a_malformed_fingerprint_is_left_to_validation() {
+        // Only one message for it: the error, not a warning as well.
+        let text = "[[peers]]\nname = \"PC\"\nid = \"bbbb\"\nos = \"windows\"\nside = \"right\"\n\
+                    fingerprint = \"C41D\"\n";
+        let (config, warnings) = parse(text).unwrap();
+        assert_eq!(warnings, []);
+        assert_eq!(
+            config.problems(),
+            [crate::ValidationError::InvalidFingerprint { index: 0 }]
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_of_the_wrong_type_names_the_line() {
+        let text = "[[peers]]\nname = \"PC\"\nid = \"bbbb\"\nos = \"windows\"\nside = \"right\"\n\
+                    fingerprint = 42\n";
+        let error = parse(text).unwrap_err().to_string();
+        assert!(error.contains("line 6"), "{error}");
+    }
+
+    #[test]
     fn known_keys_match_the_settings_types() {
         // Every optional setting is filled in, so the TOML form has every key.
         let config = Config {
@@ -558,7 +676,13 @@ anything = 1
                 0..=4,
             ),
             details in proptest::collection::vec(
-                (non_blank(), non_blank(), os(), proptest::option::of(non_blank())),
+                (
+                    non_blank(),
+                    non_blank(),
+                    os(),
+                    proptest::option::of(non_blank()),
+                    proptest::option::of("[0-9a-f]{63}"),
+                ),
                 4,
             ),
         ) -> Vec<PeerConfig> {
@@ -566,13 +690,23 @@ anything = 1
                 .into_iter()
                 .zip(details)
                 .enumerate()
-                .map(|(index, (side, (name, id, os, address)))| PeerConfig {
-                    name,
-                    // A prefix per peer keeps the ids unique.
-                    id: DeviceId::new(format!("peer{index}:{id}")),
-                    os,
-                    side,
-                    address,
+                .map(|(index, (side, (name, id, os, address, key)))| {
+                    // A paired peer's id is the start of its fingerprint. A
+                    // first character per peer keeps the ids unique, and no
+                    // other id is hex.
+                    let fingerprint = key.map(|rest| format!("{index:x}{rest}"));
+                    let id = match &fingerprint {
+                        Some(fingerprint) => DeviceId::new(&fingerprint[..32]),
+                        None => DeviceId::new(format!("peer{index}:{id}")),
+                    };
+                    PeerConfig {
+                        name,
+                        id,
+                        os,
+                        side,
+                        address,
+                        fingerprint,
+                    }
                 })
                 .collect()
         }
@@ -640,9 +774,10 @@ anything = 1
         #[test]
         fn config_like_text_is_handled_without_panicking(
             text in "((\\[(device|input|keymap|clipboard|transfer|network|extra)\\]|\\[\\[peers\\]\\]|\
-                (name|id|os|side|address|port|pointer_speed|corner_dead_zone|edge_delay_ms|\
-                emergency_chord|enabled|max_text_bytes|received_dir|other) = \
-                (\"[a-z ]{0,6}\"|-?[0-9]{1,6}(\\.[0-9]{1,3})?|true|false|nan|inf|\\[\\]|\\[\"[A-Za-z]{0,8}\"\\]))\n){0,16}"
+                (name|id|os|side|address|fingerprint|port|pointer_speed|corner_dead_zone|\
+                edge_delay_ms|emergency_chord|enabled|max_text_bytes|received_dir|other) = \
+                (\"[a-z ]{0,6}\"|\"[0-9a-f]{64}\"|-?[0-9]{1,6}(\\.[0-9]{1,3})?|true|false|nan|inf|\
+                \\[\\]|\\[\"[A-Za-z]{0,8}\"\\]))\n){0,16}"
         ) {
             if let Ok((config, _)) = parse(&text) {
                 let _ = config.problems();

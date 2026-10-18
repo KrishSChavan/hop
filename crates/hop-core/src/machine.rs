@@ -70,6 +70,39 @@ pub enum Event {
         /// False for Hop's own injected events, which the core ignores.
         physical: bool,
     },
+    /// The runtime can no longer vouch for this device's input: its
+    /// suppression lease lapsed (Hop stalled, and capture already went back
+    /// to passive by itself), captured input was dropped, or a platform call
+    /// a session depends on (suppressing, parking, injecting) failed.
+    ///
+    /// The core ends any session, failing open, with
+    /// [`EndReason::Stalled`]:
+    /// - while entering or controlling, as for the emergency chord: it sends
+    ///   `Release`, restores the cursor at the exit point, sets capture to
+    ///   passive, and disarms the edge the cursor left through;
+    /// - while controlled, it sends `TakeBack` and emits
+    ///   [`Action::ReleaseAllInjected`].
+    ///
+    /// Then, in every state, it stops vouching for the keys it believed
+    /// held, since it may have missed their key-ups:
+    /// - They are never pressed for a peer (in the next `Enter`) or pressed
+    ///   again for local apps when the cursor comes home, so a missed key-up
+    ///   cannot leave a modifier stuck down. A key the user keeps holding
+    ///   through the stall therefore does not follow the cursor until it is
+    ///   pressed again (lost, never stuck).
+    /// - They still get a local key-up at the next crossing, and still count
+    ///   toward the emergency chord, where counting a key as held when it
+    ///   is not does no harm.
+    /// - A modifier pressed again for local apps when the cursor came home
+    ///   is released at once, as its key-up may be the one that was missed.
+    ///
+    /// Any news of a key (down or up) settles its state again. Mouse buttons
+    /// are kept as they were: a cursor that crossed while a button was still
+    /// down could leave it stuck down here, so a missed button-up only
+    /// blocks crossings until the next click. With no session and no key
+    /// believed held, the event changes nothing, so feeding it twice in a
+    /// row is harmless.
+    LocalStall,
     /// This device's layout changed (displays added, removed or moved). A
     /// connected peer that has no displays in the new layout keeps the ones
     /// it reported when it connected.
@@ -178,6 +211,11 @@ pub enum EndReason {
     Superseded,
     /// The cursor was sent on toward a device this one cannot reach.
     UnreachableTarget,
+    /// This device could no longer vouch for its own input (a lapsed
+    /// suppression lease, dropped input or a failed platform call; see
+    /// [`Event::LocalStall`]), so it ended the session. The peer sees the
+    /// session end as [`EndReason::Released`] or [`EndReason::TakenBack`].
+    Stalled,
 }
 
 /// A summary of what the core is doing, for user interfaces and tests.
@@ -263,6 +301,14 @@ impl State {
 ///   next display, as an OS moves its own cursor. The spec's "the display
 ///   that contains `pos`" is the same thing for one display, but with two it
 ///   left the driven cursor stuck where displays meet.
+/// - [`Event::LocalStall`] (docs/M2-DESIGN.md) ends any session the way the
+///   emergency chord or a take-back does. The design says the core then
+///   forgets the keys and buttons it believed held. Keys are forgotten only
+///   where a wrong guess would press one: they are never pressed for a peer
+///   or again for local apps, but they still get a local key-up at the next
+///   crossing and still count toward the chord, so a key that really is
+///   still down cannot get stuck here and the chord keeps working. Buttons
+///   are kept, so the cursor never crosses while one may still be down.
 #[derive(Clone, Debug)]
 pub struct Core {
     me: DeviceId,
@@ -271,8 +317,16 @@ pub struct Core {
     layout: Layout,
     /// Connected peers and the displays each reported (empty if refused).
     peers: BTreeMap<DeviceId, Vec<DisplayInfo>>,
-    /// Keys physically held on this device, tracked in every state.
+    /// Keys physically held on this device, tracked in every state. A stall
+    /// moves them all to `maybe_held`.
     held_keys: BTreeSet<KeyCode>,
+    /// Keys that were held when the runtime last reported a stall
+    /// ([`Event::LocalStall`]) and have not gone down or up since. Their
+    /// key-up may have been missed, so they are no longer in `held_keys`:
+    /// they are never pressed for a peer or again for local apps. They still
+    /// get a key-up at a crossing and still count toward the emergency
+    /// chord, where treating a key as held when it is not does no harm.
+    maybe_held: BTreeSet<KeyCode>,
     /// Mouse buttons physically held on this device, tracked in every state.
     held_buttons: BTreeSet<MouseButton>,
     /// Modifiers pressed again for local apps when the cursor came home
@@ -411,6 +465,7 @@ impl Core {
             layout,
             peers: BTreeMap::new(),
             held_keys: BTreeSet::new(),
+            maybe_held: BTreeSet::new(),
             held_buttons: BTreeSet::new(),
             repressed: BTreeSet::new(),
             next_seq: 1,
@@ -455,6 +510,7 @@ impl Core {
                     self.on_local_input(now, event, cursor, out);
                 }
             }
+            Event::LocalStall => self.on_local_stall(now, out),
             Event::LayoutChanged(layout) => self.on_layout_changed(layout),
         }
     }
@@ -952,6 +1008,8 @@ impl Core {
         }
         match event {
             InputEvent::Key { code, pressed, .. } => {
+                // Any news of a key settles whether it is down.
+                self.maybe_held.remove(&code);
                 if pressed {
                     self.held_keys.insert(code);
                 } else {
@@ -1065,8 +1123,10 @@ impl Core {
     fn cross(&mut self, now: Millis, candidate: Candidate, out: &mut Vec<Action>) {
         out.push(Action::SetCaptureMode(CaptureMode::Suppress));
         out.push(Action::ParkCursor);
-        // Local apps must never see a key stuck down while we are away.
-        for &code in &self.held_keys {
+        // Local apps must never see a key stuck down while we are away. That
+        // includes keys that may still be down after a stall: a key-up for a
+        // key that is already up is harmless.
+        for &code in self.held_keys.union(&self.maybe_held) {
             out.push(Action::Inject {
                 event: InputEvent::Key {
                     code,
@@ -1148,11 +1208,17 @@ impl Core {
 
     /// Entering or Controlling: buffer or forward, and watch for the chord.
     fn controller_input(&mut self, now: Millis, event: InputEvent, out: &mut Vec<Action>) {
-        if self
-            .config
-            .emergency_chord
-            .is_completed_by(&event, &self.held_keys)
-        {
+        let chord = &self.config.emergency_chord;
+        // Keys that may still be down after a stall count too: the chord
+        // only ever ends a session, so counting a key wrongly is harmless,
+        // while ignoring one could leave the user without a way out.
+        let completed = if self.maybe_held.is_empty() {
+            chord.is_completed_by(&event, &self.held_keys)
+        } else {
+            let held = self.held_keys.union(&self.maybe_held).copied().collect();
+            chord.is_completed_by(&event, &held)
+        };
+        if completed {
             // The chord's last key is not forwarded.
             self.end_as_controller(now, EndReason::EmergencyChord, true, out);
             return;
@@ -1194,6 +1260,56 @@ impl Core {
             let msg = CoreMessage::TakeBack { seq: c.link.seq };
             self.finish_as_controlled(c.link, EndReason::TakenBack, Some(msg), out);
         }
+    }
+
+    // ----- stalls -------------------------------------------------------
+
+    /// [`Event::LocalStall`]: end any session, failing open, then stop
+    /// vouching for the keys believed held.
+    fn on_local_stall(&mut self, now: Millis, out: &mut Vec<Action>) {
+        match std::mem::replace(&mut self.phase, Phase::idle()) {
+            // As for the emergency chord. The Release also frees a peer that
+            // accepted an Enter we never heard the answer to.
+            Phase::Entering(Entering {
+                link, departure, ..
+            })
+            | Phase::Controlling(Controlling {
+                link, departure, ..
+            }) => self.finish_as_controller(now, link, departure, EndReason::Stalled, true, out),
+            Phase::Controlled(c) => {
+                let msg = CoreMessage::TakeBack { seq: c.link.seq };
+                self.finish_as_controlled(c.link, EndReason::Stalled, Some(msg), out);
+            }
+            // No session to end. Edge tracking stays as it is, so an edge
+            // disarmed by an earlier ending stays disarmed.
+            idle @ Phase::Idle { .. } => self.phase = idle,
+        }
+        self.stop_vouching_for_keys(out);
+    }
+
+    /// Moves every key believed held to `maybe_held` (see
+    /// [`Event::LocalStall`]). Buttons are kept on purpose.
+    ///
+    /// Plain forgetting would not do: a key that really is still down would
+    /// get no key-up at the next crossing (rule 1), capture would then
+    /// swallow its physical key-up, and it would stay stuck down here while
+    /// the cursor is away.
+    fn stop_vouching_for_keys(&mut self, out: &mut Vec<Action>) {
+        // The injector holds a modifier pressed again on the way home until
+        // the core sees its physical key-up, and that may be what was
+        // missed. Release it now, even if the user may still be holding it.
+        for code in std::mem::take(&mut self.repressed) {
+            out.push(Action::Inject {
+                event: InputEvent::Key {
+                    code,
+                    pressed: false,
+                    repeat: false,
+                },
+                source_os: self.os,
+            });
+        }
+        let mut held = std::mem::take(&mut self.held_keys);
+        self.maybe_held.append(&mut held);
     }
 
     // ----- controlled: motion and injection -----------------------------
@@ -1720,6 +1836,68 @@ mod tests {
                 seq: 2
             }
         );
+    }
+
+    /// The exact actions of `LocalStall` in each role, as the agent carries
+    /// them out.
+    #[test]
+    fn a_stall_ends_the_session_with_exactly_these_actions() {
+        let (mut core, pc, _) = controlling_the_middle_of_three();
+        assert_eq!(
+            core.handle(30, Event::LocalStall),
+            vec![
+                Action::Send {
+                    to: pc.clone(),
+                    msg: CoreMessage::Release { seq: 1 }
+                },
+                Action::RestoreCursor {
+                    at: Point::new(1511.0, 500.0)
+                },
+                Action::SetCaptureMode(CaptureMode::Passive),
+                Action::Notify(Notice::SessionEnded {
+                    peer: pc.clone(),
+                    reason: EndReason::Stalled
+                }),
+            ]
+        );
+        assert_eq!(core.state(), State::Idle);
+        assert_eq!(core.handle(40, Event::LocalStall), vec![], "nothing left");
+
+        // Controlled by the PC, in its session 2.
+        let entry = EntryPoint {
+            display_id: 1,
+            edge: Edge::Right,
+            position: Point::new(1511.0, 300.0),
+        };
+        let enter = CoreMessage::Enter {
+            seq: 2,
+            entry,
+            held_keys: vec![],
+            source_os: Os::Windows,
+        };
+        core.handle(
+            50,
+            Event::PeerMessage {
+                from: pc.clone(),
+                msg: enter,
+            },
+        );
+        assert!(matches!(core.state(), State::Controlled { seq: 2, .. }));
+        assert_eq!(
+            core.handle(60, Event::LocalStall),
+            vec![
+                Action::Send {
+                    to: pc.clone(),
+                    msg: CoreMessage::TakeBack { seq: 2 }
+                },
+                Action::ReleaseAllInjected,
+                Action::Notify(Notice::SessionEnded {
+                    peer: pc,
+                    reason: EndReason::Stalled
+                }),
+            ]
+        );
+        assert_eq!(core.state(), State::Idle);
     }
 
     #[test]
