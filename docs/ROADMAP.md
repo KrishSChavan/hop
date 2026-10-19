@@ -48,7 +48,7 @@ Follow-ups:
 - The agent checks macOS Secure Input, so keys meant for the PC don't go to a focused password field.
 - Peers learn about display changes without reconnecting.
 - The device key moves to the Keychain and Credential Manager.
-- A byte budget for peer messages, before M4.
+- A byte budget for peer messages, before M4. M4 keeps at most one clipboard text per peer waiting, and file data has its own bounded stream; other messages are still bounded by count only.
 
 - **Scope:**
   - QUIC transport with pinned keys;
@@ -60,9 +60,15 @@ Follow-ups:
 
 ## M3: Two-way control
 
+**Status (2026-10-19):** the first test between the two laptops (2026-10-18, Mac driving, PC on its right) worked, and found:
+- **A bounce at the edge.** Parking warped the Mac's cursor to the middle of the screen, and macOS added that jump to the next mouse movement, which sent the cursor straight back from the PC. Fixed in 0.1.1: the Mac parks the cursor where it is, and takes any remaining warp back out of the motion.
+- **The PC's cursor left visible** after the cursor came back to the Mac. Built on branch m4-m5: the computer the cursor left hides its cursor until its own mouse is used (rule 11 in ARCHITECTURE.md).
+- **Ctrl+V should paste on the PC.** Keys now stay as labelled by default (0.1.1); the swap is the app's Shortcuts choice (m4-m5).
+- **Wi-Fi power saving** can delay the first crossing after a quiet spell; the core now nudges the other computer as the cursor heads for the edge (m4-m5), and the log records each crossing's answer time.
+
 - **Scope:**
   - the full hand-off in both directions, including take-back;
-  - the Cmd ↔ Ctrl swap;
+  - keys as labelled, with the Cmd ↔ Ctrl swap as a choice;
   - release-all on every exit;
   - lock-key sync;
   - Secure Input detection on the Mac;
@@ -71,20 +77,24 @@ Follow-ups:
 
 ## M4: Text clipboard
 
+**Status (2026-10-19):** built on branch m4-m5 and reviewed; not yet tried between the laptops. Text goes along when the cursor leaves a computer, on the control stream, so it arrives before the next key. Password-manager items, empty text and text over 1 MiB are never sent. See [M4-M5-DESIGN.md](M4-M5-DESIGN.md).
+
 - **Scope:** text sync both ways on screen switch, an echo guard, line-ending normalization, and skipping password-manager items.
 - **Done when:** copying on one machine and pasting with the native shortcut on the other works in Notes, TextEdit, Word and a browser.
 
 ## M5: Files to the Received folder
 
+**Status (2026-10-19):** built on branch m4-m5 and reviewed; not yet tried between the laptops. See [M4-M5-DESIGN.md](M4-M5-DESIGN.md).
+
 - **Scope:**
-  - a transfer engine (chunked, hash-verified, temporary-then-rename);
-  - an edge "catcher" that takes over a Finder or Explorer drag at the shared edge;
-  - delivery to `Downloads/Hop Received`, with a notification and a reveal action.
-- **Done when:** dragging several images or PDFs across lands them intact in both directions, and window dragging and snapping at the shared edge still work.
+  - a transfer engine (hash-verified, temporary-then-rename, paced, on its own stream): crates/hop-transfer and hop-net;
+  - a drop target that appears at the shared edge while files are dragged near it, a thin band that takes the drop, with a label that drags pass through;
+  - delivery to `Downloads/Hop Received`, which opens on the receiving computer, with the names in the app's Activity, and the files marked as downloaded.
+- **Done when:** dropping several images or PDFs at the edge lands them intact in both directions, and window dragging, snapping and other drag and drop at the shared edge still work.
 
 ## M6: App shell
 
-**Status (2026-10-18):** the first part, the app, is built and reviewed (see [M6-APP.md](M6-APP.md)), with 677 tests across the workspace; it has not yet run on the two laptops. One window on each computer pairs the two, says where the other computer sits, starts and stops sharing, and shows what is happening. A GitHub Release carries `Hop-macOS.zip` and `Hop-Windows.zip`: `scripts/macos/release.sh` builds the Mac zip and publishes the release, and the Release workflow adds the Windows zip. [INSTALL.md](INSTALL.md) walks the user through the first run on each computer.
+**Status (2026-10-19):** the first part, the app, is built and reviewed (see [M6-APP.md](M6-APP.md)), and ran on the two laptops on 2026-10-18 (0.1.0, then 0.1.1). On branch m4-m5 it also has the Shortcuts choice and Activity lines for copy and paste and for files. One window on each computer pairs the two, says where the other computer sits, starts and stops sharing, and shows what is happening. A GitHub Release carries `Hop-macOS.zip` and `Hop-Windows.zip`: `scripts/macos/release.sh` builds the Mac zip and publishes the release, and the Release workflow adds the Windows zip. [INSTALL.md](INSTALL.md) walks the user through the first run on each computer.
 
 Left for M6:
 - the menu-bar and tray icon;
@@ -116,7 +126,7 @@ Decide these when the milestone in brackets is built.
 - **[M3] Corner dead zones between monitors.** Where two displays continue one edge, the dead zones leave a 20-unit band in the middle. That is what the spec says, but it may feel odd.
 - **[M2] Display changes.** Peers are not told when a device's displays change until they reconnect. Add a message for it.
 - **[M2] Peer addresses.** Decide whether `peers.address` is a host or `host:port`.
-- **[M6] Saving the config.** Saving drops comments and unknown keys. Keep them (`toml_edit`) now that the app writes the file (Where is it?, Address, Forget… and pairing).
+- **[M6] Saving the config.** Saving drops comments and unknown keys. Keep them (`toml_edit`) now that the app writes the file (Where is it?, Address, Shortcuts, Forget… and pairing).
 - **[M2] Unknown values.** An unknown value (for example a future `os = "android"`) fails the whole config load, unlike unknown keys, which only warn.
 
 ## Later

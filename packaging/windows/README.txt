@@ -1,7 +1,10 @@
 Hop for Windows
 ===============
 
-Hop shares one keyboard and mouse between this PC and your Mac.
+Hop shares one keyboard and mouse between this PC and your Mac. Text
+you copy goes along when the cursor moves across, and files you drop
+at the screen edge are sent to the other computer. Files from the Mac
+arrive in Downloads\Hop Received.
 
 Before you start it
 -------------------
@@ -39,7 +42,7 @@ Hop's log
 ---------
 The log is in %LOCALAPPDATA%\Hop\Logs (paste that into File Explorer's
 address bar), or click "Open log folder" in Hop. It never contains what
-you type or copy, or pairing codes.
+you type or copy, file names, or pairing codes.
 
 The install guide
 -----------------

@@ -48,7 +48,7 @@
 **ADR-7: motion marks.** Motion is sent as cumulative marks over an unreliable channel. Input events carry the mark, so lost motion never misplaces a click.
 
 **ADR-8: v1 scope.**
-- In: cursor and keyboard both ways, the Cmd ↔ Ctrl swap, text clipboard, and files to a Received folder.
+- In: cursor and keyboard both ways, keys as labelled with an optional Cmd ↔ Ctrl swap, text clipboard, and files to a Received folder.
 - Out: exact drop-at-location, images and files on the clipboard, Windows UAC and lock screen, internet use, and Linux.
 
 **ADR-9: transport (M2).** QUIC (`quinn` + `rustls`) with mutually pinned keys, SPAKE2 pairing on a one-time code, and mDNS discovery with a manual-address fallback.

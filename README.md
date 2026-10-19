@@ -1,8 +1,8 @@
 # Hop
 
-One keyboard and mouse across a Mac and a Windows PC. Push the cursor past the screen edge and it continues on the other computer, and the keyboard follows. Copy text on one machine and paste it on the other with that machine's own shortcut. Drag files across to a Received folder.
+One keyboard and mouse across a Mac and a Windows PC. Push the cursor past the screen edge and it continues on the other computer, and the keyboard follows. Copy text on one machine and paste it on the other with that machine's own shortcut. Drop files at the edge of the screen to send them to the other computer's Downloads › Hop Received folder.
 
-**Status:** Hop has an app on each computer. It pairs the two computers, knows which side each one sits on, and shares one keyboard and mouse both ways. Keys stay as labelled, so with the Mac's keyboard on the PC, Ctrl+V pastes. The text clipboard (M4) and files (M5) come later. See [docs/ROADMAP.md](docs/ROADMAP.md).
+**Status:** Hop has an app on each computer. It pairs the two computers, knows which side each one sits on, and shares one keyboard and mouse both ways. Keys stay as labelled, so with the Mac's keyboard on the PC, Ctrl+V pastes; a Shortcuts choice in the app swaps Cmd and Ctrl instead. Copied text goes along when the cursor crosses (M4), and files dropped at the shared edge go to the other computer (M5). See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Install
 
@@ -35,7 +35,8 @@ crates/
   hop-keymap    key tables, the optional Cmd/Ctrl swap, pressed-key tracking
   hop-core      hand-off state machine, screen layout and edge mapping (no OS access)
   hop-config    TOML configuration
-  hop-net       the encrypted link: identity, pairing, discovery
+  hop-net       the encrypted link: identity, pairing, discovery, clipboard text, file transfers
+  hop-transfer  files on disk: cleaning received names, saving and checking them, reading files to send
   hop-platform  OS integration traits, with hop-platform-macos and hop-platform-windows
   hop-selftest  the guided self-test of the platform layer
   hop-agent     the agent, pairing, settings and the hop command line

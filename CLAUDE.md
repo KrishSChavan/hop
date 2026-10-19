@@ -1,6 +1,6 @@
 # Hop
 
-Hop is the user's personal software KVM: one keyboard and mouse shared between their Mac and their Windows 11 laptop over home Wi-Fi, with two-way control, keys as labelled (an optional Cmd↔Ctrl swap), text clipboard sync, and files dropped into a "Received" folder. The user does not read code; Claude writes and maintains all of it, so explain changes in plain language.
+Hop is the user's personal software KVM: one keyboard and mouse shared between their Mac and their Windows 11 laptop over home Wi-Fi, with two-way control, keys as labelled (an optional Cmd↔Ctrl swap), text clipboard sync, and files dropped at the shared edge into the other computer's Downloads › Hop Received folder. The user does not read code; Claude writes and maintains all of it, so explain changes in plain language.
 
 ## Where things are
 
@@ -9,7 +9,7 @@ Hop is the user's personal software KVM: one keyboard and mouse shared between t
 - `docs/ROADMAP.md`: milestones, plus open questions tagged by milestone.
 - `docs/M6-APP.md`: the spec for the app.
 - `docs/M4-M5-DESIGN.md`: the design for the first-test fixes, the clipboard (M4) and files (M5).
-- `docs/INSTALL.md`: the user's guide to installing and using the app. It quotes the app's labels from `docs/M6-APP.md`, so change the two together.
+- `docs/INSTALL.md`: the user's guide to installing and using the app. It quotes the app's labels from `docs/M6-APP.md`, and some of hop-agent's status lines and the drop-zone label (`agent/clipboard.rs`, `agent/files.rs`), all pinned by tests; change them together.
 - `docs/WINDOWS-SETUP.md`: preparing the PC for building and testing.
 - `docs/releases/`: release notes, one file per tag (`vX.Y.Z.md`).
 - `crates/hop-agent`: the agent, pairing, settings and the `hop` command line, shared by both apps.
@@ -45,7 +45,7 @@ cargo test --workspace
 - **The Mac is the user's employer-managed work laptop.** Their IT department approved running Hop on it (2026-10-17). Keep Hop transparent there: no hidden capture, nothing logged.
 - **The PC is the user's personal machine** (confirmed 2026-10-17).
 - **Tell the user before input moves.** Before running anything that moves the cursor, types, or blocks the mouse and keyboard, tell the user what will happen and for how long, so they're not surprised mid-task.
-- **No secrets in logs.** Never log keystrokes, clipboard contents or file contents, even in debug builds.
+- **No secrets in logs.** Never log keystrokes, clipboard contents, file names or file contents, or pairing codes, even in debug builds.
 - **Fail open.** Any error, timeout or disconnect must return both machines to local control and release every key and button Hop pressed.
 - **OS code stays in `hop-platform`.** It is the only crate that calls OS APIs. Every other crate is pure, portable Rust with `#![forbid(unsafe_code)]`.
 - **Keep the seams.** Keep new features behind the existing seams (platform traits, capability negotiation, the local control API), because the user plans many more features, including an AI assistant that will drive Hop through that API.

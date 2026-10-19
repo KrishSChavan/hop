@@ -1,6 +1,6 @@
 # Hop architecture
 
-Hop shares one keyboard and mouse between a Mac and a Windows laptop on the same home network. Push the cursor past a screen edge and it continues on the other computer, and the keyboard follows. Either laptop can control the other. Text copied on one machine can be pasted on the other with that machine's own shortcut, and files dragged across the edge land in a "Received" folder.
+Hop shares one keyboard and mouse between a Mac and a Windows laptop on the same home network. Push the cursor past a screen edge and it continues on the other computer, and the keyboard follows. Either laptop can control the other. Text copied on one machine can be pasted on the other with that machine's own shortcut. Files dragged to the shared edge drop on a target that appears there, and are copied to the other computer's Downloads › Hop Received folder.
 
 ## Principles
 
@@ -16,33 +16,37 @@ Hop shares one keyboard and mouse between a Mac and a Windows laptop on the same
 |---|---|
 | `hop-types` | Shared vocabulary: device ids, OS, geometry, input events, session messages |
 | `hop-proto` | Wire format: framing, encoding, `Hello` and capability negotiation, size limits |
-| `hop-keymap` | Key tables (USB HID, macOS keycodes, Windows scancodes), the Cmd/Ctrl swap, pressed-key tracking |
+| `hop-keymap` | Key tables (USB HID, macOS keycodes, Windows scancodes), the optional Cmd/Ctrl swap, pressed-key tracking |
 | `hop-core` | Hand-off state machine, screen layout and edge mapping |
 | `hop-config` | TOML configuration |
 | `hop-platform` | OS traits, plus the macOS and Windows implementations (M1) |
-| `hop-net` | QUIC link with pinned keys, pairing with a one-time code, mDNS discovery (M2) |
+| `hop-net` | QUIC link with pinned keys, pairing with a one-time code, mDNS discovery (M2); clipboard text, nudges and file transfers (M4, M5) |
+| `hop-transfer` | Files on disk (M5): cleaning received names and finding free ones, saving under temporary names with a SHA-256 check, sweeping leftovers, reading files to send |
 | `hop-selftest` | The guided platform self-test and the latency probe (M1) |
-| `hop-agent` | The agent (core thread, platform and network wiring), the pairing flow, settings, the log, and the `hop` command line; shared by both apps (M6) |
+| `hop-agent` | The agent (core thread, platform and network wiring), clipboard sync, drop zones and transfer status, the pairing flow, settings, the log, and the `hop` command line; shared by both apps (M6) |
 | `apps/hop` | The `hop` command line |
-| `apps/hop-app` | The app: one window (eframe/egui) to pair, set where the other computer is, and start and stop sharing (M6, see [M6-APP.md](M6-APP.md)) |
+| `apps/hop-app` | The app: one window (eframe/egui) to pair, set where the other computer is, choose the shortcuts, and start and stop sharing (M6, see [M6-APP.md](M6-APP.md)) |
 
-Planned: `hop-control` (local control API), `hop-transfer` (file transfer; M5), `apps/hopctl` (CLI client), and the menu-bar and tray icon (M6).
+Planned: `hop-control` (local control API), `apps/hopctl` (CLI client), and the menu-bar and tray icon (M6).
 
 ## Process model
 
 **macOS:** one signed `.app`. Its Info.plist sets `LSUIElement`, so the `hop` commands that scripts start through LaunchServices show no Dock icon. The app's window asks for a regular app (Dock icon, app menu) while it is open.
-- Main thread: AppKit work: the app's window (winit and egui), and later the status item and pasteboard polling.
-- Input thread: a `CGEventTap` on its own `CFRunLoop`, plus event injection and cursor park/hide.
-- An async runtime: networking, the control API and file I/O.
+- Main thread: AppKit work: the app's window (winit and egui) and the drop-zone panels. Other threads dispatch work to it and never wait for it. Later: the status item.
+- "hop-capture": a `CGEventTap` on its own `CFRunLoop`, with the suppression-lease watchdog. It also shows a hidden cursor again at the first physical mouse event, and watches the left button for file drags. It never waits on anything.
+- "hop-clipboard": runs every `NSPasteboard` call; each one is bounded by `CLIPBOARD_TIMEOUT` (250 ms). A serial queue reads the drag pasteboard.
+- The core thread ("hop-agent"): the core, injection and the cursor (parking, hiding).
+- An async runtime ("hop-net", two workers): networking. File reads and writes run on blocking threads, never on the workers or the core thread.
 
 **Windows:** one windowed executable (`Hop.exe`, the tray icon later) that never runs elevated.
-- Main thread: the window (winit and egui), and later the tray.
-- Hook thread: `WH_MOUSE_LL` and `WH_KEYBOARD_LL` with a message loop. Callbacks only enqueue, so they stay far below the 1000 ms hook timeout.
-- An injection thread.
-- An OLE/clipboard thread (STA).
-- An async runtime.
+- Main thread: the window (winit and egui); later the tray.
+- "hop-input": `WH_MOUSE_LL` and `WH_KEYBOARD_LL` with a message loop, Raw Input, and the small windows that hide a parked or left-behind cursor. Callbacks only enqueue or post, so they stay far below the 1000 ms hook timeout.
+- "hop-clipboard": a message-only window that owns what Hop writes to the clipboard, with its own message loop; every clipboard call is bounded by `CLIPBOARD_TIMEOUT`.
+- "hop-drop": an OLE thread (`OleInitialize`, a message loop) that owns the drop-zone windows, registered with `RegisterDragDrop`.
+- The core thread ("hop-agent"): the core and injection (`SendInput`).
+- An async runtime ("hop-net", two workers), as on the Mac.
 
-On both systems the core runs on its own task. Platform threads feed it events over channels and carry out its actions. Hop's own injected events are tagged so capture can tell them apart from physical input.
+On both systems the core runs on its own thread. Platform threads feed it events over channels and carry out its actions. Hop's own injected events are tagged so capture can tell them apart from physical input.
 
 ## Coordinates and layout
 
@@ -67,7 +71,7 @@ Each device is in exactly one state.
 
 | State | Meaning | Capture mode | Local cursor |
 |---|---|---|---|
-| **Idle** | Local control | Passive | Normal |
+| **Idle** | Local control | Passive | Normal, or hidden where it stopped after a session that left through an edge, until this computer's own mouse is used |
 | **Entering(target, seq)** | Crossed an edge, sent `Enter`, waiting for `EnterAck` | Suppress | Parked; physical input buffered (at most 64 events) |
 | **Controlling(target, seq)** | Our physical input is forwarded to `target` | Suppress | Parked and hidden |
 | **Controlled(by, seq)** | We inject input received from `by` | Passive (our own physical input is never suppressed) | Driven by injection |
@@ -83,7 +87,7 @@ A session is identified by (controller id, `seq`). The controller picks a new, i
    - Remember the exit point, so the cursor can be restored there.
 2. **Entering → Controlling** on `EnterAck(seq)`: flush the buffered input in order. On `EnterReject`, or no ack within `enter_timeout_ms` (500): go to Idle with `RestoreCursor(exit point)` and `SetCaptureMode(Passive)`, and notify.
 3. **A device receives `Enter` from X:**
-   - **While Idle:** go to Controlled(X, seq). Then `MoveCursorTo(entry)`, inject key-downs for `held_keys` (the runtime maps them from `source_os`), and send `EnterAck`.
+   - **While Idle:** go to Controlled(X, seq). Then show a hidden cursor again (`RevealCursor`, first), `MoveCursorTo(entry)`, inject key-downs for `held_keys` (the runtime maps them from `source_os`), and send `EnterAck`.
    - **While Controlling or Controlled with another device:** `EnterReject(Busy)`.
    - **While Entering(X)**, meaning both crossed at once: the device with the lower `DeviceId` keeps the controller role. The winner rejects with `Busy`. The loser aborts its own Entering (restoring its cursor and capture mode), then accepts as above. A later reject of the loser's own stale `Enter` is ignored.
 4. **Controlling.** Every physical event is forwarded.
@@ -97,6 +101,7 @@ A session is identified by (controller id, `seq`). The controller picks a new, i
    - Otherwise, find the edge crossed of the display that contains `pos`. If that edge faces a neighbor (same mapping rules), no injected button is held, and the point is outside the corner dead zones, then:
      - send `Leave { seq, to, entry }`, with `entry` in `to`'s coordinates;
      - emit `ReleaseAllInjected`;
+     - emit `ConcealCursor`: this device's cursor is hidden where it is, since the cursor is now on the other device (see rule 11);
      - go to Idle.
    - Otherwise clamp to that display and emit `MoveCursorTo(clamped)`.
 6. **Controlled: other events.** Buttons, keys and scroll from `Input` become `Inject { event, source_os }`. Injected buttons are tracked, so exits can be blocked while one is held.
@@ -119,6 +124,8 @@ A session is identified by (controller id, `seq`). The controller picks a new, i
     - the controller goes to Idle and restores its cursor;
     - the controlled side emits `ReleaseAllInjected` and goes to Idle;
     - both notify the UI.
+11. **The cursor left behind.** When a session ends because the cursor left the controlled device through an edge (rule 5), that device hides its cursor where it is (`ConcealCursor`): nothing is moved, frozen or suppressed. It shows it again (`RevealCursor`, always the first action of its list) on physical pointer input there (motion, a button press, scrolling; keys do not), when a peer enters (rule 3), and on a stall. The platform also shows it by itself at the first physical mouse event and when Hop stops, so a stalled core never leaves an invisible cursor. Other endings (take-back, release, timeouts, disconnects) never hide it.
+12. **Nudges.** While idle, physical motion that stays on screen and heads toward the part of an edge that leads to a connected peer, ending within `nudge_distance` (300 units; 0 turns this off) of it, makes the core send that peer a nudge (`Nudge { to }`), at most every `nudge_interval_ms` (200). A nudge is a tiny datagram every build ignores; receiving it wakes a dozing Wi-Fi radio before the `Enter` arrives.
 
 ### Details settled while building M0
 
@@ -141,6 +148,8 @@ The rules above leave some cases open. `hop-core` decides them as follows, and i
 
 The core's tests check these:
 - Capture is Suppress exactly in Entering and Controlling.
+- The cursor is hidden by `ConcealCursor` only while Idle, and is never parked or moved while hidden; `RevealCursor` comes first in its action list.
+- `Nudge` goes out only while Idle, to a connected peer.
 - Two devices never control each other at the same time.
 - Every exit from Controlled emits `ReleaseAllInjected`.
 - No session state survives `peer_timeout_ms` of silence.
@@ -157,6 +166,7 @@ pub enum Event {
     PeerDisconnected { peer: DeviceId },
     PeerMessage { from: DeviceId, msg: CoreMessage },
     LocalInput { event: InputEvent, cursor: Point, physical: bool },
+    LocalStall,                               // the runtime can no longer vouch for local input
     LayoutChanged(Layout),
 }
 
@@ -168,43 +178,54 @@ pub enum Action {
     MoveCursorTo { to: Point },              // while Controlled; drag if buttons held
     Inject { event: InputEvent, source_os: Os },
     ReleaseAllInjected,
+    ConcealCursor,                            // rule 11
+    RevealCursor,
+    Nudge { to: DeviceId },                   // rule 12
     Notify(Notice),
 }
 
 impl Core {
     pub fn new(me: DeviceId, os: Os, config: CoreConfig, layout: Layout) -> Self;
     pub fn handle(&mut self, now: Millis, event: Event) -> Vec<Action>;
+    // The parts of this device's edges that lead to `peer` (whole edges
+    // minus the corner dead zones), for the drop zones.
+    pub fn edges_toward(&self, peer: &DeviceId) -> Vec<SharedEdge>;
 }
 ```
 
 ## Keyboard
 
 - Keys travel as USB HID usages, which name physical key positions. The receiving OS applies its own keyboard layout, so both laptops should use the same layout (US).
-- **Shortcut translation (v1).** When the source and target OS differ (Mac ↔ Windows), the *receiver* swaps Meta (Command or the Windows key) with Control, left with left and right with right.
-  - Cmd+C typed on the Mac keyboard arrives on Windows as Ctrl+C.
-  - Ctrl+C typed on the PC keyboard arrives on the Mac as Cmd+C.
-  - The Mac's Control key acts as the Windows key.
-  - Option and Alt are the same HID keys and need no mapping.
+- **Keys as labelled (the default since 2026-10-18).** Every key arrives as itself. Ctrl stays Ctrl, and the Mac's Command key and the Windows key are the same HID key (Meta): with the Mac's keyboard on the PC, Ctrl+C copies and Cmd acts as the Windows key; with the PC's keyboard on the Mac, the Windows key acts as Command.
+- **The optional swap** (`keymap.cmd_ctrl = "swap"`, the app's Shortcuts choice). The *receiving* computer applies it to keys from the other computer's keyboard, when exactly one of the two is a Mac: Meta and Control trade places, left with left and right with right. Cmd+C typed on the Mac then arrives on Windows as Ctrl+C. Each computer's choice covers the other computer's keyboard only.
+- Option and Alt are the same HID keys and are never mapped.
 - The receiver records the mapped code at key-down, so the key-up always matches even if settings change mid-press. It releases every injected key and button when a session ends.
 - Auto-repeat comes from the source OS (key-downs with `repeat: true`).
 
-## Clipboard (v1: text only)
+## Clipboard (M4: text only)
 
-- **Change detection.** The Mac polls `NSPasteboard.changeCount` (there is no change notification). Windows listens for `WM_CLIPBOARDUPDATE`.
-- **When text is sent.** The text is read and sent when the cursor *leaves* the machine (and at most 1 MiB is sent), not on every copy. That keeps programmatic pasteboard reads rare. Every cross-machine paste involves a switch anyway.
-- **Skipped items.** Items marked as concealed or transient (password managers: `org.nspasteboard.ConcealedType` on the Mac, the clipboard-history exclusion formats on Windows) are never synced.
-- **Line endings.** LF and CRLF are normalized on the way in and out.
-- **Echo guard.** Hop records the change count of its own writes and ignores them, and every message carries a `generation`.
+- **When.** Text travels when the cursor *leaves* a computer, never on a copy. The controller sends its clipboard right after its `Enter`; the controlled side sends its clipboard just before its `Leave`, so the controller has written it before it gets its own keyboard back. On the ordered control stream the text therefore arrives before the next key, and the receiving agent writes it to the OS clipboard before it handles the next event.
+- **Only when it changed.** Nothing polls or listens. As the cursor leaves, the agent reads the clipboard's change count (`NSPasteboard.changeCount`, `GetClipboardSequenceNumber`) and reads the text only if the count differs from the one both computers last shared. That count starts at its value when sharing starts, so an older clipboard is never pushed; if it cannot be read then, the first crossing only records it. Writing the other computer's text records the count the write returns, which is the echo guard.
+- **Never sent.** Items marked `org.nspasteboard.ConcealedType`, `TransientType` or `AutoGeneratedType` (Mac); items with `ExcludeClipboardContentFromMonitorProcessing`, `Clipboard Viewer Ignore`, `CanIncludeInClipboardHistory` = 0 or `CanUploadToCloudClipboard` = 0 (Windows); empty text; text over `clipboard.max_text_bytes` (1 MiB), which is never cut short. Clipboard text is never logged.
+- **Bounded.** Every platform clipboard call runs on the backend's own thread and returns within `CLIPBOARD_TIMEOUT` (250 ms), or fails, because reading can wait on the app that copied. A write that fails is retried for about 2 seconds.
+- **Line endings.** LF on the wire; Windows gets CRLF.
+- **Network.** The `clipboard.text` capability; at most one `ClipboardText` per peer waits for the agent (a newer one replaces it).
 
 ## Files (M5)
 
-Dragging a file across the edge sends it, and it lands in a "Hop Received" folder in Downloads with a notification and a reveal action. Transfers use their own low-priority stream, stream to disk, are hash-verified, and use temporary names that are renamed only when complete. Exact drop-at-location comes after v1.
+- **Dropping.** While a file drag (from Finder or Explorer) comes near the edge that leads to the other computer, a drop target appears along it: a thin band at the very edge takes the drop, and a label ("Drop to send to Windows PC") that drags and clicks pass through shows while files are over the band. It appears only during a drag, never blocks other drag and drop or clicks, and always takes a copy, never a move. The cursor never crosses with a button held.
+- **Arriving.** The files are copied to the other computer's Downloads › Hop Received folder, which then opens there (one file selected; several, the folder), and the app's Activity names them. They are marked as downloaded (the Mac's quarantine, Windows' Mark of the Web), so the usual system checks apply when they are opened. File names are never logged.
+- **Protocol.** Capability `files`, version 1. `FileMessage` (kind 3) on the control stream: `Offer { id, files }`, `Answer { id, accepted, refusal }`, `Outcome { id, saved, failure }`. After an accepted answer, one unidirectional QUIC stream per transfer at priority −1 carries the id (8 bytes), then each file's bytes followed by its SHA-256. One such stream per direction at a time, allowed only after `files` is negotiated; data is paced to 12 MiB/s.
+- **Bounds.** At most 1,000 files, 4 GiB each and 16 GiB per transfer; offers are answered one at a time, with at most 4 waiting. The answer may wait up to 2 minutes (the Mac asks once for the Downloads folder); after that, 30 seconds without progress ends a transfer.
+- **Saving.** Each file is written as `.<name>.hop-part`, checked, then renamed to a free name, never overwriting. Any failure deletes that transfer's temporary files. The folder is not touched until the first offer arrives, then created and swept of leftovers.
+- **Reports.** Every transfer ends with exactly one event, on both computers. Details: [M4-M5-DESIGN.md](M4-M5-DESIGN.md), section 5.
+- Exact drop-at-location comes after v1.
 
 ## Wire protocol
 
 - **Frames.** A stream frame is `kind (u16, big-endian) | length (u32, big-endian) | body`. A datagram is `kind (u16, big-endian) | body`.
 - **Body.** MessagePack with named fields (`rmp-serde`). Unknown fields are ignored and missing ones take defaults, so messages can grow.
-- **Kinds.** 1 is `Hello`, 2 is `Core` (`CoreMessage`). Unknown kinds are skipped.
+- **Kinds.** 1 is `Hello`, 2 is `Core` (`CoreMessage`), 3 is `File` (`FileMessage`, control stream, only after `files` is negotiated), 4 is `Nudge` (datagram only, no body; every build ignores it). Unknown kinds are skipped.
 - **`Hello`.** It carries:
   - protocol major and minor versions;
   - app version;
@@ -213,16 +234,16 @@ Dragging a file across the edge sends it, and it lands in a "Hop Received" folde
   - capabilities, as a list of `{ name, version }`.
 
   The major version must match. The minor version and the capabilities negotiate down to what both sides support.
-- **Limits.** A stream frame body is at most 1 MiB + 64 KiB (room for 1 MiB of clipboard text plus its envelope). A whole datagram, kind included, is at most 1200 bytes. Clipboard text is at most 1 MiB of UTF-8. Oversized input is rejected, never truncated, and frames are rejected from their header before the body is buffered.
+- **Limits.** A stream frame body is at most 1 MiB + 64 KiB (room for 1 MiB of clipboard text plus its envelope). A whole datagram, kind included, is at most 1200 bytes. Clipboard text is at most 1 MiB of UTF-8. A file offer lists at most 1,000 files, each name at most 1,024 bytes. Oversized input is rejected, never truncated, and frames are rejected from their header before the body is buffered.
 - **Evolution rules.** The crate docs of `hop-proto` set the rules for changing messages: add fields only with defaults; never rename, remove or retype a field; send new enum variants only to peers that negotiated the capability that introduced them.
 
 ## Transport and security (M2)
 
-- **Transport.** QUIC (`quinn` + `rustls`). Motion goes as datagrams; keys, buttons and session messages on a high-priority stream; clipboard and files on low-priority streams.
+- **Transport.** QUIC (`quinn` + `rustls`). Motion and nudges go as datagrams; keys, buttons, session messages, clipboard text and file messages on the control stream; file data on a unidirectional stream per transfer at priority −1.
 - **Pairing.** Each device has a long-term key. Devices pair once with a one-time code (SPAKE2), then pin each other's keys. There is no plaintext mode.
 - **Discovery.** mDNS, with a manual-address fallback.
-- **Wi-Fi.** On Wi-Fi (the only network here), the receiver smooths motion and the UI shows latency.
-- **Ports.** UDP 47800 carries sessions. Pairing runs as its own process (`hop pair`) on its own listener, UDP 47801, and only while pairing. `hop latency` uses UDP 47802.
+- **Wi-Fi.** A dozing Wi-Fi radio holds incoming packets until it next wakes, often 100 to 300 ms, so the core nudges the other computer as the cursor heads for the shared edge (rule 12), and the log records how long each `Enter` waited for its answer (`answered_in_ms`).
+- **Ports.** UDP 47800 carries sessions. Pairing (`hop pair`, or the app's pairing section) runs its own listener, UDP 47801, and only while pairing. `hop latency` uses UDP 47802.
 - **Full design.** The details, including the security review that shaped them, are in [M2-DESIGN.md](M2-DESIGN.md).
 
 ## Control API and extensions (M2 and later)
@@ -240,9 +261,9 @@ TOML, at `~/Library/Application Support/Hop/config.toml` on macOS and `%APPDATA%
 - the device name and id;
 - peers: name, id, OS, side, and an optional address;
 - input settings: edge delay, corner dead zone, pointer speed, take-back threshold, emergency chord;
-- keymap: `swap_cmd_ctrl`;
+- keymap: `cmd_ctrl`, `"keep"` (the default) or `"swap"`. The older `swap_cmd_ctrl` is retired: read without a warning, ignored, and dropped at the next save;
 - clipboard: enabled and size limit (password-manager items are never synced, and there is no setting for that);
-- the folder for received files;
+- transfer: `enabled` (default true; off means no drop target and no receiving) and `received_dir` (default Downloads/Hop Received);
 - the network port. The default 47800 is chosen to avoid Synergy/Deskflow's 24800.
 
 ## Testing

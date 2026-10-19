@@ -83,7 +83,7 @@ Both laptops are trusted; their accounts and disks are out of scope. A paired la
 - **Channels on a connection:**
   - one bidirectional **control stream**, opened by the dialler. The dialler writes its `Hello` at once, because quinn announces a stream to the peer only when data is written. `Hello` comes first in each direction (hop-proto frames), then every `CoreMessage` except `Motion`, reliable and in order;
   - QUIC **datagrams** for `Motion` (hop-proto datagram encoding), unreliable and latest-wins. A `Motion` larger than `max_datagram_size()`, or one to a peer without datagrams, goes on the control stream instead;
-  - clipboard and file streams come in M4 and M5, at a lower priority than the control stream.
+  - clipboard text came in M4 on the control stream, and file data in M5 on unidirectional streams at priority −1 (see M4-M5-DESIGN.md).
 - **`Hello` checks.**
   - The connection is closed with `PROTOCOL` unless the peer's `Hello` arrives exactly once and names the device id that the peer's certificate gives.
   - Negotiation must agree on the major version and share `input`, otherwise the connection closes with `INCOMPATIBLE`.
@@ -228,7 +228,7 @@ Fail-open duties of the agent:
 - **What is left.** If Hop is killed or aborts, the OS removes its event tap or hooks. The peer's core times out within 1.5 s and releases what it injected. Keys that this laptop had injected for the peer, however, stay down until they are pressed again. A watchdog process for that comes later.
 - **Logs.** Write to `~/Library/Logs/Hop/hop.log` and `%LOCALAPPDATA%\Hop\Logs\hop.log`.
   - What goes in: connections, sessions and errors, and fingerprints, which are public.
-  - What never goes in: keys or key codes, clipboard text, file contents, pairing codes, SPAKE2 messages and keys, MACs, exporter values, private keys and TLS secrets.
+  - What never goes in: keys or key codes, clipboard text, file names and contents, pairing codes, SPAKE2 messages and keys, MACs, exporter values, private keys and TLS secrets.
   - Text from a peer or the network (names, versions, close reasons, mDNS names) has its control characters removed and is cut short before it is logged or printed.
   - Any device on the network can cause failed handshakes. Repeated warnings are therefore rate-limited, and the file is capped at 10 MiB, plus one old file. quinn, rustls and mdns-sd log at `warn` at most.
   - In Hop.app, stdout and stderr also go to files, so they follow the same rules, and the agent keeps them quiet.
