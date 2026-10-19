@@ -108,8 +108,8 @@ The examples here are what the Mac shows when the PC is on its right.
    - Text you copied before you clicked **Start sharing**, or before sharing restarted after a change, stays behind: copy it again.
    - The text goes along only when the cursor moves across. When you switch by using the other computer's own trackpad, mouse or keyboard instead, it stays behind.
 6. **Send files** by dropping them at the edge of the screen:
-   1. Drag the files from Finder (or File Explorer) towards the edge that leads to the other computer. The cursor stays on this screen while you drag.
-   2. Near the edge, a box appears: "Drop to send to Windows PC". Drop the files on it.
+   1. Drag the files from Finder (or File Explorer) towards the edge that leads to the other computer. The cursor stays on this screen while you drag. On the Mac, a thin coloured line along that edge lights up as the files get close.
+   2. Push the files right against that edge. When they reach it, a box appears there: "Drop to send to Windows PC". Let go anywhere on the box. The box stays while the files are on it; if you move them off it, it goes away, so push them against the edge again.
    3. Hop copies them to the other computer, into the **Hop Received** folder inside its **Downloads** folder, and opens that folder there to show them. The originals stay where they were.
 
    Hop sends files, not folders: to send what is in a folder, open it and drag the files.
@@ -148,7 +148,7 @@ Your pairing and your **Where is it?** and **Shortcuts** choices stay as they ar
   - Text copied before **Start sharing**, or before sharing restarted after a change, stays behind. So does text when you switch by using the other computer's own trackpad, mouse or keyboard. Copy it again, then move the cursor across.
   - Text longer than about a million characters is not sent.
   - On the Mac, if Activity says that copied text did not go because macOS does not let Hop read the clipboard, open System Settings → Privacy & Security → Paste from Other Apps and allow Hop.
-- **No box appears when you drag files to the edge.** Check that both computers are connected ("Connected to …") and run the same version of Hop. The box appears only while you drag files, close to the edge that leads to the other computer. **Activity** says what happened to files you dropped.
+- **No box appears when you drag files to the edge.** Push the files right against the edge that leads to the other computer: the box appears only while you drag files, once they reach that edge, not before. Check that both computers are connected ("Connected to …") and run the same version of Hop. **Activity** says what happened to files you dropped.
 - **Files from the PC never arrive on the Mac.** If Activity on the PC says "Mac could not save the files in its Hop Received folder", or you clicked Don't Allow when macOS asked about the Downloads folder: open System Settings → Privacy & Security → Files & Folders on the Mac, find Hop, and switch on **Downloads Folder**. Then drop the files again. Activity on the Mac says the same.
 - **To pair again**, for example with a new computer: click **Forget…** under **Your other computer**, then pair as in step 4.
 - **Hop's log.** Click **Open log folder** under **Activity** in Hop's window. On the Mac the log is in `~/Library/Logs/Hop`, and on the PC in `%LOCALAPPDATA%\Hop\Logs`. The log never contains what you type or copy, the names of files you send, or pairing codes, so you can share it with Claude.

@@ -13,10 +13,13 @@
 //! - **The band**, [`BAND_DEPTH`] deep: the only one that takes drops, and
 //!   the only one a click can land on. It covers no more than the very
 //!   edge, where a cursor pushed against it stops, so the icons, panes and
-//!   scroll bars near the edge keep their own drops and clicks.
+//!   scroll bars near the edge keep their own drops and clicks. While files
+//!   are over it, it grows to the label's place, under the label
+//!   ([`Placement::rect`]): a drop anywhere on the box the user sees is
+//!   taken, and the box goes only when the files leave it.
 //! - **The label**, [`LABEL_DEPTH`] deep: the tint and the words that say
-//!   what a drop there does. Drags and clicks pass through it, and it shows
-//!   only while files are over the band.
+//!   what a drop there does. Drags and clicks pass through it, to the band
+//!   under it, and it shows only while files are over the band.
 //!
 //! # When
 //!
@@ -36,17 +39,21 @@
 //! - **Hidden.**
 //! - **Armed:** the band shows at [`BAND_ALPHA`]: invisible, but there for
 //!   drag and drop to find under the cursor.
-//! - **Highlighted:** files are dragged over the band: the label shows too,
-//!   at [`LABEL_ALPHA`], and the band answers "copy" if the source allows
-//!   it.
+//! - **Highlighted:** files are dragged over the band: the band grows to
+//!   the label's place, still invisible, and the label shows over it, at
+//!   [`LABEL_ALPHA`]. The band answers "copy" if the source allows it. The
+//!   cursor that brought the files is still on the band once it has grown,
+//!   so drag and drop sees no change; it tells the band the files left only
+//!   once they leave the whole box.
 //!
 //! Anything but files (text, a link, an e-mail, an attachment that is not a
 //! file yet) dragged onto an armed band makes it step aside: it hides at
 //! once and stays hidden until that gesture ends, so drag and drop finds
 //! the window under it, which gets the drag and its drop as if Hop were not
-//! there. The files leaving (or the drag being cancelled) go back to armed.
-//! A drop takes the files, answers "copy" and hides. The answer is never
-//! "move": the files always stay where they were.
+//! there. The files leaving the box (or the drag being cancelled) go back
+//! to armed: the label goes, and the band shrinks back to the edge. A drop
+//! takes the files, answers "copy" and hides. The answer is never "move":
+//! the files always stay where they were.
 //!
 //! When the button goes up somewhere else, an armed band hides at once: no
 //! drop can come to it, and the next click must not find it. When it goes
@@ -216,7 +223,7 @@ pub fn window_rect(zone: &DropZone, scale: f64, depth: f64) -> Option<PhysRect> 
 /// Where a zone's two windows go, in physical pixels (see [`window_rect`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
-    /// The band, [`BAND_DEPTH`] deep.
+    /// The band at the very edge, [`BAND_DEPTH`] deep.
     pub band: PhysRect,
     /// The label, [`LABEL_DEPTH`] deep: over the band and beyond it.
     pub label: PhysRect,
@@ -230,6 +237,18 @@ impl Placement {
             band: window_rect(zone, scale, BAND_DEPTH)?,
             label: window_rect(zone, scale, LABEL_DEPTH)?,
         })
+    }
+
+    /// Where `part` goes while the zone looks `look`. The label has one
+    /// place. The band stays at the very edge, except while files are over
+    /// it: then it covers the label's place, under the label, so that a
+    /// drop anywhere on the box the user sees is the band's, and drag and
+    /// drop tells the band the files left only once they leave that box.
+    pub fn rect(&self, part: Part, look: Look) -> PhysRect {
+        match part {
+            Part::Band if !look.labelled() => self.band,
+            Part::Band | Part::Label => self.label,
+        }
     }
 }
 
@@ -406,10 +425,11 @@ pub enum Look {
     /// Neither window is shown.
     #[default]
     Hidden,
-    /// The band shows, at [`BAND_ALPHA`]: invisible, but there for drag
-    /// and drop.
+    /// The band shows at the very edge, at [`BAND_ALPHA`]: invisible, but
+    /// there for drag and drop.
     Armed,
-    /// Files are dragged over the band: the label shows too.
+    /// Files are dragged over the band: it covers the label's place, and
+    /// the label shows over it.
     Highlighted,
 }
 
@@ -435,12 +455,16 @@ pub enum Part {
 }
 
 /// What a zone's windows do for its look to go from `before` to `after`:
-/// each window that changes, with whether it ends up shown, in order. The
-/// label goes first and comes last, so it is never on screen without the
-/// band that takes the drop it invites.
+/// each window that changes, with whether it ends up shown, in order; it
+/// goes where [`Placement::rect`] says for `after`. The band changes when
+/// it comes or goes, and also when it grows to the label's place or
+/// shrinks back to the edge. The label goes first and comes last, so it is
+/// never on screen without the band under all of it, which takes the drop
+/// it invites; and each window is put on top as it is shown, so the label,
+/// shown after the band, stays over it.
 pub fn window_steps(before: Look, after: Look) -> impl Iterator<Item = (Part, bool)> {
     let label_goes = before.labelled() && !after.labelled();
-    let band_changes = before.shown() != after.shown();
+    let band_changes = before.shown() != after.shown() || before.labelled() != after.labelled();
     let label_comes = !before.labelled() && after.labelled();
     [
         label_goes.then_some((Part::Label, false)),
@@ -481,7 +505,10 @@ pub enum ButtonUp {
 impl ButtonUp {
     /// Where a button-up at `at` (`None`: not seen) is for a band at
     /// `band`. Drag and drop drops where the button went up, so a drop can
-    /// come to the band only from a button-up over it.
+    /// come to the band only from a button-up over it. Only an armed band
+    /// is decided this way (one with files over it waits for its drop
+    /// wherever the button went up), so `band` is its place at the very
+    /// edge, [`Placement::band`].
     pub fn locate(at: Option<PhysPoint>, band: PhysRect) -> ButtonUp {
         if at.is_none_or(|at| band.contains(at)) {
             ButtonUp::Over
@@ -581,21 +608,22 @@ impl Target {
         }
     }
 
-    /// The drag left the band, or was cancelled: the label goes.
+    /// The drag left the band, or was cancelled: the label goes, and the
+    /// band shrinks back to the edge.
     pub fn drag_leave(&mut self) {
         if self.look == Look::Highlighted {
             self.look = Look::Armed;
         }
     }
 
-    /// A click landed on the band, still shown after a drag: no files are
-    /// being dragged over it (a drag holds the mouse), so it hides at once
-    /// and the next click goes through. A highlighted band waits for its
-    /// drop instead.
+    /// A click landed on the band, still shown after a drag: no drag is
+    /// going on (a drag holds the mouse until its button goes up, which is
+    /// when drag and drop hands over its drop), so it hides at once and the
+    /// next click goes through. So does a highlighted band whose drop never
+    /// came, which covers the whole label's place. A drop that comes after
+    /// all is still taken (see [`Target::drop_files`]).
     pub fn clicked(&mut self) {
-        if self.look != Look::Highlighted {
-            *self = Target::default();
-        }
+        *self = Target::default();
     }
 
     /// The drag was dropped on the band. `files`: paths were read from it.
@@ -1164,8 +1192,18 @@ mod tests {
         let steps = |before, after| window_steps(before, after).collect::<Vec<_>>();
         use Look::{Armed, Hidden, Highlighted};
         assert_eq!(steps(Hidden, Armed), [(Part::Band, true)]);
-        assert_eq!(steps(Armed, Highlighted), [(Part::Label, true)]);
-        assert_eq!(steps(Highlighted, Armed), [(Part::Label, false)]);
+        // Files over the band: it grows to the label's place first, then
+        // the label shows over it.
+        assert_eq!(
+            steps(Armed, Highlighted),
+            [(Part::Band, true), (Part::Label, true)]
+        );
+        // They leave the box: the label goes first, then the band shrinks
+        // back to the edge.
+        assert_eq!(
+            steps(Highlighted, Armed),
+            [(Part::Label, false), (Part::Band, true)]
+        );
         assert_eq!(steps(Armed, Hidden), [(Part::Band, false)]);
         // A drop: the label goes first.
         assert_eq!(
@@ -1177,20 +1215,90 @@ mod tests {
             steps(Hidden, Highlighted),
             [(Part::Band, true), (Part::Label, true)]
         );
-        // Every change ends with the windows showing what the look says, and
-        // the label is never on screen without the band under it.
-        let looks = [Hidden, Armed, Highlighted];
+        // Nothing changes, nothing moves.
+        for look in [Hidden, Armed, Highlighted] {
+            assert_eq!(steps(look, look), [], "{look:?}");
+        }
+    }
+
+    #[test]
+    fn the_box_the_user_sees_is_all_band_and_the_label_stays_on_top() {
+        // Regression guard: with the band left at the edge under a deep
+        // label, a drop on the label's words went to the window under it,
+        // and moving onto them made the box vanish.
+        let placement =
+            Placement::of(&zone(panel(), Edge::Left, 10.0, 854.0), 1.25).expect("a place");
+        let looks = [Look::Hidden, Look::Armed, Look::Highlighted];
         for before in looks {
             for after in looks {
-                let (mut band, mut label) = (before.shown(), before.labelled());
+                // Where each window is on screen, and whether the label was
+                // last put on top of the band.
+                let mut band = before.shown().then(|| placement.rect(Part::Band, before));
+                let mut label = before
+                    .labelled()
+                    .then(|| placement.rect(Part::Label, before));
+                let mut label_on_top = true;
                 for (part, shown) in window_steps(before, after) {
+                    let rect = shown.then(|| placement.rect(part, after));
                     match part {
-                        Part::Band => band = shown,
-                        Part::Label => label = shown,
+                        Part::Band => band = rect,
+                        Part::Label => label = rect,
                     }
-                    assert!(band || !label, "{before:?} to {after:?}");
+                    if shown {
+                        // Each window goes on top as it is shown or moved.
+                        label_on_top = part == Part::Label;
+                    }
+                    if label.is_some() {
+                        // The label is never on screen without the band
+                        // under all of it, which takes the drop it invites.
+                        assert_eq!(band, label, "{before:?} to {after:?}");
+                        assert!(label_on_top, "{before:?} to {after:?}");
+                    }
                 }
-                assert_eq!((band, label), (after.shown(), after.labelled()));
+                // Every change ends with the windows where the look says.
+                assert_eq!(
+                    band,
+                    after.shown().then(|| placement.rect(Part::Band, after)),
+                    "{before:?} to {after:?}"
+                );
+                assert_eq!(
+                    label,
+                    after.labelled().then(|| placement.rect(Part::Label, after)),
+                    "{before:?} to {after:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_highlighted_band_covers_the_labels_place() {
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            let (start, end) = panel().edge_span(edge);
+            let placement = Placement::of(&zone(panel(), edge, start, end), 1.25).expect("a place");
+            let band = |look| placement.rect(Part::Band, look);
+            // Armed, the band is the thin strip at the edge...
+            assert_eq!(band(Look::Armed), placement.band, "{edge:?}");
+            assert_eq!(band(Look::Hidden), placement.band, "{edge:?}");
+            // ...and with files over it, exactly the label's place, so a
+            // drop on the label's words, in its middle, is the band's.
+            assert_eq!(band(Look::Highlighted), placement.label, "{edge:?}");
+            assert_eq!(
+                placement.rect(Part::Label, Look::Highlighted),
+                placement.label
+            );
+            let words = placement.label.center();
+            assert!(band(Look::Highlighted).contains(words), "{edge:?}");
+            assert!(!band(Look::Armed).contains(words), "{edge:?}");
+            // The cursor that brought the files onto the thin band is still
+            // on it once it has grown: drag and drop sees no files leave.
+            let thin = placement.band;
+            for corner in [
+                p(thin.left, thin.top),
+                p(thin.right - 1, thin.top),
+                p(thin.left, thin.bottom - 1),
+                p(thin.right - 1, thin.bottom - 1),
+            ] {
+                assert!(band(Look::Highlighted).contains(corner), "{edge:?}");
             }
         }
     }
@@ -1455,11 +1563,16 @@ mod tests {
         target.disarm(t, ButtonUp::Over);
         target.clicked();
         assert_eq!(target, Target::default());
-        // Files over it: the drop is on its way, so it stays.
+        // Files were over it and their drop never came (the drag source
+        // went away): it covers the label's place, so it must not stay
+        // there catching clicks until the grace runs out.
         target.arm();
         target.drag_enter(true, true);
+        target.disarm(t, ButtonUp::Over);
         target.clicked();
-        assert_eq!(target.look(), Look::Highlighted);
+        assert_eq!(target, Target::default());
+        // A drop that comes after all is still taken.
+        assert_eq!(target.drop_files(true, true), Effect::Copy);
         // Nothing shown, nothing to do.
         let mut hidden = Target::default();
         hidden.clicked();

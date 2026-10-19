@@ -12,9 +12,12 @@
 //!     still found under the cursor, registered with `RegisterDragDrop` and
 //!     an `IDropTarget` of its own. Drag and drop calls the targets on this
 //!     thread; they are not agile, so COM never calls them anywhere else.
+//!     While files are over it, it covers the label's place, under the
+//!     label.
 //!   - **the label**, deeper, with the tint and the words, painted with
 //!     GDI. It is `WS_EX_TRANSPARENT`, so drags and clicks pass through it
-//!     to whatever is under it, and it is never registered for drops.
+//!     to whatever is under it (the band, while it shows), and it is never
+//!     registered for drops.
 //! - The mouse hook, on Hop's input thread, follows the left button
 //!   (`logic::drop_zone::DragGesture`) and posts "arm" and "disarm" (with
 //!   where the button went up) to that window. It never waits: it only
@@ -24,8 +27,11 @@
 //!
 //! A band shows only during a drag near its zone (the rules are in
 //! `logic::drop_zone`), and only the band takes drops, so what lies near
-//! the edge keeps its own drops and clicks. With files over the band, the
-//! label shows too; a drop is always taken as a copy, never a move.
+//! the edge keeps its own drops and clicks. With files over the band, it
+//! grows to the label's place and the label shows over it, so a drop
+//! anywhere on that box is taken, and the box goes only when the files
+//! leave it; the band then shrinks back to the edge. A drop is always
+//! taken as a copy, never a move.
 //! Anything but files dragged onto a band (no `CF_HDROP`) makes it hide at
 //! once for the rest of that drag, so the window under it gets the drag.
 //! When the button goes up somewhere else, a band without files over it
@@ -151,13 +157,14 @@ struct DropState {
 
 struct ZoneWindow {
     zone: DropZone,
-    /// The thin strip at the edge that drag and drop finds: the
-    /// `IDropTarget`'s window.
+    /// The strip at the edge that drag and drop finds, grown to the label's
+    /// place while files are over it: the `IDropTarget`'s window.
     band: HWND,
     /// The tint and the words, which drags and clicks pass through.
     label: HWND,
     target: Target,
-    /// Where the windows were put when the band was last shown.
+    /// Where the windows go (see `Placement::rect`), worked out when the
+    /// band was last shown.
     placed: Option<Placement>,
 }
 
@@ -188,14 +195,18 @@ struct Change {
 
 impl Change {
     /// Shows the band while the look is shown and the label while it is
-    /// labelled, at the places they were given, and hides each otherwise
-    /// (see `window_steps`). Drop thread.
+    /// labelled, each where `Placement::rect` puts it for the look (the
+    /// band over the label's place while files are over it, at the edge
+    /// otherwise), and hides each otherwise. `window_steps` orders the
+    /// steps: the band grows before the label shows, so the label is put on
+    /// top of it, and the label hides before the band shrinks. Drop thread.
     fn apply(&self) {
         for (part, shown) in window_steps(self.before, self.after) {
-            let (hwnd, place) = match part {
-                Part::Band => (self.band, self.placed.map(|placed| placed.band)),
-                Part::Label => (self.label, self.placed.map(|placed| placed.label)),
+            let hwnd = match part {
+                Part::Band => self.band,
+                Part::Label => self.label,
             };
+            let place = self.placed.map(|placed| placed.rect(part, self.after));
             show(hwnd, place.filter(|_| shown));
         }
     }
@@ -602,7 +613,10 @@ fn disarm(generation: u64, at: Option<PhysPoint>) {
         let mut changes = Vec::new();
         for zone in &mut state.zones {
             let before = zone.target.look();
-            // Only the band takes drops: the label lets them through.
+            // Only the band takes drops: the label lets them through. Where
+            // the button went up matters only to an armed band, which lies
+            // at the very edge; one with files over it, grown over the
+            // label's place, waits for its drop anyway.
             let up = zone
                 .placed
                 .map_or(ButtonUp::Over, |placed| ButtonUp::locate(at, placed.band));

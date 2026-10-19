@@ -12,9 +12,15 @@
 //!   while a button is held), and nothing further in. Desktop icons, the
 //!   Dock and windows near the edge keep taking their own drops. The band
 //!   glows while files are dragged near it, which shows where to take them.
+//!   While files are over it, it grows over the whole sign ([`BandFrames`]),
+//!   still glowing only along the edge and all but clear elsewhere, so the
+//!   sign shows through: a drop anywhere on the box the user sees is taken,
+//!   and the box goes only when the files leave it. Then the band shrinks
+//!   back to the edge.
 //! - **The sign** says where the files go ("Drop to send to …"), across the
 //!   120 points next to the edge. It shows only while files are over the
-//!   band, and it ignores the mouse: clicks and drags pass through it.
+//!   band, under it, and it ignores the mouse: clicks and drags pass
+//!   through it.
 //!
 //! Three threads take part, and none of them ever waits for another:
 //!
@@ -36,11 +42,11 @@
 //! - **The main thread** owns the panels (AppKit allows nothing else) and
 //!   gets its work through the main dispatch queue, never waited on. The
 //!   app and `hop run` both run the main event loop that serves it. The
-//!   band's view takes the drop: it shows the sign while files are over
-//!   it, reads the dropped file URLs into the queue that
-//!   [`DropCatcher::take_drops`] empties, and hides the target. Only file
-//!   URLs count: no web links, and no file promises (Photos and Mail drag
-//!   those).
+//!   band's view takes the drop: while files are over it, it grows over the
+//!   sign and shows it, it reads the dropped file URLs into the queue that
+//!   [`DropCatcher::take_drops`] empties, and it hides the target. Only
+//!   file URLs count: no web links, and no file promises (Photos and Mail
+//!   drag those).
 //!
 //! The band answers every drag with the copy operation, so a drop never
 //! moves or deletes the files it came from.
@@ -69,8 +75,8 @@ use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSDragOperation, NSDraggingDestination,
     NSDraggingInfo, NSFont, NSPanel, NSPasteboard, NSPasteboardNameDrag, NSPasteboardTypeFileURL,
     NSPasteboardURLReadingFileURLsOnlyKey, NSResponder, NSStatusWindowLevel, NSTextAlignment,
-    NSTextField, NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowLevel,
-    NSWindowStyleMask,
+    NSTextField, NSView, NSWindow, NSWindowAnimationBehavior, NSWindowCollectionBehavior,
+    NSWindowLevel, NSWindowStyleMask,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGMouseButton,
@@ -104,8 +110,14 @@ const LINGER: Duration = Duration::from_secs(1);
 /// of points, where macOS stops a cursor pushed against the edge.
 const BAND_DEPTH: f64 = 8.0;
 
-/// How far the sign reaches into the display from the edge, in points.
+/// How far the sign reaches into the display from the edge, in points. The
+/// band reaches as far while files are over it.
 const SIGN_DEPTH: f64 = 120.0;
+
+/// The band's opacity beyond its glowing edge while it lies over the sign:
+/// next to nothing, so the sign shows through, but never fully clear, so
+/// that no part of the band is left for a drag to pass through.
+const OVER_SIGN_ALPHA: f64 = 0.02;
 
 /// The space between the sign's edges and its rounded strip, in points. As
 /// deep as the band, so the strip starts where the band ends.
@@ -747,7 +759,8 @@ impl Panels {
         };
         let panel =
             slot.get_or_insert_with(|| Panel::new(zone, &zones.label, Arc::downgrade(state), mtm));
-        // The sign waits until files are over the band.
+        // The band comes at the very edge; it grows over the sign, and the
+        // sign shows, once files are over it.
         panel.view.set_highlighted(false);
         panel.band.orderFrontRegardless();
         state.generation.fetch_add(1, Ordering::AcqRel);
@@ -785,7 +798,8 @@ enum Part {
 }
 
 impl Part {
-    /// How far it reaches into the display from the edge, in points.
+    /// How far it reaches into the display from the edge, in points (the
+    /// band, while no files are over it).
     fn depth(self) -> f64 {
         match self {
             Part::Band => BAND_DEPTH,
@@ -793,7 +807,8 @@ impl Part {
         }
     }
 
-    /// Its frame for `zone`, in Quartz coordinates.
+    /// Its frame for `zone`, in Quartz coordinates (the band's while no
+    /// files are over it; see [`BandFrames`]).
     fn rect(self, zone: &DropZone) -> Rect {
         edge_rect(zone, self.depth())
     }
@@ -805,8 +820,9 @@ impl Part {
     }
 
     /// Its window level: above the Dock and floating windows, with the
-    /// band one above the sign, so that where the sign covers the band
-    /// the band is still the window a drag finds.
+    /// band one above the sign. So the band is the window a drag finds
+    /// wherever the two meet: along the edge, and all over the sign while
+    /// files are over the band, which then lies over the whole sign.
     fn level(self) -> NSWindowLevel {
         match self {
             Part::Band => NSStatusWindowLevel + 1,
@@ -815,12 +831,48 @@ impl Part {
     }
 }
 
+/// Where the band goes, in Cocoa coordinates: at the very edge, or over
+/// the whole sign while files are over it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BandFrames {
+    /// At the very edge: the band's own frame.
+    edge: Rect,
+    /// Over the sign: the sign's frame, the box the user sees.
+    sign: Rect,
+}
+
+impl BandFrames {
+    /// The band's frames for `zone`, on a primary display `primary_height`
+    /// points tall.
+    fn of(zone: &DropZone, primary_height: f64) -> Self {
+        Self {
+            edge: to_cocoa(Part::Band.rect(zone), primary_height),
+            sign: to_cocoa(Part::Sign.rect(zone), primary_height),
+        }
+    }
+
+    /// The band's frame with files over it (`files_over`) or not. Both
+    /// start at the edge, along the same stretch, and the sign's holds the
+    /// band's: the cursor that brings files onto the band is still on it
+    /// once it has grown, so AppKit sees no exit, and it sees one only once
+    /// the files leave the whole sign.
+    fn frame(&self, files_over: bool) -> Rect {
+        if files_over { self.sign } else { self.edge }
+    }
+
+    /// Where the band's glow goes while it lies over the sign, in its
+    /// view's coordinates: along the edge, where the band lies otherwise.
+    fn glow_over_sign(&self) -> Rect {
+        self.edge.offset(-self.sign.min_x(), -self.sign.min_y())
+    }
+}
+
 /// One zone's drop target.
 struct Panel {
     /// The band, which takes the drop.
     band: Retained<NSPanel>,
-    /// The band's view. It holds the sign, and shows it while files are
-    /// over the band.
+    /// The band's view. It holds the sign, and while files are over the
+    /// band it grows the band over the sign and shows the sign.
     view: Retained<DropView>,
 }
 
@@ -828,16 +880,15 @@ impl Panel {
     /// The drop target for `zone`, with `label` on its sign, hidden until
     /// shown.
     fn new(zone: &DropZone, label: &str, state: Weak<DropState>, mtm: MainThreadMarker) -> Self {
-        let primary_height = main_display_frame().size.height;
-        let frame = |part: Part| ns_rect(to_cocoa(part.rect(zone), primary_height));
-        let sign_frame = frame(Part::Sign);
+        let frames = BandFrames::of(zone, main_display_frame().size.height);
+        let sign_frame = ns_rect(frames.sign);
         let sign = edge_panel(sign_frame, Part::Sign, mtm);
         let sign_view = SignView::new(at_origin(sign_frame.size), mtm);
         sign_view.add_label(label, mtm);
         sign.setContentView(Some(&sign_view));
-        let band_frame = frame(Part::Band);
+        let band_frame = ns_rect(frames.edge);
         let band = edge_panel(band_frame, Part::Band, mtm);
-        let view = DropView::new(at_origin(band_frame.size), state, sign, mtm);
+        let view = DropView::new(at_origin(band_frame.size), frames, state, sign, mtm);
         // Only the band's view takes drops, and only of files.
         // SAFETY: reading an immutable AppKit constant.
         let file_url = unsafe { NSPasteboardTypeFileURL };
@@ -846,7 +897,7 @@ impl Panel {
         Panel { band, view }
     }
 
-    /// Takes the band and its sign down.
+    /// Takes the sign down, then the band, back at the edge for next time.
     fn hide(&self) {
         self.view.set_highlighted(false);
         self.band.orderOut(None);
@@ -897,7 +948,10 @@ struct ViewIvars {
     state: Weak<DropState>,
     /// The sign, shown while files are over the band.
     sign: Retained<NSPanel>,
-    /// Files are being dragged over the band.
+    /// Where the band goes, with files over it or not.
+    frames: BandFrames,
+    /// Files are being dragged over the band, which then lies over the
+    /// sign.
     highlighted: Cell<bool>,
 }
 
@@ -910,7 +964,8 @@ define_class!(
     #[name = "HopDropTargetView"]
     #[ivars = ViewIvars]
     /// The band's view: a strip of colour along the edge, which takes
-    /// dropped files as a copy and shows the sign while files are over it.
+    /// dropped files as a copy. While files are over it, it grows the band
+    /// over the sign and shows the sign under it.
     struct DropView;
 
     impl DropView {
@@ -983,10 +1038,11 @@ define_class!(
 );
 
 impl DropView {
-    /// A view of size `frame` sending drops to `state`, which shows `sign`
-    /// while files are over it.
+    /// A view of size `frame` sending drops to `state`, in a band that goes
+    /// where `frames` say, which shows `sign` while files are over it.
     fn new(
         frame: NSRect,
+        frames: BandFrames,
         state: Weak<DropState>,
         sign: Retained<NSPanel>,
         mtm: MainThreadMarker,
@@ -994,6 +1050,7 @@ impl DropView {
         let this = Self::alloc(mtm).set_ivars(ViewIvars {
             state,
             sign,
+            frames,
             highlighted: Cell::new(false),
         });
         // SAFETY: NSView's designated initializer `initWithFrame:` takes the
@@ -1001,37 +1058,61 @@ impl DropView {
         unsafe { msg_send![super(this), initWithFrame: frame] }
     }
 
-    /// Fills the whole band with colour, stronger while files are over it.
-    /// No part of it is left clear.
+    /// Fills the band with colour. At the edge, all of it glows, stronger
+    /// while files are over it. Over the sign, only the strip along the
+    /// edge glows, and the rest is all but clear, so the sign shows
+    /// through. No part of it is left clear.
     fn draw(&self) {
-        let alpha = if self.ivars().highlighted.get() {
-            0.85
+        let accent = NSColor::controlAccentColor();
+        if self.ivars().highlighted.get() {
+            accent.colorWithAlphaComponent(OVER_SIGN_ALPHA).setFill();
+            NSBezierPath::fillRect(self.bounds());
+            accent.colorWithAlphaComponent(0.85).setFill();
+            NSBezierPath::fillRect(ns_rect(self.ivars().frames.glow_over_sign()));
         } else {
-            0.55
-        };
-        NSColor::controlAccentColor()
-            .colorWithAlphaComponent(alpha)
-            .setFill();
-        NSBezierPath::fillRect(self.bounds());
+            accent.colorWithAlphaComponent(0.55).setFill();
+            NSBezierPath::fillRect(self.bounds());
+        }
     }
 
-    /// Highlights the band, or not. When that changes, it redraws the band
-    /// and shows or hides the sign. The sign shows only beside a band that
-    /// is on the screen.
+    /// Highlights the band, or not. When that changes, the band grows over
+    /// the sign or shrinks back to the edge, it is redrawn, and the sign
+    /// shows or hides. The sign shows only under a band that is on the
+    /// screen and covers it: it shows after the band has grown, and it goes
+    /// before the band shrinks.
     fn set_highlighted(&self, highlighted: bool) {
         if self.ivars().highlighted.replace(highlighted) == highlighted {
             return;
         }
-        self.setNeedsDisplay(true);
         let sign = &self.ivars().sign;
-        if highlighted && self.window().is_some_and(|band| band.isVisible()) {
-            sign.orderFrontRegardless();
-        } else {
+        if !highlighted {
             sign.orderOut(None);
+        }
+        let band = self.window();
+        if let Some(band) = &band {
+            self.place(band, self.ivars().frames.frame(highlighted));
+        }
+        self.setNeedsDisplay(true);
+        if highlighted && band.is_some_and(|band| band.isVisible()) {
+            sign.orderFrontRegardless();
         }
     }
 
-    /// Takes a drop: queues its files, calls off the hide planned at the
+    /// Puts `band`, this view's panel, at `frame` (Cocoa coordinates), with
+    /// this view filling it. On the main thread, during a drag too: the
+    /// cursor that brought files onto the band stays on it as it grows (see
+    /// [`BandFrames::frame`]).
+    fn place(&self, band: &NSWindow, frame: Rect) {
+        let frame = ns_rect(frame);
+        band.setFrame_display(frame, band.isVisible());
+        // The panel sizes its content view to fit; said once more, since
+        // only this view takes the drop, and it must cover every point of
+        // the panel.
+        self.setFrame(at_origin(frame.size));
+    }
+
+    /// Takes a drop: the sign goes at once and the band goes back to the
+    /// edge, then it queues the files, calls off the hide planned at the
     /// mouse-up and takes the target down instead, once AppKit is done with
     /// the drop. Returns whether there were files, so a drop of nothing
     /// usable (every file gone by now, say) slides back to where it came
@@ -1057,7 +1138,8 @@ define_class!(
     #[name = "HopDropSignView"]
     /// The sign's view: a faint tint over the whole sign and a rounded
     /// strip with the label. It takes no drops: nothing registers it for
-    /// any, and its panel ignores the mouse.
+    /// any, and its panel ignores the mouse. While it shows, the band lies
+    /// over all of it and takes the drop anywhere on it.
     struct SignView;
 
     impl SignView {
@@ -1340,10 +1422,110 @@ mod tests {
         assert!(!Part::Sign.takes_mouse());
         assert!(Part::Band.depth() <= 12.0, "a thin band");
         assert!(Part::Sign.depth() > Part::Band.depth());
-        // Where the sign covers the band, the band is the window a drag
-        // finds; both stay above the Dock and floating windows.
+        // Wherever the two meet (along the edge, and all over the sign while
+        // files are over the band), the band is the window a drag finds;
+        // both stay above the Dock and floating windows.
         assert!(Part::Band.level() > Part::Sign.level());
         assert!(Part::Sign.level() >= NSStatusWindowLevel);
+    }
+
+    /// Zones on every edge, on a display beside the Mac's, and on displays
+    /// less deep than the sign.
+    fn every_kind_of_zone() -> Vec<DropZone> {
+        let monitor = Rect::new(1512.0, 200.0, 1920.0, 1080.0);
+        let strip = Rect::new(0.0, 0.0, 80.0, 50.0);
+        vec![
+            right(),
+            zone(MAC, Edge::Left, 59.0, 923.0),
+            zone(MAC, Edge::Top, 59.0, 1453.0),
+            zone(MAC, Edge::Bottom, 59.0, 1453.0),
+            zone(monitor, Edge::Right, 260.0, 1220.0),
+            zone(strip, Edge::Right, 10.0, 40.0),
+            zone(strip, Edge::Bottom, 10.0, 70.0),
+        ]
+    }
+
+    #[test]
+    fn with_files_over_it_the_band_covers_the_whole_sign() {
+        // Regression guard: with the band left at the edge under a deep
+        // sign, a drop on the sign's words landed on whatever lay under it
+        // (a Finder window, the Desktop), and moving onto them took the sign
+        // away.
+        let height = MAC.size.height;
+        let frames = BandFrames::of(&right(), height);
+        assert_eq!(frames.frame(false), Rect::new(1504.0, 59.0, 8.0, 864.0));
+        assert_eq!(frames.frame(true), Rect::new(1392.0, 59.0, 120.0, 864.0));
+        for zone in every_kind_of_zone() {
+            let frames = BandFrames::of(&zone, height);
+            let (edge, over_sign) = (frames.frame(false), frames.frame(true));
+            // At the edge, the thin band; with files over it, exactly the
+            // sign, the box the user sees.
+            assert_eq!(edge, to_cocoa(Part::Band.rect(&zone), height), "{zone:?}");
+            assert_eq!(
+                over_sign,
+                to_cocoa(Part::Sign.rect(&zone), height),
+                "{zone:?}"
+            );
+            // A drop on the sign's words, in its middle, is the band's now,
+            // and was not while the band stayed at the edge.
+            let words = over_sign.center();
+            assert!(over_sign.contains(words), "{zone:?}");
+            assert!(!edge.contains(words), "{zone:?}");
+            // The cursor that brings files onto the band is still on it once
+            // it has grown, so AppKit sees neither an exit nor a new entry:
+            // the band at the edge lies inside the grown one.
+            let inside = over_sign.min_x() <= edge.min_x()
+                && edge.max_x() <= over_sign.max_x()
+                && over_sign.min_y() <= edge.min_y()
+                && edge.max_y() <= over_sign.max_y();
+            assert!(inside, "{zone:?}");
+        }
+    }
+
+    #[test]
+    fn over_the_sign_the_band_still_glows_along_the_edge() {
+        let height = MAC.size.height;
+        let glow = |zone: DropZone| BandFrames::of(&zone, height).glow_over_sign();
+        // In the band's own view, y up: the right edge is on the right...
+        assert_eq!(glow(right()), Rect::new(112.0, 0.0, 8.0, 864.0));
+        assert_eq!(
+            glow(zone(MAC, Edge::Left, 59.0, 923.0)),
+            Rect::new(0.0, 0.0, 8.0, 864.0)
+        );
+        // ...and the top of the display is at the top of the view.
+        assert_eq!(
+            glow(zone(MAC, Edge::Top, 59.0, 1453.0)),
+            Rect::new(0.0, 112.0, 1394.0, 8.0)
+        );
+        assert_eq!(
+            glow(zone(MAC, Edge::Bottom, 59.0, 1453.0)),
+            Rect::new(0.0, 0.0, 1394.0, 8.0)
+        );
+        // On a display less deep than the sign too.
+        let strip = Rect::new(0.0, 0.0, 80.0, 50.0);
+        assert_eq!(
+            glow(zone(strip, Edge::Right, 10.0, 40.0)),
+            Rect::new(72.0, 0.0, 8.0, 30.0)
+        );
+        // Everywhere, the glow is the band's place at the edge, inside the
+        // grown band.
+        for zone in every_kind_of_zone() {
+            let frames = BandFrames::of(&zone, height);
+            let glow = frames.glow_over_sign();
+            let edge = frames.frame(false);
+            assert_eq!(glow.size, edge.size, "{zone:?}");
+            let over_sign = frames.frame(true);
+            assert_eq!(
+                glow.offset(over_sign.min_x(), over_sign.min_y()),
+                edge,
+                "{zone:?}"
+            );
+            assert!(glow.min_x() >= 0.0 && glow.min_y() >= 0.0, "{zone:?}");
+            assert!(
+                glow.max_x() <= over_sign.size.width && glow.max_y() <= over_sign.size.height,
+                "{zone:?}"
+            );
+        }
     }
 
     #[test]
