@@ -1,10 +1,22 @@
 //! Catching files dropped on the edge that leads to the other computer
 //! (docs/M4-M5-DESIGN.md, "The drop zone").
 //!
-//! The drop target is a borderless, non-activating panel along the zone.
-//! It shows only while files are dragged near the zone, so it never gets in
-//! the way of ordinary clicks or of window snapping at the edge. Three
-//! threads take part, and none of them ever waits for another:
+//! The drop target is two borderless, non-activating panels along the
+//! zone. They show only while files are dragged near the zone, so they
+//! never get in the way of ordinary clicks or of window snapping at the
+//! edge:
+//!
+//! - **The band** takes the drop. It is only a few points deep, at the very
+//!   edge: it covers the display's last column (or row) of points, where
+//!   macOS stops a cursor pushed against the edge (the cursor never crosses
+//!   while a button is held), and nothing further in. Desktop icons, the
+//!   Dock and windows near the edge keep taking their own drops. The band
+//!   glows while files are dragged near it, which shows where to take them.
+//! - **The sign** says where the files go ("Drop to send to …"), across the
+//!   120 points next to the edge. It shows only while files are over the
+//!   band, and it ignores the mouse: clicks and drags pass through it.
+//!
+//! Three threads take part, and none of them ever waits for another:
 //!
 //! - **The event tap** watches the left button ([`TapDrops`]), Hop's own
 //!   injected presses included: the other computer may be dragging a file
@@ -12,21 +24,25 @@
 //!   pasteboard's change count; while the button is dragged it asks, at
 //!   most every 50 ms, whether a drag of files has started since. Once one
 //!   has, it compares the cursor with the zones (plain arithmetic) and asks
-//!   the main thread to show the target within 150 points of a zone, to
-//!   hide it beyond 300, and to hide it about a second after the button
-//!   goes up, which leaves time for a drop on it to land.
+//!   the main thread to show the target within 150 points of a zone (so
+//!   the band is in place before the cursor gets there), to hide it beyond
+//!   300, and to hide it about a second after the button goes up, which
+//!   leaves time for a drop on it to land. Should the tap miss the
+//!   button-up, the next press, or the tap's watchdog once it finds the
+//!   button up, takes the target down instead.
 //! - **A serial helper queue** reads the drag pasteboard. That means asking
 //!   the pasteboard server, which can take a moment, and the tap must never
 //!   wait.
 //! - **The main thread** owns the panels (AppKit allows nothing else) and
 //!   gets its work through the main dispatch queue, never waited on. The
 //!   app and `hop run` both run the main event loop that serves it. The
-//!   panel's view takes the drop: it reads the dropped file URLs into the
-//!   queue that [`DropCatcher::take_drops`] empties, and hides the panel.
-//!   Only file URLs count: no web links, and no file promises (Photos and
-//!   Mail drag those).
+//!   band's view takes the drop: it shows the sign while files are over
+//!   it, reads the dropped file URLs into the queue that
+//!   [`DropCatcher::take_drops`] empties, and hides the target. Only file
+//!   URLs count: no web links, and no file promises (Photos and Mail drag
+//!   those).
 //!
-//! The target answers every drag with the copy operation, so a drop never
+//! The band answers every drag with the copy operation, so a drop never
 //! moves or deletes the files it came from.
 //!
 //! Nothing here logs. File names leave this module only through
@@ -53,9 +69,12 @@ use objc2_app_kit::{
     NSBackingStoreType, NSBezierPath, NSColor, NSDragOperation, NSDraggingDestination,
     NSDraggingInfo, NSFont, NSPanel, NSPasteboard, NSPasteboardNameDrag, NSPasteboardTypeFileURL,
     NSPasteboardURLReadingFileURLsOnlyKey, NSResponder, NSStatusWindowLevel, NSTextAlignment,
-    NSTextField, NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSTextField, NSView, NSWindowAnimationBehavior, NSWindowCollectionBehavior, NSWindowLevel,
+    NSWindowStyleMask,
 };
-use objc2_core_graphics::{CGEvent, CGEventType};
+use objc2_core_graphics::{
+    CGEvent, CGEventSource, CGEventSourceStateID, CGEventType, CGMouseButton,
+};
 use objc2_foundation::{
     NSArray, NSDictionary, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
     NSURL,
@@ -79,13 +98,20 @@ const CHECK_EVERY: Duration = Duration::from_millis(50);
 /// to the target a moment after the button is let go.
 const LINGER: Duration = Duration::from_secs(1);
 
-/// How far the target reaches into the display from the edge, in points.
-const DEPTH: f64 = 120.0;
+/// How far the band, which takes the drop, reaches into the display from
+/// the edge, in points. Thin, so that icons, the Dock and windows near the
+/// edge keep taking their own drops; enough to hold the last column or row
+/// of points, where macOS stops a cursor pushed against the edge.
+const BAND_DEPTH: f64 = 8.0;
 
-/// The space between the target's edges and its rounded strip, in points.
-const STRIP_INSET: f64 = 8.0;
+/// How far the sign reaches into the display from the edge, in points.
+const SIGN_DEPTH: f64 = 120.0;
 
-/// The space between the target's edges and its label, in points.
+/// The space between the sign's edges and its rounded strip, in points. As
+/// deep as the band, so the strip starts where the band ends.
+const STRIP_INSET: f64 = BAND_DEPTH;
+
+/// The space between the sign's edges and its label, in points.
 const LABEL_INSET: f64 = 16.0;
 
 /// The label's font size, in points.
@@ -413,6 +439,19 @@ fn left_button(ty: CGEventType) -> Option<Left> {
     }
 }
 
+/// Whether the left button is down right now, as the apps see it. The
+/// session's combined state counts Hop's own posted presses as well as the
+/// mouse's, so a drag the other computer drives here is never cut short.
+/// The right button counts too, as a precaution: should the state ever
+/// follow the buttons as built rather than as System Settings assigns them
+/// (it can swap them), a drag is still never cut short, and a target left
+/// up meanwhile goes at the next press.
+fn left_button_held() -> bool {
+    let held =
+        |button| CGEventSource::button_state(CGEventSourceStateID::CombinedSessionState, button);
+    held(CGMouseButton::Left) || held(CGMouseButton::Right)
+}
+
 /// What one event asks of the helper queue and the main thread.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Requests {
@@ -503,6 +542,31 @@ impl TapDrops {
         self.target = None;
     }
 
+    /// The watchdog's part, on the tap thread every 100 ms: a target still
+    /// up while the left button is not held lost its button-up (macOS
+    /// switched the tap off for a moment, say), so it is taken down as the
+    /// button-up would have. Never waits.
+    pub(crate) fn on_tick(&mut self, state: &Arc<DropState>) {
+        self.refresh(state);
+        let requests = self.tick(left_button_held);
+        if requests != Requests::default() {
+            state.carry_out(requests, &self.zones);
+        }
+    }
+
+    /// What a watchdog tick asks for. `held` says whether the left button
+    /// is down right now; it is asked only while a target is up.
+    fn tick(&mut self, held: impl FnOnce() -> bool) -> Requests {
+        let mut requests = Requests::default();
+        if self.target.is_some() && !held() {
+            // As at a button-up: the hide waits a moment, in case the drop
+            // is on its way.
+            self.held = false;
+            requests.hide_later = self.target.take().is_some();
+        }
+        requests
+    }
+
     /// What a left-button event at `at`, at `now`, asks for. `file_drag` is
     /// the press whose drag the helper found carrying files.
     fn step(&mut self, left: Left, at: Point, now: Instant, file_drag: u64) -> Requests {
@@ -510,6 +574,9 @@ impl TapDrops {
         let watching = !self.zones.zones.is_empty();
         match left {
             Left::Down => {
+                // A target still up at a press lost its button-up: take it
+                // down now. That also lets this press's drag show it again.
+                requests.hide = self.target.take().is_some();
                 self.press += 1;
                 self.held = true;
                 self.checked_at = None;
@@ -643,8 +710,8 @@ fn file_path(url: &NSURL) -> Option<PathBuf> {
 
 // ----- The main thread's part -------------------------------------------------------------
 
-/// The drop targets, on the main thread: one panel per zone, each made the
-/// first time it is shown.
+/// The drop targets, on the main thread: a band and a sign for each zone,
+/// made the first time they are shown.
 #[derive(Default)]
 struct Panels {
     /// The version of the zones the panels were made for.
@@ -672,7 +739,7 @@ impl Panels {
             if let Some(panel) = panel
                 && i != index
             {
-                panel.window.orderOut(None);
+                panel.hide();
             }
         }
         let Some(slot) = self.panels.get_mut(index) else {
@@ -680,15 +747,16 @@ impl Panels {
         };
         let panel =
             slot.get_or_insert_with(|| Panel::new(zone, &zones.label, Arc::downgrade(state), mtm));
+        // The sign waits until files are over the band.
         panel.view.set_highlighted(false);
-        panel.window.orderFrontRegardless();
+        panel.band.orderFrontRegardless();
         state.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Takes every target down.
     fn hide(&self) {
         for panel in self.panels.iter().flatten() {
-            panel.window.orderOut(None);
+            panel.hide();
         }
     }
 
@@ -707,63 +775,129 @@ impl Drop for Panels {
     }
 }
 
-/// One drop target.
+/// The two panels of a drop target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// The thin band at the very edge, which takes the drop.
+    Band,
+    /// The sign with the label, shown while files are over the band.
+    Sign,
+}
+
+impl Part {
+    /// How far it reaches into the display from the edge, in points.
+    fn depth(self) -> f64 {
+        match self {
+            Part::Band => BAND_DEPTH,
+            Part::Sign => SIGN_DEPTH,
+        }
+    }
+
+    /// Its frame for `zone`, in Quartz coordinates.
+    fn rect(self, zone: &DropZone) -> Rect {
+        edge_rect(zone, self.depth())
+    }
+
+    /// Whether it meets the mouse, and so drags: only the band does. The
+    /// sign lets clicks and drags through to whatever is under it.
+    fn takes_mouse(self) -> bool {
+        self == Part::Band
+    }
+
+    /// Its window level: above the Dock and floating windows, with the
+    /// band one above the sign, so that where the sign covers the band
+    /// the band is still the window a drag finds.
+    fn level(self) -> NSWindowLevel {
+        match self {
+            Part::Band => NSStatusWindowLevel + 1,
+            Part::Sign => NSStatusWindowLevel,
+        }
+    }
+}
+
+/// One zone's drop target.
 struct Panel {
-    window: Retained<NSPanel>,
+    /// The band, which takes the drop.
+    band: Retained<NSPanel>,
+    /// The band's view. It holds the sign, and shows it while files are
+    /// over the band.
     view: Retained<DropView>,
 }
 
 impl Panel {
-    /// A drop target for `zone` with `label` on it, hidden until shown.
+    /// The drop target for `zone`, with `label` on its sign, hidden until
+    /// shown.
     fn new(zone: &DropZone, label: &str, state: Weak<DropState>, mtm: MainThreadMarker) -> Self {
-        let frame = to_cocoa(target_rect(zone), main_display_frame().size.height);
-        let frame = ns_rect(frame);
-        let window = NSPanel::initWithContentRect_styleMask_backing_defer(
-            NSPanel::alloc(mtm),
-            frame,
-            NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
-            NSBackingStoreType::Buffered,
-            false,
-        );
-        // SAFETY: Rust owns the panel through `Retained`, so AppKit must not
-        // also release it when it closes.
-        unsafe { window.setReleasedWhenClosed(false) };
-        // Hop is never the active app while the user drags from Finder: a
-        // panel that hid on deactivating would never show.
-        window.setHidesOnDeactivate(false);
-        window.setFloatingPanel(true);
-        window.setBecomesKeyOnlyIfNeeded(true);
-        // Explicitly not ignored, so the transparent parts take the drop too.
-        window.setIgnoresMouseEvents(false);
-        window.setOpaque(false);
-        window.setBackgroundColor(Some(&NSColor::clearColor()));
-        window.setHasShadow(false);
-        // Above the Dock and floating windows (after `setFloatingPanel`,
-        // which sets a level of its own).
-        window.setLevel(NSStatusWindowLevel);
-        window.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::FullScreenAuxiliary
-                | NSWindowCollectionBehavior::Stationary
-                | NSWindowCollectionBehavior::IgnoresCycle,
-        );
-        window.setAnimationBehavior(NSWindowAnimationBehavior::None);
-        let view = DropView::new(NSRect::new(NSPoint::new(0.0, 0.0), frame.size), state, mtm);
+        let primary_height = main_display_frame().size.height;
+        let frame = |part: Part| ns_rect(to_cocoa(part.rect(zone), primary_height));
+        let sign_frame = frame(Part::Sign);
+        let sign = edge_panel(sign_frame, Part::Sign, mtm);
+        let sign_view = SignView::new(at_origin(sign_frame.size), mtm);
+        sign_view.add_label(label, mtm);
+        sign.setContentView(Some(&sign_view));
+        let band_frame = frame(Part::Band);
+        let band = edge_panel(band_frame, Part::Band, mtm);
+        let view = DropView::new(at_origin(band_frame.size), state, sign, mtm);
+        // Only the band's view takes drops, and only of files.
         // SAFETY: reading an immutable AppKit constant.
         let file_url = unsafe { NSPasteboardTypeFileURL };
         view.registerForDraggedTypes(&NSArray::from_slice(&[file_url]));
-        view.add_label(label, mtm);
-        window.setContentView(Some(&view));
-        Panel { window, view }
+        band.setContentView(Some(&view));
+        Panel { band, view }
+    }
+
+    /// Takes the band and its sign down.
+    fn hide(&self) {
+        self.view.set_highlighted(false);
+        self.band.orderOut(None);
     }
 }
 
-/// What the drop target's view keeps.
+/// A borderless, non-activating panel at `frame` (Cocoa coordinates) for
+/// `part` of a drop target, on every Space, hidden until ordered in.
+fn edge_panel(frame: NSRect, part: Part, mtm: MainThreadMarker) -> Retained<NSPanel> {
+    let window = NSPanel::initWithContentRect_styleMask_backing_defer(
+        NSPanel::alloc(mtm),
+        frame,
+        NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+        NSBackingStoreType::Buffered,
+        false,
+    );
+    // SAFETY: Rust owns the panel through `Retained`, so AppKit must not
+    // also release it when it closes.
+    unsafe { window.setReleasedWhenClosed(false) };
+    // Hop is never the active app while the user drags from Finder: a
+    // panel that hid on deactivating would never show.
+    window.setHidesOnDeactivate(false);
+    window.setFloatingPanel(true);
+    window.setBecomesKeyOnlyIfNeeded(true);
+    // Set either way, never left to AppKit: the band takes the mouse at
+    // every point, transparent or not, so all of it takes the drop; the
+    // sign takes none of it.
+    window.setIgnoresMouseEvents(!part.takes_mouse());
+    window.setOpaque(false);
+    window.setBackgroundColor(Some(&NSColor::clearColor()));
+    window.setHasShadow(false);
+    // After `setFloatingPanel`, which sets a level of its own.
+    window.setLevel(part.level());
+    window.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces
+            | NSWindowCollectionBehavior::FullScreenAuxiliary
+            | NSWindowCollectionBehavior::Stationary
+            | NSWindowCollectionBehavior::IgnoresCycle,
+    );
+    window.setAnimationBehavior(NSWindowAnimationBehavior::None);
+    window
+}
+
+/// What the band's view keeps.
 struct ViewIvars {
     /// Where drops go. Weak, because the state owns the panels and so this
     /// view.
     state: Weak<DropState>,
-    /// Files are being dragged over the view.
+    /// The sign, shown while files are over the band.
+    sign: Retained<NSPanel>,
+    /// Files are being dragged over the band.
     highlighted: Cell<bool>,
 }
 
@@ -775,8 +909,8 @@ define_class!(
     #[thread_kind = MainThreadOnly]
     #[name = "HopDropTargetView"]
     #[ivars = ViewIvars]
-    /// The drop target's view: a translucent rounded strip with the label,
-    /// which takes dropped files as a copy.
+    /// The band's view: a strip of colour along the edge, which takes
+    /// dropped files as a copy and shows the sign while files are over it.
     struct DropView;
 
     impl DropView {
@@ -849,12 +983,101 @@ define_class!(
 );
 
 impl DropView {
-    /// A view of size `frame` sending drops to `state`.
-    fn new(frame: NSRect, state: Weak<DropState>, mtm: MainThreadMarker) -> Retained<Self> {
+    /// A view of size `frame` sending drops to `state`, which shows `sign`
+    /// while files are over it.
+    fn new(
+        frame: NSRect,
+        state: Weak<DropState>,
+        sign: Retained<NSPanel>,
+        mtm: MainThreadMarker,
+    ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ViewIvars {
             state,
+            sign,
             highlighted: Cell::new(false),
         });
+        // SAFETY: NSView's designated initializer `initWithFrame:` takes the
+        // frame and returns the initialized view.
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    /// Fills the whole band with colour, stronger while files are over it.
+    /// No part of it is left clear.
+    fn draw(&self) {
+        let alpha = if self.ivars().highlighted.get() {
+            0.85
+        } else {
+            0.55
+        };
+        NSColor::controlAccentColor()
+            .colorWithAlphaComponent(alpha)
+            .setFill();
+        NSBezierPath::fillRect(self.bounds());
+    }
+
+    /// Highlights the band, or not. When that changes, it redraws the band
+    /// and shows or hides the sign. The sign shows only beside a band that
+    /// is on the screen.
+    fn set_highlighted(&self, highlighted: bool) {
+        if self.ivars().highlighted.replace(highlighted) == highlighted {
+            return;
+        }
+        self.setNeedsDisplay(true);
+        let sign = &self.ivars().sign;
+        if highlighted && self.window().is_some_and(|band| band.isVisible()) {
+            sign.orderFrontRegardless();
+        } else {
+            sign.orderOut(None);
+        }
+    }
+
+    /// Takes a drop: queues its files, calls off the hide planned at the
+    /// mouse-up and takes the target down instead, once AppKit is done with
+    /// the drop. Returns whether there were files, so a drop of nothing
+    /// usable (every file gone by now, say) slides back to where it came
+    /// from instead of looking delivered.
+    fn take_drop(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
+        self.set_highlighted(false);
+        let paths = dropped_paths(&sender.draggingPasteboard());
+        let Some(state) = self.ivars().state.upgrade() else {
+            return false;
+        };
+        let taken = state.add_drop(paths);
+        state.generation.fetch_add(1, Ordering::AcqRel);
+        state.on_main(|_, panels, _| panels.hide());
+        taken
+    }
+}
+
+define_class!(
+    // SAFETY: NSView can be subclassed to draw, the chain below is NSView's
+    // real superclass chain, and `SignView` does not implement `Drop`.
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "HopDropSignView"]
+    /// The sign's view: a faint tint over the whole sign and a rounded
+    /// strip with the label. It takes no drops: nothing registers it for
+    /// any, and its panel ignores the mouse.
+    struct SignView;
+
+    impl SignView {
+        // SAFETY: `drawRect:` takes the rectangle to draw and returns
+        // nothing, which is this signature.
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            // AppKit calls this; a panic must not unwind into it.
+            let _ = catch_unwind(AssertUnwindSafe(|| self.draw()));
+        }
+    }
+
+    // SAFETY: NSObjectProtocol has no safety requirements.
+    unsafe impl NSObjectProtocol for SignView {}
+);
+
+impl SignView {
+    /// A view of size `frame`.
+    fn new(frame: NSRect, mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
         // SAFETY: NSView's designated initializer `initWithFrame:` takes the
         // frame and returns the initialized view.
         unsafe { msg_send![super(this), initWithFrame: frame] }
@@ -875,8 +1098,7 @@ impl DropView {
         self.addSubview(&label);
     }
 
-    /// Draws a faint tint over the whole target (so no part of it is fully
-    /// transparent) and the rounded strip, stronger while files are over it.
+    /// Draws a faint tint over the whole sign and the rounded strip.
     fn draw(&self) {
         let bounds = self.bounds();
         let accent = NSColor::controlAccentColor();
@@ -890,42 +1112,13 @@ impl DropView {
             ),
         );
         let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(strip, 12.0, 12.0);
-        let alpha = if self.ivars().highlighted.get() {
-            0.85
-        } else {
-            0.55
-        };
-        accent.colorWithAlphaComponent(alpha).setFill();
+        accent.colorWithAlphaComponent(0.85).setFill();
         path.fill();
         NSColor::whiteColor()
             .colorWithAlphaComponent(0.9)
             .setStroke();
         path.setLineWidth(2.0);
         path.stroke();
-    }
-
-    /// Highlights the strip, or not, redrawing it when that changes.
-    fn set_highlighted(&self, highlighted: bool) {
-        if self.ivars().highlighted.replace(highlighted) != highlighted {
-            self.setNeedsDisplay(true);
-        }
-    }
-
-    /// Takes a drop: queues its files, calls off the hide planned at the
-    /// mouse-up and takes the target down instead, once AppKit is done with
-    /// the drop. Returns whether there were files, so a drop of nothing
-    /// usable (every file gone by now, say) slides back to where it came
-    /// from instead of looking delivered.
-    fn take_drop(&self, sender: &ProtocolObject<dyn NSDraggingInfo>) -> bool {
-        self.set_highlighted(false);
-        let paths = dropped_paths(&sender.draggingPasteboard());
-        let Some(state) = self.ivars().state.upgrade() else {
-            return false;
-        };
-        let taken = state.add_drop(paths);
-        state.generation.fetch_add(1, Ordering::AcqRel);
-        state.on_main(|_, panels, _| panels.hide());
-        taken
     }
 }
 
@@ -958,28 +1151,28 @@ fn nearest(zones: &[DropZone], p: Point) -> Option<(usize, f64)> {
         .min_by(|a, b| a.1.total_cmp(&b.1))
 }
 
-/// The target's frame for `zone`, in Quartz coordinates: the zone's stretch
-/// of the edge, [`DEPTH`] points into the display (all of a display less
-/// deep than that). It covers the display's last column or row of points,
-/// where macOS stops a cursor pushed against the edge.
-fn target_rect(zone: &DropZone) -> Rect {
+/// A frame along `zone`, in Quartz coordinates: the zone's stretch of the
+/// edge, `depth` points into the display (all of a display less deep than
+/// that). It covers the display's last column or row of points, where
+/// macOS stops a cursor pushed against the edge.
+fn edge_rect(zone: &DropZone, depth: f64) -> Rect {
     let display = &zone.display;
     let length = zone.end - zone.start;
     match zone.edge {
         Edge::Left => {
-            let depth = DEPTH.min(display.size.width);
+            let depth = depth.min(display.size.width);
             Rect::new(display.min_x(), zone.start, depth, length)
         }
         Edge::Right => {
-            let depth = DEPTH.min(display.size.width);
+            let depth = depth.min(display.size.width);
             Rect::new(display.max_x() - depth, zone.start, depth, length)
         }
         Edge::Top => {
-            let depth = DEPTH.min(display.size.height);
+            let depth = depth.min(display.size.height);
             Rect::new(zone.start, display.min_y(), length, depth)
         }
         Edge::Bottom => {
-            let depth = DEPTH.min(display.size.height);
+            let depth = depth.min(display.size.height);
             Rect::new(zone.start, display.max_y() - depth, length, depth)
         }
     }
@@ -998,9 +1191,9 @@ fn to_cocoa(rect: Rect, primary_height: f64) -> Rect {
     )
 }
 
-/// The label's frame in a target `width` by `height` points (Cocoa view
+/// The label's frame in a sign `width` by `height` points (Cocoa view
 /// coordinates), for text `text_height` points tall: centred, clear of the
-/// target's edges.
+/// sign's edges.
 fn label_frame(width: f64, height: f64, text_height: f64) -> Rect {
     let label_width = (width - 2.0 * LABEL_INSET).max(0.0);
     let label_height = text_height.min(height - 2.0 * LABEL_INSET).max(0.0);
@@ -1017,6 +1210,11 @@ fn ns_rect(rect: Rect) -> NSRect {
         NSPoint::new(rect.origin.x, rect.origin.y),
         NSSize::new(rect.size.width, rect.size.height),
     )
+}
+
+/// A view frame of `size`, at its window's origin.
+fn at_origin(size: NSSize) -> NSRect {
+    NSRect::new(NSPoint::new(0.0, 0.0), size)
 }
 
 #[cfg(test)]
@@ -1053,38 +1251,99 @@ mod tests {
     }
 
     #[test]
-    fn the_target_lies_along_the_zone_inside_the_display() {
-        assert_eq!(target_rect(&right()), Rect::new(1392.0, 59.0, 120.0, 864.0));
+    fn the_band_takes_drops_only_at_the_very_edge() {
+        let band = |zone: &DropZone| Part::Band.rect(zone);
+        assert_eq!(band(&right()), Rect::new(1504.0, 59.0, 8.0, 864.0));
         // The last column of points, where a cursor pushed against the edge
-        // stops, is inside it.
-        assert!(target_rect(&right()).contains(Point::new(1511.0, 500.0)));
-        assert_eq!(
-            target_rect(&zone(MAC, Edge::Left, 59.0, 923.0)),
-            Rect::new(0.0, 59.0, 120.0, 864.0)
-        );
-        assert_eq!(
-            target_rect(&zone(MAC, Edge::Top, 59.0, 1453.0)),
-            Rect::new(59.0, 0.0, 1394.0, 120.0)
-        );
-        let bottom = target_rect(&zone(MAC, Edge::Bottom, 59.0, 1453.0));
-        assert_eq!(bottom, Rect::new(59.0, 862.0, 1394.0, 120.0));
+        // stops, is inside it...
+        assert!(band(&right()).contains(Point::new(1511.0, 500.0)));
+        assert!(band(&right()).contains(Point::new(1511.75, 500.0)));
+        // ...and nothing further in: desktop icons, a Dock on that side and
+        // windows near the edge keep taking their own drops.
+        assert!(!band(&right()).contains(Point::new(1500.0, 500.0)));
+        assert!(!band(&right()).contains(Point::new(1452.0, 120.0)));
+        let left = band(&zone(MAC, Edge::Left, 59.0, 923.0));
+        assert_eq!(left, Rect::new(0.0, 59.0, 8.0, 864.0));
+        assert!(left.contains(Point::new(0.0, 500.0)));
+        assert!(!left.contains(Point::new(20.0, 500.0)));
+        let top = band(&zone(MAC, Edge::Top, 59.0, 1453.0));
+        assert_eq!(top, Rect::new(59.0, 0.0, 1394.0, 8.0));
+        assert!(top.contains(Point::new(700.0, 0.0)));
+        let bottom = band(&zone(MAC, Edge::Bottom, 59.0, 1453.0));
+        assert_eq!(bottom, Rect::new(59.0, 974.0, 1394.0, 8.0));
         assert!(bottom.contains(Point::new(700.0, 981.0)));
         // A display to the right of the Mac's, lower down.
         let monitor = Rect::new(1512.0, 200.0, 1920.0, 1080.0);
         assert_eq!(
-            target_rect(&zone(monitor, Edge::Right, 260.0, 1220.0)),
+            band(&zone(monitor, Edge::Right, 260.0, 1220.0)),
+            Rect::new(3424.0, 260.0, 8.0, 960.0)
+        );
+        // A display less deep than the band gets covered whole.
+        let sliver = Rect::new(0.0, 0.0, 5.0, 50.0);
+        assert_eq!(
+            band(&zone(sliver, Edge::Right, 10.0, 40.0)),
+            Rect::new(0.0, 10.0, 5.0, 30.0)
+        );
+    }
+
+    #[test]
+    fn the_sign_lies_over_the_band_and_reaches_further_in() {
+        let sign = |zone: &DropZone| Part::Sign.rect(zone);
+        assert_eq!(sign(&right()), Rect::new(1392.0, 59.0, 120.0, 864.0));
+        assert_eq!(
+            sign(&zone(MAC, Edge::Left, 59.0, 923.0)),
+            Rect::new(0.0, 59.0, 120.0, 864.0)
+        );
+        assert_eq!(
+            sign(&zone(MAC, Edge::Top, 59.0, 1453.0)),
+            Rect::new(59.0, 0.0, 1394.0, 120.0)
+        );
+        assert_eq!(
+            sign(&zone(MAC, Edge::Bottom, 59.0, 1453.0)),
+            Rect::new(59.0, 862.0, 1394.0, 120.0)
+        );
+        let monitor = Rect::new(1512.0, 200.0, 1920.0, 1080.0);
+        assert_eq!(
+            sign(&zone(monitor, Edge::Right, 260.0, 1220.0)),
             Rect::new(3312.0, 260.0, 120.0, 960.0)
         );
-        // A display less deep than the target gets covered whole.
+        // A display less deep than the sign gets covered whole.
         let strip = Rect::new(0.0, 0.0, 80.0, 50.0);
         assert_eq!(
-            target_rect(&zone(strip, Edge::Right, 10.0, 40.0)),
+            sign(&zone(strip, Edge::Right, 10.0, 40.0)),
             Rect::new(0.0, 10.0, 80.0, 30.0)
         );
         assert_eq!(
-            target_rect(&zone(strip, Edge::Bottom, 10.0, 70.0)),
+            sign(&zone(strip, Edge::Bottom, 10.0, 70.0)),
             Rect::new(10.0, 0.0, 60.0, 50.0)
         );
+        // On every edge, both start at the edge itself, along the same
+        // stretch, and the sign covers the band.
+        for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+            let zone = zone(MAC, edge, 59.0, 923.0);
+            let (band, sign) = (Part::Band.rect(&zone), Part::Sign.rect(&zone));
+            assert_eq!(band.edge_line(edge), MAC.edge_line(edge), "{edge:?}");
+            assert_eq!(sign.edge_line(edge), MAC.edge_line(edge), "{edge:?}");
+            let inside = sign.min_x() <= band.min_x()
+                && band.max_x() <= sign.max_x()
+                && sign.min_y() <= band.min_y()
+                && band.max_y() <= sign.max_y();
+            assert!(inside, "{edge:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_band_meets_the_mouse_and_it_lies_above_the_sign() {
+        // The band takes the drop. The sign, much deeper, lets clicks and
+        // drags through to whatever is under it.
+        assert!(Part::Band.takes_mouse());
+        assert!(!Part::Sign.takes_mouse());
+        assert!(Part::Band.depth() <= 12.0, "a thin band");
+        assert!(Part::Sign.depth() > Part::Band.depth());
+        // Where the sign covers the band, the band is the window a drag
+        // finds; both stay above the Dock and floating windows.
+        assert!(Part::Band.level() > Part::Sign.level());
+        assert!(Part::Sign.level() >= NSStatusWindowLevel);
     }
 
     #[test]
@@ -1092,30 +1351,47 @@ mod tests {
         let height = MAC.size.height;
         // Along the right edge, 59 points from the top and from the bottom.
         assert_eq!(
-            to_cocoa(target_rect(&right()), height),
+            to_cocoa(Part::Sign.rect(&right()), height),
             Rect::new(1392.0, 59.0, 120.0, 864.0)
         );
-        // At the top of the display: Cocoa's y counts up from the bottom.
         assert_eq!(
-            to_cocoa(target_rect(&zone(MAC, Edge::Top, 59.0, 1453.0)), height),
+            to_cocoa(Part::Band.rect(&right()), height),
+            Rect::new(1504.0, 59.0, 8.0, 864.0)
+        );
+        // At the top of the display: Cocoa's y counts up from the bottom.
+        let top = zone(MAC, Edge::Top, 59.0, 1453.0);
+        assert_eq!(
+            to_cocoa(Part::Sign.rect(&top), height),
             Rect::new(59.0, 862.0, 1394.0, 120.0)
         );
         assert_eq!(
-            to_cocoa(target_rect(&zone(MAC, Edge::Bottom, 59.0, 1453.0)), height),
+            to_cocoa(Part::Band.rect(&top), height),
+            Rect::new(59.0, 974.0, 1394.0, 8.0)
+        );
+        let bottom = zone(MAC, Edge::Bottom, 59.0, 1453.0);
+        assert_eq!(
+            to_cocoa(Part::Sign.rect(&bottom), height),
             Rect::new(59.0, 0.0, 1394.0, 120.0)
+        );
+        assert_eq!(
+            to_cocoa(Part::Band.rect(&bottom), height),
+            Rect::new(59.0, 0.0, 1394.0, 8.0)
         );
         // A display above the Mac's has negative Quartz y, and Cocoa y above
         // the Mac's height.
         let above = Rect::new(0.0, -1080.0, 1920.0, 1080.0);
         assert_eq!(
-            to_cocoa(target_rect(&zone(above, Edge::Top, 60.0, 1860.0)), height),
+            to_cocoa(
+                Part::Sign.rect(&zone(above, Edge::Top, 60.0, 1860.0)),
+                height
+            ),
             Rect::new(60.0, 1942.0, 1800.0, 120.0)
         );
         // A display to the right and lower down reaches below Cocoa's zero.
         let monitor = Rect::new(1512.0, 200.0, 1920.0, 1080.0);
         assert_eq!(
             to_cocoa(
-                target_rect(&zone(monitor, Edge::Right, 260.0, 1220.0)),
+                Part::Sign.rect(&zone(monitor, Edge::Right, 260.0, 1220.0)),
                 height
             ),
             Rect::new(3312.0, -238.0, 120.0, 960.0)
@@ -1317,6 +1593,54 @@ mod tests {
         tap.step(Left::Down, at(800.0, 500.0), t, 0);
         assert_eq!(tap.step(Left::Dragged, at(900.0, 500.0), t, 1), NOTHING);
         assert_eq!(tap.step(Left::Up, at(900.0, 500.0), t, 1), NOTHING);
+    }
+
+    #[test]
+    fn a_press_takes_down_a_target_whose_button_up_was_missed() {
+        let mut tap = watching(vec![right()]);
+        let t = Instant::now();
+        tap.step(Left::Down, at(800.0, 500.0), t, 0);
+        assert_eq!(tap.step(Left::Dragged, at(1500.0, 500.0), t, 1), show(0));
+        // The button-up never reached the tap (macOS had switched it off
+        // for a moment). The next press takes the target down at once...
+        assert_eq!(
+            tap.step(Left::Down, at(1500.0, 500.0), t, 1),
+            Requests {
+                snapshot: Some(2),
+                hide: true,
+                ..Requests::default()
+            }
+        );
+        // ...and a drag of files from it shows the target again.
+        assert_eq!(tap.step(Left::Dragged, at(1500.0, 500.0), t, 2), show(0));
+        assert_eq!(tap.step(Left::Up, at(1500.0, 500.0), t, 2), HIDE_LATER);
+        // A press with no target up takes nothing down.
+        assert!(!tap.step(Left::Down, at(800.0, 500.0), t, 2).hide);
+    }
+
+    #[test]
+    fn the_watchdog_takes_down_a_target_once_the_button_is_up() {
+        let mut tap = watching(vec![right()]);
+        let t = Instant::now();
+        let never = || -> bool { panic!("asked about the button with no target up") };
+        assert_eq!(tap.tick(never), NOTHING);
+        tap.step(Left::Down, at(800.0, 500.0), t, 0);
+        assert_eq!(tap.tick(never), NOTHING, "a press alone");
+        assert_eq!(tap.step(Left::Dragged, at(1500.0, 500.0), t, 1), show(0));
+        // The button is held: the drag goes on, however long it pauses.
+        assert_eq!(tap.tick(|| true), NOTHING);
+        assert_eq!(tap.tick(|| true), NOTHING);
+        // It is up, and the tap missed the button-up: the target goes as
+        // at a button-up, a moment later, in case the drop is on its way.
+        assert_eq!(tap.tick(|| false), HIDE_LATER);
+        assert_eq!(tap.tick(never), NOTHING, "once");
+        // The button-up arriving late asks for nothing more, and neither
+        // does a stray drag event after it.
+        assert_eq!(tap.step(Left::Up, at(1500.0, 500.0), t, 1), NOTHING);
+        assert_eq!(tap.step(Left::Dragged, at(1500.0, 500.0), t, 1), NOTHING);
+        // The next drag of files shows the target again.
+        tap.step(Left::Down, at(800.0, 500.0), t, 1);
+        assert_eq!(tap.step(Left::Dragged, at(1500.0, 500.0), t, 2), show(0));
     }
 
     #[test]
@@ -1673,5 +1997,13 @@ mod tests {
         ] {
             assert!(class.instance_method(selector).is_some(), "{selector:?}");
         }
+    }
+
+    #[test]
+    fn the_sign_view_class_draws() {
+        // As above: no view, no window.
+        let class = SignView::class();
+        assert_eq!(class.name().to_str(), Ok("HopDropSignView"));
+        assert!(class.instance_method(sel!(drawRect:)).is_some());
     }
 }

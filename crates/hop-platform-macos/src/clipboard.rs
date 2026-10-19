@@ -181,8 +181,8 @@ fn change_count(pasteboard: &NSPasteboard) -> u64 {
 }
 
 /// The text of the pasteboard's first item, with LF line endings. `None`
-/// when that item has no text, is marked private, or has more than
-/// `max_bytes` of UTF-8 text (it is never cut short).
+/// when that item has no text or only empty text, is marked private, or
+/// has more than `max_bytes` of UTF-8 text (it is never cut short).
 fn read_text(pasteboard: &NSPasteboard, max_bytes: usize) -> Result<Option<String>> {
     check_access(pasteboard)?;
     let Some(item) = pasteboard
@@ -200,6 +200,13 @@ fn read_text(pasteboard: &NSPasteboard, max_bytes: usize) -> Result<Option<Strin
     let Some(text) = item.stringForType(string_type) else {
         return Ok(None);
     };
+    // Empty text is no text, as on Windows: sending it would only empty the
+    // other computer's clipboard. `pbcopy < /dev/null` leaves an empty
+    // string on the pasteboard, and so does text with a broken character
+    // that macOS cannot keep. LF endings never make other text empty.
+    if text.length() == 0 {
+        return Ok(None);
+    }
     // Every UTF-16 unit is at least one UTF-8 byte, and turning CRLF into
     // LF at most halves the count: longer than this, it can never fit, and
     // a huge text is not copied out just to find that out.
@@ -421,6 +428,32 @@ mod tests {
         assert_eq!(clipboard.read_text(1024).expect("read"), None, "empty");
         private.put(None, &["public.png"]);
         assert_eq!(clipboard.read_text(1024).expect("read"), None, "no text");
+        // Empty text, as `pbcopy < /dev/null` leaves it, is no text either:
+        // sending it would empty the other computer's clipboard.
+        private.put(Some(""), &[]);
+        let count = clipboard.change_count().expect("count");
+        assert_eq!(clipboard.read_text(1024).expect("read"), None, "empty text");
+        // The change count still moved, so the agent records the copy and
+        // does not ask again until the next one.
+        private.put(Some(" "), &[]);
+        assert!(clipboard.change_count().expect("count") > count);
+        assert_eq!(
+            clipboard.read_text(1024).expect("read").as_deref(),
+            Some(" "),
+            "a space is text"
+        );
+    }
+
+    #[test]
+    fn written_empty_text_reads_back_as_none() {
+        // Writing goes through as asked (the other computer never sends
+        // empty text, but nothing here relies on that); reading it back
+        // finds no text.
+        let private = Private::new();
+        let mut clipboard = private.clipboard(PATIENT);
+        let count = clipboard.write_text("").expect("write");
+        assert_eq!(clipboard.change_count().expect("count"), count);
+        assert_eq!(clipboard.read_text(1024).expect("read"), None);
     }
 
     /// A clipboard on `private` whose helper hangs in its first call, as it

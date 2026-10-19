@@ -93,6 +93,19 @@ cp "$ICON" "$APP/Contents/Resources/Hop.icns"
 # - NSDownloadsFolderUsageDescription: the text of macOS's prompt the first
 #   time Hop saves files received from the other computer, which go in
 #   Downloads > Hop Received.
+# - LSFileQuarantineEnabled: macOS marks every file Hop.app creates as
+#   downloaded (the com.apple.quarantine attribute, naming Hop), as a
+#   browser, Mail or AirDrop marks what it saves. So a file received from
+#   the other computer gets Gatekeeper's usual check the first time it is
+#   opened: an app or installer downloaded on the PC is not trusted here
+#   just because Hop copied it. Hop's own files (its settings, its
+#   identity and its logs) are marked too, which changes nothing: Hop reads
+#   and writes them as before, and text files open as before.
+# - NSDesktopFolderUsageDescription and NSDocumentsFolderUsageDescription:
+#   the text of macOS's prompt, should it ever ask, when Hop reads files
+#   dropped on the edge of the screen from the Desktop or Documents folder
+#   to send them. A drop normally lets Hop read the dropped files without
+#   asking.
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -133,6 +146,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	</array>
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>Hop saves files sent from your other computer in Downloads > Hop Received.</string>
+	<key>LSFileQuarantineEnabled</key>
+	<true/>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Hop reads files you drop on the edge of the screen to send them to your other computer.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Hop reads files you drop on the edge of the screen to send them to your other computer.</string>
 </dict>
 </plist>
 PLIST

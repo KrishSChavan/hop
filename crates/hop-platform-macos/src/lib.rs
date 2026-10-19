@@ -35,10 +35,13 @@
 //!   Items a password manager marks as concealed, transient or
 //!   auto-generated are never read.
 //! - **Drop zone:** while files are dragged near an edge that leads to the
-//!   other computer, a borderless, non-activating panel along that edge
-//!   takes the drop, always as a copy. The event tap notices the drag
-//!   without ever waiting: a serial helper queue reads the drag pasteboard,
-//!   and the main dispatch queue shows and hides the panel.
+//!   other computer, a thin band of borderless, non-activating panel at the
+//!   very edge takes the drop, always as a copy, so icons, the Dock and
+//!   windows near the edge keep their own drops. While files are over the
+//!   band, a sign beside it, which the mouse passes through, says where
+//!   they go. The event tap notices the drag without ever waiting: a serial
+//!   helper queue reads the drag pasteboard, and the main dispatch queue
+//!   shows and hides the panels.
 //! - **Suppression needs capture:** `set_mode(Suppress)` fails unless
 //!   capture is running, since only the running tap can swallow input and
 //!   end the lease. `stop` (and dropping the capture) also gives a parked

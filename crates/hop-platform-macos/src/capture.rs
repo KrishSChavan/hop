@@ -9,7 +9,9 @@
 //! The tap also does two small jobs of its own, neither of which ever
 //! waits: it shows a concealed cursor again at the first physical mouse
 //! event (see `cursor`), and it watches the left button for files dragged
-//! toward a drop zone (see `catcher`).
+//! toward a drop zone (see `catcher`). The watchdog backs both up: it
+//! makes a reveal an event could not, and takes down a drop target whose
+//! button-up the tap missed.
 //!
 //! Both callbacks are `extern "C-unwind"` functions called by macOS. Each
 //! wraps its body in `catch_unwind`, so a panic never unwinds into macOS,
@@ -478,6 +480,11 @@ impl TapContext {
             && !CGEvent::tap_is_enabled(port)
         {
             CGEvent::tap_enable(port, true);
+        }
+        // A drop target whose button-up the tap missed (while it was off,
+        // say) comes down once the button is found up.
+        if let Ok(mut drops) = self.drops.try_borrow_mut() {
+            drops.on_tick(self.shared.drops());
         }
     }
 }
