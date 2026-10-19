@@ -207,8 +207,9 @@ fn on_main<R: Send + 'static>(f: impl FnOnce(MainThreadMarker) -> R + Send + 'st
 }
 
 /// A value that may only be touched on the main thread, but can be held,
-/// shared and dropped on any thread.
-struct MainOnly<T: 'static>(Option<T>);
+/// shared and dropped on any thread. The test window and the drop target
+/// (`catcher`) keep their AppKit objects in one.
+pub(crate) struct MainOnly<T: 'static>(Option<T>);
 
 // SAFETY: the value is reachable only through `get`, which takes a
 // `MainThreadMarker`, so it is only ever used on the main thread; `Drop`
@@ -218,11 +219,13 @@ unsafe impl<T: 'static> Send for MainOnly<T> {}
 unsafe impl<T: 'static> Sync for MainOnly<T> {}
 
 impl<T: 'static> MainOnly<T> {
-    fn new(value: T, _mtm: MainThreadMarker) -> Self {
+    /// Wraps `value`, made on the main thread.
+    pub(crate) fn new(value: T, _mtm: MainThreadMarker) -> Self {
         Self(Some(value))
     }
 
-    fn get(&self, _mtm: MainThreadMarker) -> Option<&T> {
+    /// The value, for the main thread.
+    pub(crate) fn get(&self, _mtm: MainThreadMarker) -> Option<&T> {
         self.0.as_ref()
     }
 }

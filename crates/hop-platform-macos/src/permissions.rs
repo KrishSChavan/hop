@@ -1,8 +1,10 @@
-//! Permissions, Secure Event Input and the clipboard placeholder.
+//! Permissions and Secure Event Input.
+//!
+//! The clipboard needs no permission of its own to be written. Reading it
+//! can: from macOS 15.4 on the user may deny an app "Paste from Other
+//! Apps", which `clipboard` reports when it reads.
 
-use hop_platform::{
-    Permission, PermissionState, Permissions, PlatformError, Result, SystemState, TextClipboard,
-};
+use hop_platform::{Permission, PermissionState, Permissions, PlatformError, Result, SystemState};
 use objc2::rc::autoreleasepool;
 use objc2_application_services::{AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFString, kCFBooleanFalse, kCFBooleanTrue};
@@ -72,23 +74,6 @@ impl SystemState for MacSystem {
     }
 }
 
-/// The clipboard arrives in milestone M4.
-pub(crate) struct MacClipboard;
-
-impl TextClipboard for MacClipboard {
-    fn change_count(&self) -> Result<u64> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn read_text(&self, _max_bytes: usize) -> Result<Option<String>> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn write_text(&mut self, _text: &str) -> Result<u64> {
-        Err(PlatformError::Unsupported)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,23 +86,6 @@ mod tests {
         );
         assert!(matches!(
             MacPermissions.request(Permission::LocalNetwork),
-            Err(PlatformError::Unsupported)
-        ));
-    }
-
-    #[test]
-    fn the_clipboard_is_not_there_yet() {
-        let mut clipboard = MacClipboard;
-        assert!(matches!(
-            clipboard.change_count(),
-            Err(PlatformError::Unsupported)
-        ));
-        assert!(matches!(
-            clipboard.read_text(1_048_576),
-            Err(PlatformError::Unsupported)
-        ));
-        assert!(matches!(
-            clipboard.write_text("x"),
             Err(PlatformError::Unsupported)
         ));
     }

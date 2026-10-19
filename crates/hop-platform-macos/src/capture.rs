@@ -6,6 +6,11 @@
 //! also runs the lease watchdog: a timer that ends suppression and gives
 //! the cursor back when the runtime stops renewing the lease.
 //!
+//! The tap also does two small jobs of its own, neither of which ever
+//! waits: it shows a concealed cursor again at the first physical mouse
+//! event (see `cursor`), and it watches the left button for files dragged
+//! toward a drop zone (see `catcher`).
+//!
 //! Both callbacks are `extern "C-unwind"` functions called by macOS. Each
 //! wraps its body in `catch_unwind`, so a panic never unwinds into macOS,
 //! and on a panic the event passes through untouched (fail open).
@@ -33,6 +38,7 @@ use objc2_core_graphics::{
     CGEventTapProxy, CGEventType,
 };
 
+use crate::catcher::TapDrops;
 use crate::convert::{Converter, tap_mask};
 use crate::permissions::accessibility_trusted;
 use crate::shared::Shared;
@@ -188,6 +194,12 @@ struct TapContext {
     /// A lapsed lease still owes the user their cursor: the watchdog found
     /// the cursor control busy on another thread and will try again.
     unpark_owed: Cell<bool>,
+    /// A physical mouse event found the cursor concealed and the cursor
+    /// control busy on another thread: the next event or the watchdog's
+    /// next tick shows it instead.
+    reveal_owed: Cell<bool>,
+    /// The tap's part in catching dropped files.
+    drops: RefCell<TapDrops>,
 }
 
 struct TapState {
@@ -215,6 +227,7 @@ fn run_tap(
     // stopped, say) belongs to no event this tap will see.
     let _ = shared.take_warp();
     let start_cursor = cursor::current_position().ok();
+    let drops = TapDrops::new(shared.drops());
     // The callbacks reach the context through this raw pointer. It is freed
     // below, only after the tap and the timer are gone.
     let raw = Box::into_raw(Box::new(TapContext {
@@ -226,6 +239,8 @@ fn run_tap(
             sink,
         }),
         unpark_owed: Cell::new(false),
+        reveal_owed: Cell::new(false),
+        drops: RefCell::new(drops),
     }));
     // SAFETY: `raw` came from `Box::into_raw` just above and is freed only at
     // the end of this function. Everything, here and in the callbacks, uses
@@ -398,6 +413,15 @@ impl TapContext {
         }
         let physical = CGEvent::integer_value_field(Some(event), CGEventField::EventSourceUserData)
             != INJECTED_TAG;
+        // The user's own mouse shows a concealed cursor again, without ever
+        // waiting for it: if another thread holds the cursor control right
+        // now, the reveal is owed, and the next event or the watchdog's next
+        // tick makes it.
+        let wanted = reveals(ty, physical) && self.shared.concealed();
+        let owed = settle_reveal(self.reveal_owed.get(), wanted, || {
+            cursor::try_reveal(&self.shared)
+        });
+        self.reveal_owed.set(owed);
         // Only a sink that re-enters the run loop could find the state
         // borrowed; its event is then passed on unreported.
         if let Ok(mut state) = self.state.try_borrow_mut() {
@@ -414,12 +438,18 @@ impl TapContext {
                 });
             }
         }
+        let now = Instant::now();
         // Hop's own injected events always get through.
-        if physical && self.shared.suppressing(Instant::now()) {
-            Verdict::Swallow
-        } else {
-            Verdict::Pass
+        if physical && self.shared.suppressing(now) {
+            return Verdict::Swallow;
         }
+        // Files dragged toward a drop zone. Only events that reach the apps
+        // can be part of a drag, Hop's own included: the other computer may
+        // be dragging a file here.
+        if let Ok(mut drops) = self.drops.try_borrow_mut() {
+            drops.on_event(self.shared.drops(), ty, event, now);
+        }
+        Verdict::Pass
     }
 
     fn on_timer(&self) {
@@ -436,6 +466,12 @@ impl TapContext {
             cursor::try_unpark(&self.shared)
         });
         self.unpark_owed.set(owed);
+        // A reveal a mouse event could not make: try again, still without
+        // waiting.
+        let owed = settle_reveal(self.reveal_owed.get(), false, || {
+            cursor::try_reveal(&self.shared)
+        });
+        self.reveal_owed.set(owed);
         // macOS normally announces when it switches a tap off, but a tap
         // found off anyway is switched back on here.
         if let Some(port) = self.port.get()
@@ -444,6 +480,37 @@ impl TapContext {
             CGEvent::tap_enable(port, true);
         }
     }
+}
+
+/// Whether an event of type `ty` shows a concealed cursor again: the user's
+/// own mouse does (motion, drags, buttons and the wheel), keys do not, and
+/// neither does anything Hop injected, which can still reach the tap after
+/// the session that injected it ended.
+fn reveals(ty: CGEventType, physical: bool) -> bool {
+    physical
+        && matches!(
+            ty,
+            CGEventType::MouseMoved
+                | CGEventType::LeftMouseDragged
+                | CGEventType::RightMouseDragged
+                | CGEventType::OtherMouseDragged
+                | CGEventType::LeftMouseDown
+                | CGEventType::LeftMouseUp
+                | CGEventType::RightMouseDown
+                | CGEventType::RightMouseUp
+                | CGEventType::OtherMouseDown
+                | CGEventType::OtherMouseUp
+                | CGEventType::ScrollWheel
+        )
+}
+
+/// Shows a concealed cursor again if that is `wanted` now (a physical mouse
+/// event found it concealed) or still `owed` from earlier; returns whether
+/// the reveal is still owed afterwards. `try_reveal` returns `false` while
+/// another thread holds the cursor control, and is not called at all when
+/// there is nothing to do.
+fn settle_reveal(owed: bool, wanted: bool, try_reveal: impl FnOnce() -> bool) -> bool {
+    (owed || wanted) && !try_reveal()
 }
 
 /// One watchdog tick's work on the cursor; returns whether the cursor is
@@ -520,6 +587,71 @@ mod tests {
         // own cursor): the watchdog must not un-park that one.
         shared.renew_lease(lapsed);
         assert_eq!(tick(&shared, true, lapsed, true), (false, false));
+    }
+
+    /// Runs [`settle_reveal`] with a pretend cursor control that is `free`
+    /// or busy; returns whether the reveal is still owed and whether it was
+    /// tried.
+    fn reveal(owed: bool, wanted: bool, free: bool) -> (bool, bool) {
+        let mut tried = false;
+        let owed = settle_reveal(owed, wanted, || {
+            tried = true;
+            free
+        });
+        (owed, tried)
+    }
+
+    #[test]
+    fn a_reveal_the_cursor_control_was_too_busy_for_is_made_later() {
+        // Nothing wanted or owed: the cursor control is left alone.
+        assert_eq!(reveal(false, false, true), (false, false));
+        // A mouse event finds the cursor concealed and the control free.
+        assert_eq!(reveal(false, true, true), (false, true));
+        // Busy: never waited for, but owed.
+        assert_eq!(reveal(false, true, false), (true, true));
+        // The next watchdog tick finds it busy again, then free.
+        assert_eq!(reveal(true, false, false), (true, true));
+        assert_eq!(reveal(true, false, true), (false, true));
+        // A later mouse event pays a debt as well as a tick does.
+        assert_eq!(reveal(true, true, true), (false, true));
+    }
+
+    #[test]
+    fn only_the_user_s_own_mouse_shows_a_concealed_cursor() {
+        use CGEventType as T;
+        let mouse = [
+            T::MouseMoved,
+            T::LeftMouseDragged,
+            T::RightMouseDragged,
+            T::OtherMouseDragged,
+            T::LeftMouseDown,
+            T::LeftMouseUp,
+            T::RightMouseDown,
+            T::RightMouseUp,
+            T::OtherMouseDown,
+            T::OtherMouseUp,
+            T::ScrollWheel,
+        ];
+        for ty in mouse {
+            assert!(reveals(ty, true), "{ty:?}");
+            assert!(!reveals(ty, false), "Hop's own {ty:?}");
+        }
+        let others = [
+            T::KeyDown,
+            T::KeyUp,
+            T::FlagsChanged,
+            T::TapDisabledByTimeout,
+            T::TapDisabledByUserInput,
+            T::Null,
+        ];
+        for ty in others {
+            assert!(!reveals(ty, true), "{ty:?}");
+            assert!(!reveals(ty, false), "{ty:?}");
+        }
+        // Every event the tap can see is one or the other.
+        let mask = tap_mask();
+        let seen = mouse.iter().chain(&others[..3]);
+        assert_eq!(seen.fold(0, |m, ty| m | (1 << ty.0)), mask);
     }
 
     #[test]

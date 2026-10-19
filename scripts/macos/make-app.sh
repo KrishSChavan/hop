@@ -90,6 +90,9 @@ cp "$ICON" "$APP/Contents/Resources/Hop.icns"
 #   group apps by.
 # - NSLocalNetworkUsageDescription and NSBonjourServices: the text of
 #   macOS's Local Network prompt, and the mDNS services Hop looks for.
+# - NSDownloadsFolderUsageDescription: the text of macOS's prompt the first
+#   time Hop saves files received from the other computer, which go in
+#   Downloads > Hop Received.
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -128,6 +131,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 		<string>_hop._udp</string>
 		<string>_hop._tcp</string>
 	</array>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Hop saves files sent from your other computer in Downloads > Hop Received.</string>
 </dict>
 </plist>
 PLIST

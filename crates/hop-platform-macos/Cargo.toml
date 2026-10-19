@@ -1,6 +1,6 @@
 [package]
 name = "hop-platform-macos"
-description = "Hop's macOS backend: Quartz event taps and event posting, cursor control, displays, permissions, an AppKit test window"
+description = "Hop's macOS backend: Quartz event taps and event posting, cursor control, displays, the clipboard, the drop zone, permissions, an AppKit test window"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,19 +22,28 @@ objc2 = { workspace = true, features = ["std"] }
 objc2-app-kit = { workspace = true, features = [
     "std",
     "NSApplication",
+    "NSBezierPath",
     "NSButton",
+    "NSColor",
     "NSControl",
+    "NSDragging",
     "NSEvent",
+    "NSFont",
     "NSGraphics",
     "NSGraphicsContext",
     "NSMenu",
     "NSMenuItem",
+    "NSPanel",
+    "NSPasteboard",
+    "NSPasteboardItem",
     "NSResponder",
     "NSRunningApplication",
     "NSText",
     "NSTextField",
     "NSView",
     "NSWindow",
+    # The methods that take or return a CGFloat (colours, fonts, sizes).
+    "objc2-core-foundation",
 ] }
 objc2-application-services = { workspace = true, features = ["std", "HIServices", "AXUIElement"] }
 objc2-core-foundation = { workspace = true, features = [
@@ -58,4 +67,16 @@ objc2-core-graphics = { workspace = true, features = [
     "CGEventTypes",
     "CGRemoteOperation",
 ] }
-objc2-foundation = { workspace = true, features = ["std", "NSDate", "NSGeometry", "NSObject", "NSProcessInfo", "NSString"] }
+objc2-foundation = { workspace = true, features = [
+    "std",
+    "NSArray",
+    "NSDate",
+    "NSDictionary",
+    "NSEnumerator",
+    "NSGeometry",
+    "NSObject",
+    "NSProcessInfo",
+    "NSString",
+    "NSURL",
+    "NSValue",
+] }

@@ -1,10 +1,15 @@
-//! State shared by capture, the cursor and the lease watchdog.
+//! State shared by capture, the cursor, the drop catcher and the lease
+//! watchdog.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Instant;
 
 use hop_platform::{CaptureMode, SuppressLease};
 use hop_types::Point;
+
+use crate::catcher::DropState;
+use crate::cursor::CursorCalls;
 
 /// Locks `mutex`, carrying on if another thread panicked while holding it:
 /// every value guarded here stays consistent between statements, and
@@ -14,16 +19,26 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// One per [`hop_platform::Platform`]: the capture thread, the cursor
-/// control and the lease watchdog all see the same lease and cursor state.
+/// control, the drop catcher and the lease watchdog all see the same lease,
+/// cursor and drop state.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     lease: Mutex<SuppressLease>,
     cursor: Mutex<CursorState>,
+    /// [`CursorState::concealed`], for the tap, which must never wait for
+    /// the cursor lock. It is written only while that lock is held
+    /// ([`Shared::set_concealed`]) and read without it.
+    concealed: AtomicBool,
     /// The warp capture has not seen yet. Warps produce no event, so capture
     /// would otherwise report the pre-warp position as the "previous
     /// position" of the next event, and macOS adds a warp's distance to the
     /// delta of the next mouse event (see `convert`).
     warp: Mutex<Option<Warp>>,
+    /// The calls that change the cursor: the WindowServer's own, except in
+    /// tests.
+    calls: CursorCalls,
+    /// The drop zones, and the files dropped on them.
+    drops: Arc<DropState>,
 }
 
 /// A warp of the cursor from `from` to `to`.
@@ -45,13 +60,54 @@ pub(crate) struct CursorState {
     /// (`CGAssociateMouseAndMouseCursorPosition(false)`).
     pub(crate) detached: bool,
     /// Hop holds one `CGDisplayHideCursor` that no `CGDisplayShowCursor` has
-    /// balanced yet. macOS counts hides, so they must stay paired.
+    /// balanced yet. macOS counts hides, so they must stay paired: parking
+    /// and concealing share this one flag, and so this one hide.
     pub(crate) hidden: bool,
+    /// The cursor is hidden but not parked: a peer's session left it at the
+    /// edge ([`hop_platform::CursorControl::conceal`]), or the show that
+    /// should have ended a park failed. The next physical mouse event shows
+    /// it again. Set exactly when `hidden` is and the cursor is neither
+    /// parked nor detached: parking clears it, and so does every show that
+    /// works.
+    pub(crate) concealed: bool,
 }
 
 impl Shared {
+    /// The state for a new platform, changing the real cursor.
     pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_calls(CursorCalls::REAL)
+    }
+
+    /// The state for a new platform whose cursor changes go through
+    /// `calls`. Tests pass calls that only record what would have happened.
+    pub(crate) fn with_calls(calls: CursorCalls) -> Arc<Self> {
+        Arc::new(Self {
+            calls,
+            ..Self::default()
+        })
+    }
+
+    /// The calls that change the cursor.
+    pub(crate) fn calls(&self) -> &CursorCalls {
+        &self.calls
+    }
+
+    /// The drop zones, and the files dropped on them.
+    pub(crate) fn drops(&self) -> &Arc<DropState> {
+        &self.drops
+    }
+
+    /// Whether the cursor is concealed, read without the cursor lock: the
+    /// answer can be a moment old, so act on it only through the lock.
+    pub(crate) fn concealed(&self) -> bool {
+        self.concealed.load(Ordering::Acquire)
+    }
+
+    /// Sets [`CursorState::concealed`] and the copy the tap reads together.
+    /// `state` is this state's cursor, locked by the caller.
+    pub(crate) fn set_concealed(&self, state: &mut CursorState, concealed: bool) {
+        state.concealed = concealed;
+        self.concealed.store(concealed, Ordering::Release);
     }
 
     /// Starts or extends suppression from `now`.
@@ -194,6 +250,17 @@ mod tests {
                 to: Point::new(1511.0, 420.0),
             })
         );
+    }
+
+    #[test]
+    fn the_tap_s_copy_of_concealed_follows_the_cursor_state() {
+        let shared = Shared::new();
+        assert!(!shared.concealed());
+        let mut state = shared.cursor();
+        shared.set_concealed(&mut state, true);
+        assert!(state.concealed && shared.concealed());
+        shared.set_concealed(&mut state, false);
+        assert!(!state.concealed && !shared.concealed());
     }
 
     #[test]

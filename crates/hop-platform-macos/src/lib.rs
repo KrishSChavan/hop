@@ -18,7 +18,9 @@
 //!   from the mouse and hides it (no warp: macOS would add the warp to the
 //!   next mouse delta). Hiding from the background
 //!   needs a private WindowServer switch; without it the cursor is still
-//!   parked, just not hidden.
+//!   parked, just not hidden. Concealing (the cursor a peer's session left
+//!   at the edge) only hides it, and the tap shows it again at the first
+//!   physical mouse event.
 //! - **Displays:** Quartz display bounds, which are already Hop's
 //!   coordinates on a Mac (points, origin at the main display's top-left).
 //! - **Permissions:** Accessibility, through `AXIsProcessTrustedWithOptions`.
@@ -26,7 +28,17 @@
 //!   anything: posting first can leave Hop with a grant for posting only.
 //!   Until it is granted, `InputCapture::start` and every injection return
 //!   `PermissionDenied(Accessibility)` without prompting, and nothing is
-//!   posted. Local Network arrives in milestone M2, the clipboard in M4.
+//!   posted. Local Network arrives in milestone M2.
+//! - **Clipboard:** `NSPasteboard.generalPasteboard`, used on a helper
+//!   thread of its own, so every call returns within
+//!   `hop_platform::CLIPBOARD_TIMEOUT` whatever the app that copied does.
+//!   Items a password manager marks as concealed, transient or
+//!   auto-generated are never read.
+//! - **Drop zone:** while files are dragged near an edge that leads to the
+//!   other computer, a borderless, non-activating panel along that edge
+//!   takes the drop, always as a copy. The event tap notices the drag
+//!   without ever waiting: a serial helper queue reads the drag pasteboard,
+//!   and the main dispatch queue shows and hides the panel.
 //! - **Suppression needs capture:** `set_mode(Suppress)` fails unless
 //!   capture is running, since only the running tap can swallow input and
 //!   end the lease. `stop` (and dropping the capture) also gives a parked
@@ -36,18 +48,23 @@
 //!
 //! [`native`] and everything in the [`hop_platform::Platform`] it returns
 //! work from any thread. The test window needs AppKit's event loop running
-//! on the main thread: wrap the work in [`run_with_ui`].
+//! on the main thread: wrap the work in [`run_with_ui`]. So does the drop
+//! zone's panel, which is never waited for: without the event loop it
+//! simply never shows.
 //!
 //! # Privacy
 //!
 //! Nothing here logs. Captured keys go only to the sink given to
-//! `InputCapture::start`.
+//! `InputCapture::start`, and clipboard text only to the caller that asked
+//! for it.
 
 #![cfg(target_os = "macos")]
 #![warn(missing_docs)]
 
 mod activity;
 mod capture;
+mod catcher;
+mod clipboard;
 mod convert;
 mod cursor;
 mod displays;
@@ -55,13 +72,17 @@ mod ffi;
 mod flags;
 mod inject;
 mod permissions;
+#[cfg(test)]
+mod private_pasteboard;
 mod shared;
 mod ui;
 
 pub use activity::AppNapExemption;
 pub use ui::{open_test_window, run_with_ui};
 
-use hop_platform::{NoDrops, Platform, Result};
+use std::sync::Arc;
+
+use hop_platform::{Platform, Result};
 use objc2::rc::autoreleasepool;
 use objc2_foundation::{NSProcessInfo, NSString};
 
@@ -84,10 +105,10 @@ pub fn native() -> Result<Platform> {
     Ok(Platform {
         capture: Box::new(capture::MacCapture::new(shared.clone())),
         injector: Box::new(inject::MacInjector::new()?),
-        cursor: Box::new(cursor::MacCursor::new(shared)),
+        cursor: Box::new(cursor::MacCursor::new(Arc::clone(&shared))),
         displays: Box::new(displays::MacDisplays),
-        clipboard: Box::new(permissions::MacClipboard),
-        drops: Box::new(NoDrops),
+        clipboard: Box::new(clipboard::MacClipboard::new()),
+        drops: Box::new(catcher::MacDrops::new(Arc::clone(shared.drops()))),
         permissions: Box::new(permissions::MacPermissions),
         system: Box::new(permissions::MacSystem),
     })
@@ -102,15 +123,20 @@ mod tests {
     /// Builds the whole platform and drops it again. Creating it only makes
     /// a private event source in memory; dropping it releases nothing,
     /// because nothing was pressed, and un-parks nothing, because nothing
-    /// was parked. No event is posted and no tap is created.
+    /// was parked. No event is posted, no tap is created, the clipboard is
+    /// never opened and no drop target is made.
     #[test]
     fn the_platform_builds_and_drops_without_touching_input() {
-        let platform = native().expect("platform");
+        let mut platform = native().expect("platform");
         assert_eq!(platform.capture.mode(), CaptureMode::Passive);
         assert_eq!(
             platform.permissions.state(Permission::LocalNetwork),
             PermissionState::NotDetermined
         );
+        // No zones yet, so clearing them changes nothing, and nothing has
+        // been dropped.
+        assert!(platform.drops.set_zones(Vec::new(), "").is_ok());
+        assert!(platform.drops.take_drops().is_empty());
         drop(platform);
     }
 }
