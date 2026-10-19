@@ -12,7 +12,7 @@
 | 6 | File drag-and-drop in v1 | Files land in a "Received" folder; exact drop-at-location later |
 | 7 | Typical files | Images, text files, PDFs |
 | 8 | Clipboard in v1 | Text only |
-| 9 | Shortcuts | Swap Cmd ↔ Ctrl only |
+| 9 | Shortcuts | Keys stay as labelled: with the Mac's keyboard on the PC, Ctrl+V pastes (changed 2026-10-18; it was "Swap Cmd ↔ Ctrl only"). The swap stays available as a setting |
 | 10 | Future ideas | More machines, use across the internet, a phone companion, a Chrome extension, and an AI assistant that understands and can control all the devices |
 | 11 | Network | Home Wi-Fi on both; no Ethernet |
 | 12 | Tooling | Claude Code will run on the PC; use a GitHub repository with CI |
@@ -41,7 +41,7 @@
 
 **ADR-4: the wire format.** Kind-tagged frames carry MessagePack bodies with named fields. Capabilities are negotiated in `Hello`. Unknown kinds and fields are ignored. Chosen over protobuf for simplicity while every peer runs the same Rust core; revisit if a non-Rust peer appears.
 
-**ADR-5: keys travel as physical positions.** Keys are sent as USB HID usages, and the receiver maps them. In v1 the only translation is the Meta ↔ Control swap between Mac and Windows.
+**ADR-5: keys travel as physical positions.** Keys are sent as USB HID usages, and the receiver maps them. In v1 the only translation is the optional Meta ↔ Control swap between Mac and Windows, off by default since 2026-10-18 (requirement 9).
 
 **ADR-6: the controlled device owns its cursor.** The controlled device is authoritative for its cursor position and decides when the cursor leaves. Whichever device the cursor is leaving computes the entry point on the next device.
 
@@ -52,3 +52,5 @@
 - Out: exact drop-at-location, images and files on the clipboard, Windows UAC and lock screen, internet use, and Linux.
 
 **ADR-9: transport (M2).** QUIC (`quinn` + `rustls`) with mutually pinned keys, SPAKE2 pairing on a one-time code, and mDNS discovery with a manual-address fallback.
+
+**ADR-10: clipboard and files (M4, M5).** Text travels when the cursor leaves a computer, on the control stream, so it always arrives before the next key. Files are dropped on a target that appears at the shared edge during a drag (the cursor never crosses with a button held), and travel on their own low-priority QUIC stream, paced, hash-checked and saved under temporary names until complete. The details are in [M4-M5-DESIGN.md](M4-M5-DESIGN.md).
