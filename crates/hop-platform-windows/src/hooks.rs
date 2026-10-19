@@ -24,10 +24,11 @@ use windows::Win32::UI::Input::{
     RAWMOUSE, RID_INPUT, RIDEV_INPUTSINK, RIDEV_REMOVE, RIM_TYPEMOUSE, RegisterRawInputDevices,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP, MSLLHOOKSTRUCT,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1, XBUTTON2,
+    CallNextHookEx, GetSystemMetrics, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_UP,
+    MSLLHOOKSTRUCT, SM_CXDRAG, SM_CYDRAG, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    XBUTTON1, XBUTTON2,
 };
 
 use crate::logic::coords::{PhysPoint, PhysRect, length_to_logical, to_logical};
@@ -37,7 +38,7 @@ use crate::logic::motion::{HookMove, MotionTracker, position_before};
 use crate::logic::scroll::wheel_notches;
 use crate::logic::swallow::{Hooked, swallows};
 use crate::logic::watchdog::HookHealth;
-use crate::{cursor, engine, os, shared};
+use crate::{cursor, drops, engine, os, shared};
 
 // The structures Windows hands the hooks and Raw Input are read through raw
 // pointers, and GetRawInputData is given RAWINPUT's size: the bindings must
@@ -68,6 +69,9 @@ struct HookState {
     monitors: Vec<PhysRect>,
     /// The primary scale, refreshed by the watchdog.
     scale: f64,
+    /// The system's drag threshold (`SM_CXDRAG`, `SM_CYDRAG`), refreshed by
+    /// the watchdog, for the drop zones.
+    drag_threshold: (i32, i32),
     /// The cursor position after the last mouse event.
     cursor: PhysPoint,
     /// When each hook last ran and when raw motion last arrived
@@ -86,6 +90,8 @@ impl HookState {
             held_injected: HeldKeys::default(),
             monitors: Vec::new(),
             scale: 1.0,
+            // Windows' default.
+            drag_threshold: (4, 4),
             cursor: PhysPoint::default(),
             mouse_tick: 0,
             keyboard_tick: 0,
@@ -161,6 +167,8 @@ pub(crate) fn uninstall() {
         unhook(installed.keyboard);
     }
     unregister_raw_input();
+    // Nothing will see the left button go up now.
+    drops::forget_gesture();
     // Dropping the sink lets the runtime's receiving side see the end.
     let sink = with_state(|state| {
         let sink = state.sink.take();
@@ -188,6 +196,18 @@ fn set_hooks() -> Result<(HHOOK, HHOOK)> {
         }
     };
     Ok((mouse, keyboard))
+}
+
+/// Whether the mouse hook is installed, as far as Hop knows (Windows can
+/// remove it silently; the watchdog then reinstalls it). Input thread.
+pub(crate) fn mouse_hooked() -> bool {
+    INSTALLED
+        .try_with(|installed| {
+            installed
+                .try_borrow()
+                .is_ok_and(|installed| installed.as_ref().is_some_and(|i| i.mouse.is_some()))
+        })
+        .unwrap_or(false)
 }
 
 fn unhook(hook: Option<HHOOK>) {
@@ -228,10 +248,10 @@ fn unregister_raw_input() {
 }
 
 /// The watchdog's refresh of the monitor layout and primary scale, which
-/// the hooks need for edge detection and logical units. Monitors and
-/// scaling can change at any time, and a message-only window does not get
-/// the broadcast that announces it, so this simply runs every tick while
-/// capturing. It costs microseconds.
+/// the hooks need for edge detection and logical units, and of the drag
+/// threshold. Monitors and scaling can change at any time, and a
+/// message-only window does not get the broadcast that announces it, so
+/// this simply runs every tick while capturing. It costs microseconds.
 pub(crate) fn refresh_geometry() {
     if INSTALLED.with(|installed| installed.borrow().is_none()) {
         return;
@@ -241,9 +261,12 @@ pub(crate) fn refresh_geometry() {
     };
     let scale = primary_scale(&monitors);
     let rects: Vec<PhysRect> = monitors.iter().map(|monitor| monitor.rect).collect();
+    // SAFETY: plain calls.
+    let drag_threshold = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
     with_state(|state| {
         state.monitors = rects;
         state.scale = scale;
+        state.drag_threshold = drag_threshold;
     });
 }
 
@@ -389,6 +412,11 @@ fn on_mouse(message: u32, info: &MSLLHOOKSTRUCT) -> bool {
     }
     let now = Instant::now();
     let physical = is_physical(info.dwExtraInfo);
+    // A veiled cursor shows again at the user's first touch of the mouse,
+    // and the veil is gone before Windows routes this very event, so a
+    // click lands where the user sees the cursor (see `cursor`).
+    let moved_to = (message == WM_MOUSEMOVE).then_some(PhysPoint::new(info.pt.x, info.pt.y));
+    cursor::veil_on_mouse(physical, moved_to, now);
     let suppressing = should_suppress(physical, now);
     let parked = hooked(message) == Hooked::Motion && physical && cursor::is_parked();
     match with_state(|state| state.mouse(message, info, physical, suppressing, parked, now)) {
@@ -433,6 +461,11 @@ impl HookState {
         self.mouse_tick = os::tick();
         let reporting = self.sink.is_some();
         let swallow = swallows(hooked(message), physical, reporting, suppressing, parked);
+        if !swallow {
+            // What reaches this PC's apps may be a drag toward a drop zone.
+            let at = PhysPoint::new(info.pt.x, info.pt.y);
+            drops::follow_mouse(message, at, self.scale, self.drag_threshold);
+        }
         if !reporting {
             // Nothing is reported, so `swallow` is false: fail open.
             return swallow;

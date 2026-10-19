@@ -1495,6 +1495,7 @@ dependencies = [
  "hop-platform",
  "hop-types",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

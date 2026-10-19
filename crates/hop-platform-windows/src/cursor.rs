@@ -1,4 +1,5 @@
-//! Parking and restoring the cursor while this PC controls another device.
+//! Parking and restoring the cursor while this PC controls another device,
+//! and veiling the cursor another device's session left behind.
 //!
 //! Parking moves the cursor to the middle of the primary display, puts a
 //! tiny, nearly invisible, topmost window under it whose class cursor is
@@ -13,6 +14,19 @@
 //! A parked cursor is given back by itself when the suppression lease lapses,
 //! when capture stops, and when no lease has covered it for
 //! `logic::park::PARKED_WITHOUT_LEASE`.
+//!
+//! # The veil
+//!
+//! When the other device's cursor leaves this PC through an edge, the PC's
+//! cursor stays where the last injected move put it. Concealing it puts the
+//! same invisible window around it, where it is, and nothing else: no warp,
+//! no clip, nothing swallowed (the rules are in `logic::veil`). The mouse
+//! hook lifts the veil at the first physical mouse event, inside the hook,
+//! before Windows routes that event, so a click or a turn of the wheel goes
+//! to the window under the cursor rather than to the veil. Parking,
+//! restoring, a lapse, stopping capture, a panic and dropping the cursor
+//! control lift it too, and so does the watchdog once the cursor is no
+//! longer under it or no mouse hook would see the user touch the mouse.
 //!
 //! `SetSystemCursor` is never used: it changes the cursor for the whole
 //! session, and if Hop crashed the user would be left without one. A
@@ -43,6 +57,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::logic::coords::{PhysPoint, PhysRect, to_logical, to_physical};
 use crate::logic::park::{OVERLAY_SIZE, ParkSpot, ParkWatch, park_spot};
+use crate::logic::veil::{self, Veil, VeilChange};
 use crate::{engine, hooks, os, shared};
 
 const OVERLAY_CLASS: PCWSTR = w!("HopParkedCursor");
@@ -52,6 +67,9 @@ const OVERLAY_CLASS: PCWSTR = w!("HopParkedCursor");
 pub(crate) struct WinCursor {
     /// This handle parked the cursor and has not restored it.
     parked: bool,
+    /// This handle veiled the cursor, and has not revealed, parked or
+    /// restored it since.
+    concealed: bool,
 }
 
 impl CursorControl for WinCursor {
@@ -66,20 +84,41 @@ impl CursorControl for WinCursor {
         // So dropping this handle always checks; un-parking a cursor that is
         // not parked does nothing.
         self.parked = true;
+        // Parking ends a conceal: the park takes the veil's window over.
+        self.concealed = false;
         engine::run(park)?
     }
 
     fn restore(&mut self, at: Point) -> Result<()> {
         let target = to_physical(at, os::primary_scale());
         self.parked = false;
+        self.concealed = false;
         engine::run(move || restore(target))?
+    }
+
+    fn conceal(&mut self) -> Result<()> {
+        // As with parking, a veil the input thread did not put up in time
+        // may still go up, so dropping this handle checks either way.
+        self.concealed = true;
+        engine::run(put_up_veil)?
+    }
+
+    fn reveal(&mut self) -> Result<()> {
+        // Only a veil this handle put up can be there to lift; the mouse
+        // hook, parking and the watchdog lift it without this handle
+        // knowing, which leaves nothing to do here.
+        if !std::mem::take(&mut self.concealed) {
+            return Ok(());
+        }
+        engine::run(lift_veil)
     }
 }
 
 impl Drop for WinCursor {
     fn drop(&mut self) {
-        if self.parked {
-            // Put the cursor back where it was before parking.
+        if self.parked || self.concealed {
+            // Show the cursor: back where it was before parking, or where it
+            // is if it was veiled.
             let _ = engine::run(unpark_after_lapse);
         }
     }
@@ -96,11 +135,14 @@ struct Parked {
 
 #[derive(Default)]
 struct ParkState {
-    /// The hiding window, created on first park and then reused.
+    /// The hiding window, created on first park (or veil) and then reused.
     overlay: Option<HWND>,
     parked: Option<Parked>,
     /// Gives back a park that no suppression lease covers.
     watch: ParkWatch,
+    /// The veil over a cursor another device's session left behind. Never
+    /// together with `parked`: both use the one window.
+    veil: Option<Veil>,
 }
 
 thread_local! {
@@ -151,6 +193,9 @@ fn moving<T>(f: impl FnOnce() -> T) -> T {
 
 /// Parks the cursor. Input thread.
 fn park() -> Result<()> {
+    // A veiled cursor is hidden by the same window, which parking moves to
+    // the park spot: the veil simply ends.
+    with_park(|state| state.veil = None);
     let monitors = os::monitors()?;
     let primary = monitors
         .iter()
@@ -199,7 +244,10 @@ fn park() -> Result<()> {
 
 /// Shows the cursor again at `at` (physical pixels). Input thread.
 fn restore(at: PhysPoint) -> Result<()> {
-    with_park(|state| state.parked = None);
+    with_park(|state| {
+        state.parked = None;
+        state.veil = None;
+    });
     let unclipped = clip(None);
     show_arrow_shape();
     hide_overlay();
@@ -207,9 +255,11 @@ fn restore(at: PhysPoint) -> Result<()> {
     unclipped.and(warped)
 }
 
-/// Suppression lapsed (or the cursor handle went away): show and free the
-/// cursor where it was before parking. Input thread.
+/// Suppression lapsed, capture stopped, or the cursor handle went away:
+/// lift a veil, and show and free a parked cursor where it was before
+/// parking. Input thread.
 pub(crate) fn unpark_after_lapse() {
+    lift_veil();
     let Some(parked) = with_park(|state| state.parked.take()).flatten() else {
         return;
     };
@@ -239,7 +289,93 @@ pub(crate) fn release_after_panic() {
     let _ = clip(None);
     show_arrow_shape();
     hide_overlay();
-    with_park(|state| state.parked = None);
+    with_park(|state| {
+        state.parked = None;
+        state.veil = None;
+    });
+}
+
+/// Veils the cursor where it is (see the module documentation). A parked
+/// cursor is hidden already, and restoring it shows it. Input thread.
+fn put_up_veil() -> Result<()> {
+    if is_parked() {
+        return Ok(());
+    }
+    // Without the mouse hook nothing would see the user touch the mouse,
+    // and the watchdog would only lift the veil again.
+    if !hooks::mouse_hooked() {
+        return Err(PlatformError::Os(
+            "the cursor is hidden only while input capture runs, so that the mouse shows it again"
+                .into(),
+        ));
+    }
+    let veil = Veil::new(os::cursor_pos()?, Instant::now());
+    if let Err(error) = overlay().and_then(|overlay| show_overlay(overlay, veil.rect)) {
+        // Half-veiled is worse than not veiled.
+        with_park(|state| state.veil = None);
+        hide_overlay();
+        return Err(error);
+    }
+    show_hidden_shape();
+    with_park(|state| state.veil = Some(veil));
+    Ok(())
+}
+
+/// Lifts the veil, if there is one: the cursor shows where it is. Input
+/// thread, including inside the mouse hook, so it never waits.
+pub(crate) fn lift_veil() {
+    if with_park(|state| state.veil.take()).flatten().is_none() {
+        return;
+    }
+    // While the cursor is still over the veil this thread owns its shape:
+    // an arrow first, in case the window it lands on never sets one.
+    show_arrow_shape();
+    hide_overlay();
+}
+
+/// The mouse hook's part in the veil (see `logic::veil::on_mouse_event`):
+/// a physical event lifts it at once, before Windows routes the event,
+/// and the last moves of the session that just ended move it along.
+/// `moved_to` is where a move takes the cursor; `None` for a button or the
+/// wheel. Input thread, inside the hook.
+pub(crate) fn veil_on_mouse(physical: bool, moved_to: Option<PhysPoint>, now: Instant) {
+    let change = with_park(|state| {
+        state
+            .veil
+            .map(|veil| veil::on_mouse_event(&veil, physical, moved_to, now))
+    })
+    .flatten();
+    match change {
+        Some(VeilChange::Lift) => lift_veil(),
+        Some(VeilChange::Follow(rect)) => {
+            let Some(Some(overlay)) = with_park(|state| state.overlay) else {
+                return;
+            };
+            if show_overlay(overlay, rect).is_ok() {
+                with_park(|state| {
+                    if let Some(veil) = state.veil.as_mut() {
+                        veil.rect = rect;
+                    }
+                });
+            }
+        }
+        Some(VeilChange::Keep) | None => {}
+    }
+}
+
+/// The watchdog's check of a veiled cursor, every tick: lift the veil once
+/// the cursor is no longer under it or no mouse hook would see the user
+/// touch the mouse (see `logic::veil::watchdog_lifts`); otherwise put it
+/// back on top, in case another topmost window covered it. Input thread.
+pub(crate) fn check_veil(now: Instant) {
+    let Some(Some(veil)) = with_park(|state| state.veil) else {
+        return;
+    };
+    if veil::watchdog_lifts(&veil, os::cursor_pos().ok(), hooks::mouse_hooked(), now) {
+        lift_veil();
+    } else if let Some(Some(overlay)) = with_park(|state| state.overlay) {
+        let _ = show_overlay(overlay, veil.rect);
+    }
 }
 
 /// The watchdog's tick while parked: re-apply what Windows or other apps may
@@ -260,10 +396,10 @@ pub(crate) fn reassert() {
     show_hidden_shape();
 }
 
-/// Makes the parked cursor invisible right away. While the cursor is over
-/// the overlay, this thread owns the cursor's shape, so `SetCursor` takes
-/// effect at once; the overlay's class cursor does the same, but only when
-/// Windows next asks (`WM_SETCURSOR`, on a move), and parked motion is
+/// Makes the parked or veiled cursor invisible right away. While the cursor
+/// is over the overlay, this thread owns the cursor's shape, so `SetCursor`
+/// takes effect at once; the overlay's class cursor does the same, but only
+/// when Windows next asks (`WM_SETCURSOR`, on a move), and parked motion is
 /// swallowed.
 fn show_hidden_shape() {
     if let Ok(cursor) = transparent_cursor() {

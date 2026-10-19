@@ -1,6 +1,6 @@
 [package]
 name = "hop-platform-windows"
-description = "Hop's Windows backend: low-level hooks, Raw Input, SendInput, cursor control, displays, a Win32 test window"
+description = "Hop's Windows backend: low-level hooks, Raw Input, SendInput, cursor control, displays, the clipboard, drop zones, a Win32 test window"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,17 +11,33 @@ hop-keymap.workspace = true
 hop-platform.workspace = true
 hop-types.workspace = true
 
-# The OS bindings exist only on Windows; elsewhere this crate is empty.
+# The OS bindings exist only on Windows; elsewhere only the pure rules
+# (`logic`) are built, for their tests.
 [target.'cfg(windows)'.dependencies]
+# What `windows::core::implement` expands to names this crate directly.
+windows-core = "0.62.2"
 windows = { workspace = true, features = [
     # HWND, POINT, RECT, error codes.
     "Win32_Foundation",
-    # Monitors (EnumDisplayMonitors, GetMonitorInfoW) and the test window's font.
+    # Monitors (EnumDisplayMonitors, GetMonitorInfoW), fonts and painting.
     "Win32_Graphics_Gdi",
+    # IDataObject and FORMATETC, for what is dragged over a drop zone.
+    "Win32_System_Com",
+    # STGMEDIUM, which hands over the dragged files.
+    "Win32_System_Com_StructuredStorage",
+    # The clipboard (OpenClipboard, GetClipboardSequenceNumber, ...).
+    "Win32_System_DataExchange",
     # GetModuleHandleW, for window classes and hooks.
     "Win32_System_LibraryLoader",
+    # Global memory blocks, which hold clipboard data.
+    "Win32_System_Memory",
+    # Clipboard format numbers, OLE drag and drop (IDropTarget,
+    # RegisterDragDrop).
+    "Win32_System_Ole",
     # GetTickCount, the clock GetLastInputInfo uses.
     "Win32_System_SystemInformation",
+    # MODIFIERKEYS_FLAGS, which IDropTarget's methods take.
+    "Win32_System_SystemServices",
     # Thread priority, EcoQoS opt-out, AttachThreadInput.
     "Win32_System_Threading",
     # Per-monitor DPI awareness and monitor scales.
@@ -30,6 +46,8 @@ windows = { workspace = true, features = [
     "Win32_UI_Input",
     # SendInput, MapVirtualKeyW, GetLastInputInfo, SetFocus.
     "Win32_UI_Input_KeyboardAndMouse",
+    # DragQueryFileW, which reads the dropped files' paths.
+    "Win32_UI_Shell",
     # Hooks, windows, messages, the cursor.
     "Win32_UI_WindowsAndMessaging",
 ] }

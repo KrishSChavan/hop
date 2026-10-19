@@ -1,6 +1,6 @@
 //! Hop's input thread: one thread that owns the low-level hooks, the Raw
 //! Input registration, the watchdog timer and the window that hides the
-//! parked cursor.
+//! cursor (parked, or veiled where another device's session left it).
 //!
 //! Low-level hooks are called on the thread that installed them, between
 //! that thread's message-loop iterations, so this thread does nothing slow:
@@ -185,14 +185,15 @@ unsafe extern "system" fn procedure(
 
 /// Every [`watchdog::TICK_MS`]: end a lapsed lease (and free the cursor),
 /// free a parked cursor no lease has covered for a while, refresh the
-/// monitor layout the hooks use, keep a parked cursor pinned, and reinstall
-/// hooks Windows has removed.
+/// monitor layout the hooks use, keep a parked cursor pinned, reinstall
+/// hooks Windows has removed, and lift a veil the cursor has left.
 fn watchdog_tick() {
     lease_check();
     cursor::release_if_orphaned(Instant::now());
     hooks::refresh_geometry();
     cursor::reassert();
     hooks::check_health();
+    cursor::check_veil(Instant::now());
 }
 
 /// A lease that was renewed but has run out: back to passive (the hooks

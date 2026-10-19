@@ -10,6 +10,21 @@ use super::coords::{PhysPoint, PhysRect};
 /// uncover the cursor.
 pub const OVERLAY_SIZE: i32 = 8;
 
+/// Where the invisible window goes to hide a cursor at `p`: an
+/// [`OVERLAY_SIZE`] square with `p` at its middle (just right of and below
+/// it, for an even size). Parking puts it at the park spot; the veil (see
+/// `veil`) wherever the cursor was left.
+pub fn overlay_around(p: PhysPoint) -> PhysRect {
+    let left = p.x.saturating_sub(OVERLAY_SIZE / 2);
+    let top = p.y.saturating_sub(OVERLAY_SIZE / 2);
+    PhysRect::new(
+        left,
+        top,
+        left.saturating_add(OVERLAY_SIZE),
+        top.saturating_add(OVERLAY_SIZE),
+    )
+}
+
 /// How long the cursor may stay parked with no suppression lease in force
 /// before the watchdog gives it back.
 ///
@@ -80,13 +95,7 @@ pub fn park_spot(monitor: PhysRect) -> Option<ParkSpot> {
         return None;
     }
     let center = monitor.center();
-    let half = OVERLAY_SIZE / 2;
-    let overlay = PhysRect::new(
-        center.x - half,
-        center.y - half,
-        center.x - half + OVERLAY_SIZE,
-        center.y - half + OVERLAY_SIZE,
-    );
+    let overlay = overlay_around(center);
     let reach = (monitor.width().min(monitor.height()) / 4).max(1);
     let clip = PhysRect::new(
         (center.x - reach).max(monitor.left),
@@ -114,6 +123,30 @@ mod tests {
         assert!(spot.clip.contains(spot.center));
         // 1080 / 4 = 270 pixels of room each way.
         assert_eq!(spot.clip, PhysRect::new(689, 269, 1230, 810));
+        assert_eq!(spot.overlay, PhysRect::new(955, 535, 963, 543));
+    }
+
+    #[test]
+    fn the_overlay_is_centred_on_the_cursor_wherever_it_is() {
+        for p in [
+            PhysPoint::new(0, 0),
+            PhysPoint::new(1919, 540),
+            PhysPoint::new(-2560, -400),
+            PhysPoint::new(3, 1079),
+        ] {
+            let overlay = overlay_around(p);
+            assert!(overlay.contains(p), "{p:?}");
+            assert_eq!(overlay.width(), OVERLAY_SIZE);
+            assert_eq!(overlay.height(), OVERLAY_SIZE);
+            assert_eq!(overlay.center(), PhysPoint::new(p.x - 1, p.y - 1));
+            // Half the overlay on each side, so a nudge either way stays on it.
+            assert_eq!(p.x - overlay.left, OVERLAY_SIZE / 2);
+            assert_eq!(overlay.right - p.x, OVERLAY_SIZE / 2);
+        }
+        // Absurd coordinates saturate instead of wrapping.
+        let corner = overlay_around(PhysPoint::new(i32::MIN, i32::MAX));
+        assert_eq!(corner.left, i32::MIN);
+        assert_eq!(corner.bottom, i32::MAX);
     }
 
     #[test]

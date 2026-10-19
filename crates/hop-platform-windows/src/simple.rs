@@ -1,10 +1,7 @@
 //! The parts of the contract that need little or nothing on Windows:
-//! displays, permissions, Secure Event Input, and the clipboard (M4).
+//! displays, permissions and Secure Event Input.
 
-use hop_platform::{
-    Displays, Permission, PermissionState, Permissions, PlatformError, Result, SystemState,
-    TextClipboard,
-};
+use hop_platform::{Displays, Permission, PermissionState, Permissions, Result, SystemState};
 use hop_types::DisplayInfo;
 
 use crate::logic::displays::logical_displays;
@@ -44,23 +41,5 @@ pub(crate) struct WinSystemState;
 impl SystemState for WinSystemState {
     fn secure_input_active(&self) -> bool {
         false
-    }
-}
-
-/// The clipboard arrives in milestone M4.
-#[derive(Debug, Default)]
-pub(crate) struct NoClipboard;
-
-impl TextClipboard for NoClipboard {
-    fn change_count(&self) -> Result<u64> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn read_text(&self, _max_bytes: usize) -> Result<Option<String>> {
-        Err(PlatformError::Unsupported)
-    }
-
-    fn write_text(&mut self, _text: &str) -> Result<u64> {
-        Err(PlatformError::Unsupported)
     }
 }
