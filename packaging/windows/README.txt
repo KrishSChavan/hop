@@ -4,7 +4,8 @@ Hop for Windows
 Hop shares one keyboard and mouse between this PC and your Mac. Text
 you copy goes along when the cursor moves across, and files you drop
 at the screen edge are sent to the other computer. Files from the Mac
-arrive in Downloads\Hop Received.
+arrive in Downloads\Hop Received, marked as downloaded, so Windows
+checks them like any download.
 
 Before you start it
 -------------------
