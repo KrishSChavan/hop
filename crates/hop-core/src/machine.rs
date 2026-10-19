@@ -75,8 +75,9 @@ pub enum Event {
     /// to passive by itself), captured input was dropped, or a platform call
     /// a session depends on (suppressing, parking, injecting) failed.
     ///
-    /// The core ends any session, failing open, with
-    /// [`EndReason::Stalled`]:
+    /// A cursor hidden by [`Action::ConcealCursor`] is shown again first
+    /// ([`Action::RevealCursor`]). The core ends any session, failing open,
+    /// with [`EndReason::Stalled`]:
     /// - while entering or controlling, as for the emergency chord: it sends
     ///   `Release`, restores the cursor at the exit point, sets capture to
     ///   passive, and disarms the edge the cursor left through;
@@ -99,9 +100,9 @@ pub enum Event {
     /// Any news of a key (down or up) settles its state again. Mouse buttons
     /// are kept as they were: a cursor that crossed while a button was still
     /// down could leave it stuck down here, so a missed button-up only
-    /// blocks crossings until the next click. With no session and no key
-    /// believed held, the event changes nothing, so feeding it twice in a
-    /// row is harmless.
+    /// blocks crossings until the next click. With no session, no key
+    /// believed held and no hidden cursor, the event changes nothing, so
+    /// feeding it twice in a row is harmless.
     LocalStall,
     /// This device's layout changed (displays added, removed or moved). A
     /// connected peer that has no displays in the new layout keeps the ones
@@ -122,10 +123,15 @@ pub enum Action {
         msg: CoreMessage,
     },
     /// Send `to` a tiny unreliable packet so its Wi-Fi radio is awake when
-    /// the cursor crosses. Emitted while idle, at most every
-    /// `nudge_interval_ms`, when this device's own pointer moves toward an
-    /// edge that leads to the connected peer `to` and is within
-    /// `nudge_distance` of it. Best effort: a lost nudge changes nothing.
+    /// the cursor crosses. Emitted while idle, for physical pointer motion
+    /// that stays on this device's displays and heads for a part of an edge
+    /// that leads to the connected peer `to` (one of
+    /// [`Core::edges_toward`]): the motion moves toward that edge (it has a
+    /// component along the edge's outward normal) and ends on the edge's
+    /// display, level with the part (within its span along the edge) and at
+    /// most `nudge_distance` from the edge line. At most one per event for
+    /// each peer, and none to a peer nudged less than `nudge_interval_ms`
+    /// before. Best effort: a lost nudge changes nothing.
     Nudge {
         /// The device the cursor is heading for.
         to: DeviceId,
@@ -141,17 +147,19 @@ pub enum Action {
     },
     /// Hide the local cursor where it is. Emitted only when a session in
     /// which this device was controlled ends because the cursor left
-    /// through an edge ([`EndReason::CursorLeft`]), after
-    /// [`Action::ReleaseAllInjected`], so the cursor the controller drove
-    /// here does not stay visible at that edge. Nothing is frozen, moved or
-    /// suppressed, and the platform shows the cursor again by itself when
-    /// this device's own mouse is used.
+    /// through an edge ([`EndReason::CursorLeft`]): after `Leave` is sent
+    /// and [`Action::ReleaseAllInjected`], before the
+    /// [`Notice::SessionEnded`], so the cursor the controller drove here
+    /// does not stay visible at that edge. No other ending hides it.
+    /// Nothing is frozen, moved or suppressed, and the platform shows the
+    /// cursor again by itself when this device's own mouse is used.
     ConcealCursor,
-    /// Show a cursor hidden by [`Action::ConcealCursor`] again. Emitted,
-    /// while it is hidden, before anything else in the same list: on
-    /// physical pointer input here (motion, a button, scrolling; keys do
-    /// not count), when a peer enters this device again, and on
-    /// [`Event::LocalStall`].
+    /// Show a cursor hidden by [`Action::ConcealCursor`] again. Emitted only
+    /// while it is hidden, as the first action of the list: on physical
+    /// pointer input here (motion, a button press, scrolling; keys and
+    /// button releases do not count), when a peer enters this device again
+    /// (before [`Action::MoveCursorTo`]), and on [`Event::LocalStall`]. The
+    /// cursor is never hidden outside Idle.
     RevealCursor,
     /// Move the local cursor to `to` while controlled; drag if injected
     /// buttons are held.
@@ -332,6 +340,29 @@ impl State {
 ///   crossing and still count toward the chord, so a key that really is
 ///   still down cannot get stuck here and the chord keeps working. Buttons
 ///   are kept, so the cursor never crosses while one may still be down.
+/// - When a session in which this device was controlled ends because the
+///   cursor left through an edge, the cursor the controller drove here is
+///   hidden where it is ([`Action::ConcealCursor`], docs/M4-M5-DESIGN.md),
+///   so it does not stay visible at that edge. No other ending hides it: a
+///   take-back, a release, a timeout, a disconnect, a replaced session or a
+///   stall is not the cursor visibly leaving, and failing open favours a
+///   visible cursor. It is shown again ([`Action::RevealCursor`], first in
+///   its list) on physical pointer input here (motion, a button press,
+///   scrolling; never a key, since typing needs no pointer), when a peer
+///   enters again, and on [`Event::LocalStall`]. Both ways out of Idle, a
+///   crossing and an accepted `Enter`, pass one of those, so the cursor is
+///   hidden only while idle. A dropped connection leaves it hidden: the
+///   user is at the other computer.
+/// - While idle, physical pointer motion that stays on this device's
+///   displays nudges each connected peer it heads for ([`Action::Nudge`],
+///   docs/M4-M5-DESIGN.md), so a dozing Wi-Fi radio is awake by the time the
+///   cursor crosses: the motion moves toward a part of an edge that leads to
+///   that peer ([`Core::edges_toward`], whole edges minus the corner dead
+///   zones) and ends level with it, at most `nudge_distance` from the edge.
+///   A peer gets at most one nudge per event and one every
+///   `nudge_interval_ms`; a `nudge_distance` of 0 turns nudges off. Motion
+///   that would leave the screen does not nudge: it pushes against an edge,
+///   where the crossing rules decide.
 #[derive(Clone, Debug)]
 pub struct Core {
     me: DeviceId,
@@ -358,6 +389,17 @@ pub struct Core {
     /// injected copy; otherwise the injector would keep the modifier down
     /// and add it to the next session's keys (Cmd+Q instead of Q).
     repressed: BTreeSet<KeyCode>,
+    /// Whether the cursor a session left at this device's edge is hidden
+    /// ([`Action::ConcealCursor`]). Only ever true while idle.
+    cursor_concealed: bool,
+    /// The parts of this device's edges that lead to each connected peer
+    /// ([`Core::edges_toward`]), for nudges. Recomputed whenever the layout
+    /// or the connected peers change; peers no edge leads to are left out.
+    shared_edges: BTreeMap<DeviceId, Vec<SharedEdge>>,
+    /// When each peer was last nudged ([`Action::Nudge`]). Kept across a
+    /// reconnect, so a peer is never nudged more often than
+    /// `nudge_interval_ms`; one entry per peer, so it stays small.
+    last_nudge: BTreeMap<DeviceId, Millis>,
     /// The lowest `seq` the next `Enter` may use (see [`Core::new_seq`]).
     next_seq: u64,
     phase: Phase,
@@ -491,6 +533,9 @@ impl Core {
             maybe_held: BTreeSet::new(),
             held_buttons: BTreeSet::new(),
             repressed: BTreeSet::new(),
+            cursor_concealed: false,
+            shared_edges: BTreeMap::new(),
+            last_nudge: BTreeMap::new(),
             next_seq: 1,
             phase: Phase::idle(),
         }
@@ -657,12 +702,14 @@ impl Core {
         };
         self.peers.insert(peer, accepted);
         self.reset_push();
+        self.refresh_shared_edges();
     }
 
     fn on_peer_disconnected(&mut self, now: Millis, peer: &DeviceId, out: &mut Vec<Action>) {
         self.peers.remove(peer);
         self.end_session_with(now, peer, EndReason::Disconnected, out);
         self.reset_push();
+        self.refresh_shared_edges();
     }
 
     fn on_layout_changed(&mut self, layout: Layout) {
@@ -679,6 +726,18 @@ impl Core {
         }
         // Display ids and edges may mean something else now.
         self.reset_push();
+        self.refresh_shared_edges();
+    }
+
+    /// Recomputes [`Core::shared_edges`] for the layout and the connected
+    /// peers as they stand.
+    fn refresh_shared_edges(&mut self) {
+        self.shared_edges = self
+            .peers
+            .keys()
+            .map(|peer| (peer.clone(), self.edges_toward(peer)))
+            .filter(|(_, edges)| !edges.is_empty())
+            .collect();
     }
 
     /// Ends the current session if it is with `peer`; no message is sent
@@ -841,6 +900,9 @@ impl Core {
             });
             return;
         };
+        // The cursor the last session left hidden at the edge is about to
+        // move, and it must be seen where it goes.
+        self.reveal_cursor(out);
         // Start the session with nothing injected: a modifier pressed again
         // on an earlier return must not leak into the peer's keys.
         out.push(Action::ReleaseAllInjected);
@@ -1048,6 +1110,17 @@ impl Core {
         if !is_usable(&event) {
             return;
         }
+        // This device's own mouse shows a cursor the last session left
+        // hidden, before anything else happens (a crossing parks it). Keys
+        // do not: typing needs no pointer.
+        if matches!(
+            event,
+            InputEvent::PointerMotion { .. }
+                | InputEvent::Button { pressed: true, .. }
+                | InputEvent::Scroll { .. }
+        ) {
+            self.reveal_cursor(out);
+        }
         match event {
             InputEvent::Key { code, pressed, .. } => {
                 // Any news of a key settles whether it is down.
@@ -1086,7 +1159,8 @@ impl Core {
         }
     }
 
-    /// Idle: watch for a crossing (the crossing rules of the spec).
+    /// Idle: watch for a crossing (the crossing rules of the spec), and
+    /// nudge the peers the cursor heads for.
     fn idle_input(&mut self, now: Millis, event: InputEvent, cursor: Point, out: &mut Vec<Action>) {
         let InputEvent::PointerMotion { dx, dy } = event else {
             return;
@@ -1096,14 +1170,17 @@ impl Core {
             .device(&self.me)
             .map_or(&[][..], |d| d.displays());
         let exit = match layout::travel(displays, cursor, dx, dy) {
-            Some(Travel::Exits(exit)) => Some(exit),
-            _ => None,
+            Some(Travel::Exits(exit)) => exit,
+            travel => {
+                // Not pushing against an edge (any more).
+                self.reset_push();
+                if let Some(Travel::Inside(to)) = travel {
+                    self.nudge_peers(now, to, dx, dy, out);
+                }
+                return;
+            }
         };
         let Phase::Idle { push } = &mut self.phase else {
-            return;
-        };
-        let Some(exit) = exit else {
-            *push = None;
             return;
         };
         if let Some(Push::Disarmed { display, edge }) = push {
@@ -1141,6 +1218,33 @@ impl Core {
                     since,
                 }),
             };
+        }
+    }
+
+    /// Idle motion by `(dx, dy)` that ends on screen at `to`: nudges each
+    /// connected peer with an edge that the motion heads for and ends within
+    /// `nudge_distance` of, unless that peer was nudged less than
+    /// `nudge_interval_ms` ago. Peers come in id order, each at most once.
+    fn nudge_peers(&mut self, now: Millis, to: Point, dx: f64, dy: f64, out: &mut Vec<Action>) {
+        let reach = self.config.nudge_distance;
+        // 0 turns nudges off; it would still match a cursor right on a
+        // left or top edge line.
+        if reach <= 0.0 {
+            return;
+        }
+        let interval = self.config.nudge_interval_ms;
+        for (peer, edges) in &self.shared_edges {
+            if !edges.iter().any(|e| e.is_approached(to, dx, dy, reach)) {
+                continue;
+            }
+            let due = self
+                .last_nudge
+                .get(peer)
+                .is_none_or(|&last| now.saturating_sub(last) >= interval);
+            if due {
+                self.last_nudge.insert(peer.clone(), now);
+                out.push(Action::Nudge { to: peer.clone() });
+            }
         }
     }
 
@@ -1306,9 +1410,13 @@ impl Core {
 
     // ----- stalls -------------------------------------------------------
 
-    /// [`Event::LocalStall`]: end any session, failing open, then stop
-    /// vouching for the keys believed held.
+    /// [`Event::LocalStall`]: show a hidden cursor, end any session, failing
+    /// open, then stop vouching for the keys believed held.
     fn on_local_stall(&mut self, now: Millis, out: &mut Vec<Action>) {
+        // Fail open: Hop can no longer vouch for this device, so it does not
+        // leave a cursor hidden, even though the platform would show it at
+        // the next mouse event anyway.
+        self.reveal_cursor(out);
         match std::mem::replace(&mut self.phase, Phase::idle()) {
             // As for the emergency chord. The Release also frees a peer that
             // accepted an Enter we never heard the answer to.
@@ -1510,7 +1618,8 @@ impl Core {
     }
 
     /// The controlled side's way back to Idle: optionally tell the
-    /// controller, release everything injected, notify.
+    /// controller, release everything injected, hide the cursor if it left
+    /// through an edge, notify.
     fn finish_as_controlled(
         &mut self,
         link: Link,
@@ -1525,11 +1634,25 @@ impl Core {
             });
         }
         out.push(Action::ReleaseAllInjected);
+        // The cursor moved on to another device, so the one the controller
+        // drove here would only stay visible at this edge. Every other
+        // ending leaves it visible (fail open).
+        if reason == EndReason::CursorLeft {
+            out.push(Action::ConcealCursor);
+            self.cursor_concealed = true;
+        }
         out.push(Action::Notify(Notice::SessionEnded {
             peer: link.peer,
             reason,
         }));
         self.phase = Phase::idle();
+    }
+
+    /// Shows the cursor again if [`Action::ConcealCursor`] hid it.
+    fn reveal_cursor(&mut self, out: &mut Vec<Action>) {
+        if std::mem::take(&mut self.cursor_concealed) {
+            out.push(Action::RevealCursor);
+        }
     }
 }
 
@@ -1613,10 +1736,19 @@ fn is_usable(event: &InputEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hop_types::{Rect, ScrollUnit};
+    use hop_types::{MotionMark, Rect, ScrollUnit};
 
     fn motion(dx: f64, dy: f64) -> InputEvent {
         InputEvent::PointerMotion { dx, dy }
+    }
+
+    /// Physical input on this device, with the cursor at `cursor`.
+    fn local(event: InputEvent, cursor: Point) -> Event {
+        Event::LocalInput {
+            event,
+            cursor,
+            physical: true,
+        }
     }
 
     #[test]
@@ -2062,5 +2194,432 @@ mod tests {
             .map(|target| core.new_seq(target))
             .collect();
         assert_eq!(seqs, vec![1, 3, 4, 5, 6, 8]);
+    }
+
+    // ----- the cursor left behind (docs/M4-M5-DESIGN.md, section 2) -----
+
+    /// A display with its top-left corner at `(x, y)` of its device's own
+    /// coordinates.
+    fn screen(id: u32, x: f64, y: f64, width: f64, height: f64) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            frame: Rect::new(x, y, width, height),
+            scale: 1.0,
+            primary: x == 0.0 && y == 0.0,
+        }
+    }
+
+    /// The user's desk from the PC's side, with `config`: the PC's 1536x864
+    /// screen with the Mac's 1512x982 laptop to its left, connected.
+    /// Returns the core and the Mac's id.
+    fn the_pc_beside_the_mac_with(config: CoreConfig) -> (Core, DeviceId) {
+        let (pc, mac) = (DeviceId::new("pc"), DeviceId::new("mac"));
+        let layout = Layout::two_devices(
+            pc.clone(),
+            vec![screen(1, 0.0, 0.0, 1536.0, 864.0)],
+            mac.clone(),
+            Edge::Left,
+            vec![],
+        )
+        .unwrap();
+        let mut core = Core::new(pc, Os::Windows, config, layout);
+        core.handle(
+            0,
+            Event::PeerConnected {
+                peer: mac.clone(),
+                os: Os::MacOs,
+                displays: vec![screen(1, 0.0, 0.0, 1512.0, 982.0)],
+            },
+        );
+        (core, mac)
+    }
+
+    /// The Mac's `Enter` for its session `seq`, onto the middle of the PC's
+    /// left edge.
+    fn enter_from_the_mac(seq: u64) -> CoreMessage {
+        CoreMessage::Enter {
+            seq,
+            entry: EntryPoint {
+                display_id: 1,
+                edge: Edge::Left,
+                position: Point::new(1.0, 432.0),
+            },
+            held_keys: vec![],
+            source_os: Os::MacOs,
+        }
+    }
+
+    /// The PC after the Mac drove its cursor in (session 1, at t=10) and
+    /// back out through the PC's left edge (at t=20). Returns the core, the
+    /// Mac's id and the actions of that last motion.
+    fn the_pc_after_the_cursor_left() -> (Core, DeviceId, Vec<Action>) {
+        let (mut core, mac) = the_pc_beside_the_mac_with(CoreConfig::default());
+        let from_mac = |msg| Event::PeerMessage {
+            from: mac.clone(),
+            msg,
+        };
+        core.handle(10, from_mac(enter_from_the_mac(1)));
+        assert!(matches!(core.state(), State::Controlled { seq: 1, .. }));
+        // 200 units to the left of a cursor 1 unit inside the edge.
+        let mark = MotionMark {
+            n: 1,
+            total_dx: -200.0,
+            total_dy: 0.0,
+        };
+        let out = core.handle(20, from_mac(CoreMessage::Motion { seq: 1, mark }));
+        assert_eq!(core.state(), State::Idle);
+        (core, mac, out)
+    }
+
+    /// The controlled side's exact actions when the cursor leaves it
+    /// through an edge, as the agent carries them out: the Mac hears first,
+    /// nothing injected stays down, and the cursor is hidden before the
+    /// session is reported over.
+    #[test]
+    fn the_cursor_left_behind_is_hidden_with_exactly_these_actions() {
+        let (_, mac, out) = the_pc_after_the_cursor_left();
+        let entry = EntryPoint {
+            display_id: 1,
+            edge: Edge::Right,
+            position: Point::new(1511.0, 491.0),
+        };
+        assert_eq!(
+            out,
+            vec![
+                Action::Send {
+                    to: mac.clone(),
+                    msg: CoreMessage::Leave {
+                        seq: 1,
+                        to: mac.clone(),
+                        entry
+                    }
+                },
+                Action::ReleaseAllInjected,
+                Action::ConcealCursor,
+                Action::Notify(Notice::SessionEnded {
+                    peer: mac,
+                    reason: EndReason::CursorLeft
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_peer_entering_again_shows_the_hidden_cursor_before_moving_it() {
+        let (mut core, mac, _) = the_pc_after_the_cursor_left();
+        let from_mac = |msg| Event::PeerMessage {
+            from: mac.clone(),
+            msg,
+        };
+        // Typing on the PC needs no pointer: the cursor stays hidden.
+        for pressed in [true, false] {
+            let shift = InputEvent::Key {
+                code: KeyCode::LEFT_SHIFT,
+                pressed,
+                repeat: false,
+            };
+            assert_eq!(core.handle(30, local(shift, Point::new(1.0, 432.0))), []);
+        }
+        assert_eq!(
+            core.handle(40, from_mac(enter_from_the_mac(3))),
+            vec![
+                Action::RevealCursor,
+                Action::ReleaseAllInjected,
+                Action::MoveCursorTo {
+                    to: Point::new(1.0, 432.0)
+                },
+                Action::Send {
+                    to: mac.clone(),
+                    msg: CoreMessage::EnterAck { seq: 3 }
+                },
+                Action::Notify(Notice::ControlledBy { peer: mac.clone() }),
+            ]
+        );
+        // A release hides nothing, so a stall afterwards has nothing to
+        // show again.
+        assert_eq!(
+            core.handle(50, from_mac(CoreMessage::Release { seq: 3 })),
+            vec![
+                Action::ReleaseAllInjected,
+                Action::Notify(Notice::SessionEnded {
+                    peer: mac,
+                    reason: EndReason::Released
+                }),
+            ]
+        );
+        assert_eq!(core.handle(60, Event::LocalStall), []);
+    }
+
+    #[test]
+    fn pointer_input_here_shows_the_hidden_cursor_first() {
+        let at = Point::new(1.0, 432.0);
+        let press = InputEvent::Button {
+            button: MouseButton::Left,
+            pressed: true,
+        };
+        let scroll = InputEvent::Scroll {
+            dx: 0.0,
+            dy: 1.0,
+            unit: ScrollUnit::Line,
+        };
+        // To the right, away from the edge that leads to the Mac, so the
+        // motion nudges nothing.
+        for event in [motion(5.0, 0.0), press, scroll] {
+            let (mut core, _, _) = the_pc_after_the_cursor_left();
+            assert_eq!(
+                core.handle(30, local(event, at)),
+                [Action::RevealCursor],
+                "{event:?}"
+            );
+            assert_eq!(core.handle(40, local(event, at)), [], "only once");
+        }
+        // Neither does a button release (the button may have gone down
+        // before the cursor came here), nor input with unusable numbers.
+        let (mut core, mac, _) = the_pc_after_the_cursor_left();
+        let release = InputEvent::Button {
+            button: MouseButton::Left,
+            pressed: false,
+        };
+        assert_eq!(core.handle(30, local(release, at)), []);
+        assert_eq!(core.handle(30, local(motion(f64::NAN, 0.0), at)), []);
+        // A motion that crosses at once shows the cursor before parking it.
+        assert_eq!(
+            core.handle(40, local(motion(-50.0, 0.0), Point::new(5.0, 432.0))),
+            vec![
+                Action::RevealCursor,
+                Action::SetCaptureMode(CaptureMode::Suppress),
+                Action::ParkCursor,
+                Action::Send {
+                    to: mac,
+                    msg: CoreMessage::Enter {
+                        seq: 2,
+                        entry: EntryPoint {
+                            display_id: 1,
+                            edge: Edge::Right,
+                            position: Point::new(1511.0, 491.0),
+                        },
+                        held_keys: vec![],
+                        source_os: Os::Windows,
+                    }
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stall_shows_the_hidden_cursor() {
+        let (mut core, _, _) = the_pc_after_the_cursor_left();
+        assert_eq!(core.handle(30, Event::LocalStall), [Action::RevealCursor]);
+        assert_eq!(core.handle(40, Event::LocalStall), [], "nothing left");
+    }
+
+    /// Only the cursor leaving through an edge hides it. Every other end of
+    /// a session this device was controlled in leaves the cursor shown, so
+    /// there is nothing to show again afterwards either.
+    #[test]
+    fn no_other_ending_hides_the_cursor() {
+        let mac = DeviceId::new("mac");
+        let at = Point::new(1.0, 432.0);
+        let from_mac = |msg| Event::PeerMessage {
+            from: mac.clone(),
+            msg,
+        };
+        let press = InputEvent::Key {
+            code: KeyCode::LEFT_SHIFT,
+            pressed: true,
+            repeat: false,
+        };
+        let scroll = InputEvent::Scroll {
+            dx: 0.0,
+            dy: 1.0,
+            unit: ScrollUnit::Line,
+        };
+        let endings = [
+            (
+                EndReason::Released,
+                20,
+                from_mac(CoreMessage::Release { seq: 1 }),
+            ),
+            (EndReason::TakenBack, 20, local(press, at)),
+            // Nothing heard since the session began at t=10.
+            (EndReason::PeerTimeout, 1510, Event::Tick),
+            (
+                EndReason::Disconnected,
+                20,
+                Event::PeerDisconnected { peer: mac.clone() },
+            ),
+            (EndReason::Superseded, 20, from_mac(enter_from_the_mac(3))),
+            (EndReason::Stalled, 20, Event::LocalStall),
+        ];
+        for (reason, now, event) in endings {
+            let (mut core, _) = the_pc_beside_the_mac_with(CoreConfig::default());
+            core.handle(10, from_mac(enter_from_the_mac(1)));
+            let out = core.handle(now, event);
+            let ended = Action::Notify(Notice::SessionEnded {
+                peer: mac.clone(),
+                reason,
+            });
+            assert!(out.contains(&ended), "{reason:?}: {out:?}");
+            assert!(!out.contains(&Action::ConcealCursor), "{reason:?}");
+            let out = core.handle(now + 10, local(scroll, at));
+            assert!(!out.contains(&Action::RevealCursor), "{reason:?}");
+        }
+    }
+
+    // ----- nudges (docs/M4-M5-DESIGN.md, section 1) ----------------------
+
+    /// A Mac with one 1000x1000 display, the PC both to its right and above
+    /// it (one display each way), and "zed" to its left, all connected.
+    /// Returns the core and the ids of the PC and zed.
+    fn the_mac_between_two_peers() -> (Core, DeviceId, DeviceId) {
+        let (mac, pc, zed) = (
+            DeviceId::new("mac"),
+            DeviceId::new("pc"),
+            DeviceId::new("zed"),
+        );
+        let square = |id, x, y| screen(id, x, y, 1000.0, 1000.0);
+        let layout = Layout::new([
+            crate::DeviceLayout::new(mac.clone(), Point::new(0.0, 0.0), vec![square(1, 0.0, 0.0)]),
+            crate::DeviceLayout::new(pc.clone(), Point::new(1000.0, 0.0), vec![]),
+            crate::DeviceLayout::new(zed.clone(), Point::new(-1000.0, 0.0), vec![]),
+        ])
+        .unwrap();
+        let mut core = Core::new(mac, Os::MacOs, CoreConfig::default(), layout);
+        let peers = [
+            (&pc, vec![square(1, 0.0, 0.0), square(2, -1000.0, -1000.0)]),
+            (&zed, vec![square(1, 0.0, 0.0)]),
+        ];
+        for (peer, displays) in peers {
+            core.handle(
+                0,
+                Event::PeerConnected {
+                    peer: peer.clone(),
+                    os: Os::Windows,
+                    displays,
+                },
+            );
+        }
+        (core, pc, zed)
+    }
+
+    /// Physical motion by `(dx, dy)` from `(x, y)`, at `now`.
+    fn move_by(core: &mut Core, now: Millis, (x, y): (f64, f64), dx: f64, dy: f64) -> Vec<Action> {
+        core.handle(now, local(motion(dx, dy), Point::new(x, y)))
+    }
+
+    /// The part of an edge of the Mac's display that leads to a peer: all
+    /// of it but the default corner dead zones.
+    fn mac_edge(edge: Edge) -> SharedEdge {
+        SharedEdge {
+            display: 1,
+            frame: Rect::new(0.0, 0.0, 1000.0, 1000.0),
+            edge,
+            start: 10.0,
+            end: 990.0,
+        }
+    }
+
+    #[test]
+    fn each_peer_the_pointer_heads_for_is_nudged_at_most_every_interval() {
+        let (mut core, pc, zed) = the_mac_between_two_peers();
+        assert_eq!(
+            core.edges_toward(&pc),
+            [mac_edge(Edge::Right), mac_edge(Edge::Top)]
+        );
+        assert_eq!(core.edges_toward(&zed), [mac_edge(Edge::Left)]);
+        let nudge = |to: &DeviceId| Action::Nudge { to: to.clone() };
+        let core = &mut core;
+
+        // Toward the right edge, ending 200 units from it.
+        assert_eq!(move_by(core, 100, (500.0, 500.0), 300.0, 0.0), [nudge(&pc)]);
+        // Not again for 200 ms.
+        assert_eq!(move_by(core, 150, (800.0, 500.0), 100.0, 0.0), []);
+        assert_eq!(move_by(core, 299, (900.0, 500.0), 10.0, 0.0), []);
+        assert_eq!(move_by(core, 300, (910.0, 500.0), 10.0, 0.0), [nudge(&pc)]);
+        // Away from the edge, along it, or toward it from too far: never.
+        assert_eq!(move_by(core, 1000, (920.0, 500.0), -50.0, 0.0), []);
+        assert_eq!(move_by(core, 1000, (870.0, 500.0), 0.0, 50.0), []);
+        assert_eq!(move_by(core, 1000, (100.0, 500.0), 599.0, 0.0), []);
+        // Level with a corner dead zone, beside no part that leads anywhere.
+        assert_eq!(move_by(core, 1000, (900.0, 5.0), 10.0, 0.0), []);
+        // Into the top-right corner, near both edges that lead to the PC:
+        // one nudge.
+        assert_eq!(
+            move_by(core, 2000, (800.0, 200.0), 50.0, -50.0),
+            [nudge(&pc)]
+        );
+        // Into the top-left corner, near an edge of each peer: one each, in
+        // id order.
+        assert_eq!(
+            move_by(core, 3000, (200.0, 200.0), -50.0, -50.0),
+            [nudge(&pc), nudge(&zed)]
+        );
+        // Each peer has its own interval.
+        assert_eq!(move_by(core, 3100, (150.0, 150.0), -10.0, 0.0), []);
+        assert_eq!(
+            move_by(core, 3200, (140.0, 150.0), -10.0, 0.0),
+            [nudge(&zed)]
+        );
+    }
+
+    /// The edges are looked up again whenever a peer comes or goes or the
+    /// layout changes.
+    #[test]
+    fn nudges_follow_the_peers_and_the_layout() {
+        let (mut core, pc, zed) = the_mac_between_two_peers();
+        // Gone: no more nudges for zed.
+        assert_eq!(
+            core.handle(10, Event::PeerDisconnected { peer: zed.clone() }),
+            []
+        );
+        assert_eq!(move_by(&mut core, 20, (200.0, 500.0), -50.0, 0.0), []);
+        // The PC reconnects with only the display on the right: the top edge
+        // leads nowhere now.
+        core.handle(
+            30,
+            Event::PeerConnected {
+                peer: pc.clone(),
+                os: Os::Windows,
+                displays: vec![screen(1, 0.0, 0.0, 1000.0, 1000.0)],
+            },
+        );
+        assert_eq!(core.edges_toward(&pc), [mac_edge(Edge::Right)]);
+        assert_eq!(move_by(&mut core, 40, (500.0, 100.0), 0.0, -10.0), []);
+        assert_eq!(
+            move_by(&mut core, 50, (900.0, 500.0), 10.0, 0.0),
+            [Action::Nudge { to: pc.clone() }]
+        );
+        // The agent moves the PC far away: nothing leads to it any more.
+        let far = Layout::new([
+            crate::DeviceLayout::new(
+                DeviceId::new("mac"),
+                Point::new(0.0, 0.0),
+                vec![screen(1, 0.0, 0.0, 1000.0, 1000.0)],
+            ),
+            crate::DeviceLayout::new(pc.clone(), Point::new(5000.0, 5000.0), vec![]),
+        ])
+        .unwrap();
+        core.handle(60, Event::LayoutChanged(far));
+        assert_eq!(core.edges_toward(&pc), []);
+        assert_eq!(move_by(&mut core, 500, (900.0, 500.0), 10.0, 0.0), []);
+    }
+
+    /// A cursor right on a left or top edge line is 0 units from it, but a
+    /// nudge distance of 0 still turns nudges off.
+    #[test]
+    fn a_nudge_distance_of_0_turns_nudges_off() {
+        let toward_the_mac = |config| {
+            let (mut core, mac) = the_pc_beside_the_mac_with(config);
+            let out = move_by(&mut core, 10, (5.0, 432.0), -5.0, 0.0);
+            assert_eq!(core.state(), State::Idle, "still on the PC's screen");
+            (out, mac)
+        };
+        let (out, mac) = toward_the_mac(CoreConfig::default());
+        assert_eq!(out, [Action::Nudge { to: mac }]);
+        let off = CoreConfig {
+            nudge_distance: 0.0,
+            ..CoreConfig::default()
+        };
+        assert_eq!(toward_the_mac(off).0, []);
     }
 }

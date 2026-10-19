@@ -1578,3 +1578,372 @@ fn an_enter_with_a_bogus_entry_point_lands_on_screen() {
         vec![(key(KeyCode::LEFT_SHIFT, true), Os::MacOs)]
     );
 }
+
+// ----- the cursor left behind (docs/M4-M5-DESIGN.md, section 2) -------------
+
+/// What device `d` did from entry `from` of its log on.
+fn actions_since(sim: &Sim, d: usize, from: usize) -> Vec<Action> {
+    sim.dev[d].log[from..]
+        .iter()
+        .map(|(_, action)| action.clone())
+        .collect()
+}
+
+/// The Mac crosses to the PC and pushes the cursor straight back through the
+/// PC's left edge, which hides the PC's cursor there.
+fn cross_and_come_back(sim: &mut Sim) {
+    cross_mac_to_pc(sim);
+    sim.motion(MAC, -200.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), State::Idle);
+    assert_eq!(sim.state(PC), State::Idle);
+    assert!(sim.dev[PC].concealed);
+}
+
+/// The first test session's complaint: with the cursor back on the Mac, the
+/// PC's cursor stayed visible at the PC's left edge.
+#[test]
+fn the_cursor_left_on_the_pc_is_hidden_until_the_pc_mouse_moves() {
+    let mut sim = Sim::mac_and_pc();
+    cross_mac_to_pc(&mut sim);
+    let start = sim.dev[PC].log.len();
+    sim.motion(MAC, -200.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), State::Idle);
+    // The PC tells the Mac, lets go of everything it injected, hides its
+    // cursor and only then reports the session over.
+    let leave = CoreMessage::Leave {
+        seq: 1,
+        to: sim.id(MAC),
+        entry: EntryPoint {
+            display_id: 1,
+            edge: Edge::Right,
+            position: Point::new(1511.0, 491.0),
+        },
+    };
+    assert_eq!(
+        actions_since(&sim, PC, start),
+        vec![
+            Action::Send {
+                to: sim.id(MAC),
+                msg: leave
+            },
+            Action::ReleaseAllInjected,
+            Action::ConcealCursor,
+            Action::Notify(Notice::SessionEnded {
+                peer: sim.id(MAC),
+                reason: EndReason::CursorLeft
+            }),
+        ]
+    );
+    assert!(sim.dev[PC].concealed);
+    assert_eq!(
+        sim.cursor(PC),
+        Point::new(1.0, 432.0),
+        "hidden where it was"
+    );
+    // The cursor the user follows is back on the Mac, shown.
+    assert!(!sim.dev[MAC].concealed);
+    assert_eq!(sim.cursor(MAC), Point::new(1511.0, 491.0));
+
+    // Neither time nor typing on the PC shows it: typing needs no pointer.
+    sim.advance(5_000);
+    sim.tap(PC, KEY_A);
+    sim.key(PC, KeyCode::LEFT_SHIFT, true);
+    sim.key(PC, KeyCode::LEFT_SHIFT, false);
+    assert!(sim.dev[PC].concealed);
+    // The PC's own mouse does, before anything else.
+    let start = sim.dev[PC].log.len();
+    sim.motion(PC, 5.0, 0.0);
+    assert_eq!(actions_since(&sim, PC, start), vec![Action::RevealCursor]);
+    assert!(!sim.dev[PC].concealed);
+    assert_eq!(sim.cursor(PC), Point::new(6.0, 432.0));
+}
+
+#[test]
+fn a_click_or_scrolling_on_the_pc_shows_its_cursor_too() {
+    let mut sim = Sim::mac_and_pc();
+    cross_and_come_back(&mut sim);
+    let start = sim.dev[PC].log.len();
+    sim.button(PC, MouseButton::Left, true);
+    assert_eq!(actions_since(&sim, PC, start), vec![Action::RevealCursor]);
+    assert!(!sim.dev[PC].concealed);
+    sim.button(PC, MouseButton::Left, false);
+
+    let mut sim = Sim::mac_and_pc();
+    cross_and_come_back(&mut sim);
+    let start = sim.dev[PC].log.len();
+    sim.scroll(PC, -3.0);
+    assert_eq!(actions_since(&sim, PC, start), vec![Action::RevealCursor]);
+    assert!(!sim.dev[PC].concealed);
+}
+
+#[test]
+fn crossing_again_shows_the_pc_cursor_before_moving_it() {
+    let mut sim = Sim::mac_and_pc();
+    cross_and_come_back(&mut sim);
+    let start = sim.dev[PC].log.len();
+    sim.motion(MAC, 5.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), controlling(&sim, 3));
+    assert_eq!(sim.state(PC), controlled(&sim, 3));
+    assert_eq!(
+        actions_since(&sim, PC, start),
+        vec![
+            Action::RevealCursor,
+            Action::ReleaseAllInjected,
+            Action::MoveCursorTo {
+                to: Point::new(1.0, 432.0)
+            },
+            Action::Send {
+                to: sim.id(MAC),
+                msg: CoreMessage::EnterAck { seq: 3 }
+            },
+            Action::Notify(Notice::ControlledBy { peer: sim.id(MAC) }),
+        ]
+    );
+    assert!(!sim.dev[PC].concealed);
+}
+
+#[test]
+fn the_mac_hides_its_cursor_when_the_pc_drives_it_back_out() {
+    let mut sim = Sim::mac_and_pc();
+    sim.motion(PC, -2000.0, 0.0);
+    sim.settle();
+    let by_pc = State::Controlled {
+        by: sim.id(PC),
+        seq: 2,
+    };
+    assert_eq!(sim.state(MAC), by_pc);
+    assert_eq!(sim.cursor(MAC), Point::new(1511.0, 491.0));
+    // The PC's mouse pushes the Mac's cursor back out through its right edge.
+    sim.motion(PC, 300.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), State::Idle);
+    assert_eq!(sim.state(PC), State::Idle);
+    assert!(ended(&sim, MAC, EndReason::CursorLeft));
+    assert!(sim.dev[MAC].concealed, "hidden at the Mac's right edge");
+    assert!(!sim.dev[PC].concealed, "back on the PC, shown");
+    // The Mac's trackpad shows it again.
+    sim.motion(MAC, -10.0, 0.0);
+    assert!(!sim.dev[MAC].concealed);
+}
+
+/// A take-back, a release, a timeout, a disconnect, a stall or a replaced
+/// session is not the cursor visibly leaving, and failing open favours a
+/// visible cursor.
+#[test]
+fn only_the_cursor_leaving_through_an_edge_hides_it() {
+    /// Ends the session the Mac started with the PC.
+    type End = fn(&mut Sim);
+    let endings: [(EndReason, End); 6] = [
+        (EndReason::TakenBack, |sim| sim.motion(PC, 5.0, 0.0)),
+        (EndReason::Released, |sim| sim.chord(MAC)),
+        (EndReason::PeerTimeout, |sim| {
+            sim.net.blackhole = [true, true];
+            sim.advance(2_000);
+            sim.heal();
+        }),
+        (EndReason::Disconnected, |sim| sim.disconnect()),
+        (EndReason::Stalled, |sim| {
+            sim.stall(PC);
+        }),
+        // The chord's Release is lost, so the next crossing replaces the
+        // session the PC still believes in.
+        (EndReason::Superseded, |sim| {
+            sim.net.blackhole[PC] = true;
+            sim.chord(MAC);
+            sim.net.blackhole[PC] = false;
+            sim.motion(MAC, -3.0, 0.0);
+            sim.motion(MAC, 20.0, 0.0);
+        }),
+    ];
+    for (reason, end) in endings {
+        let mut sim = Sim::mac_and_pc();
+        cross_mac_to_pc(&mut sim);
+        end(&mut sim);
+        sim.settle();
+        assert!(ended(&sim, PC, reason), "{reason:?}");
+        let pc = &sim.dev[PC];
+        assert!(!pc.concealed, "{reason:?}");
+        assert!(
+            pc.log.iter().all(|(_, a)| *a != Action::ConcealCursor),
+            "{reason:?}"
+        );
+    }
+}
+
+#[test]
+fn a_stall_on_the_pc_shows_its_hidden_cursor() {
+    let mut sim = Sim::mac_and_pc();
+    cross_and_come_back(&mut sim);
+    // Hop can no longer vouch for the PC's input, so it leaves nothing
+    // hidden.
+    assert_eq!(sim.stall(PC), vec![Action::RevealCursor]);
+    assert!(!sim.dev[PC].concealed);
+    // The simulation checks that a second one acts exactly like a tick.
+    assert_eq!(sim.stall(PC), vec![]);
+}
+
+/// The user is at the Mac when the connection drops, so the PC's cursor stays
+/// hidden until the PC's own mouse is used or the Mac enters it again.
+#[test]
+fn a_dropped_connection_leaves_the_pc_cursor_hidden() {
+    let mut sim = Sim::mac_and_pc();
+    cross_and_come_back(&mut sim);
+    sim.disconnect();
+    sim.reconnect();
+    assert!(sim.dev[PC].concealed);
+    sim.motion(MAC, 5.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(PC), controlled(&sim, 3));
+    assert!(!sim.dev[PC].concealed);
+}
+
+// ----- nudges (docs/M4-M5-DESIGN.md, section 1) ------------------------------
+
+#[test]
+fn heading_for_the_pc_nudges_it_at_most_every_200_ms() {
+    let mut sim = Sim::mac_and_pc();
+    // From the middle of the Mac's screen (x 756) toward its right edge
+    // (x 1512), which leads to the PC: nothing while more than 300 units
+    // away.
+    sim.motion(MAC, 400.0, 0.0);
+    assert_eq!(sim.cursor(MAC), Point::new(1156.0, 491.0));
+    assert!(sim.dev[MAC].nudges.is_empty());
+    let start = sim.dev[MAC].log.len();
+    sim.motion(MAC, 56.0, 0.0);
+    assert_eq!(
+        actions_since(&sim, MAC, start),
+        vec![Action::Nudge { to: sim.id(PC) }],
+        "300 units away"
+    );
+    // The next one waits 200 ms, however far the cursor goes meanwhile.
+    sim.motion(MAC, 100.0, 20.0);
+    sim.advance(199);
+    sim.motion(MAC, 10.0, 0.0);
+    assert_eq!(sim.dev[MAC].nudges, vec![0]);
+    sim.advance(1);
+    sim.motion(MAC, 10.0, 0.0);
+    assert_eq!(sim.dev[MAC].nudges, vec![0, 200]);
+    // The push that crosses sends the Enter, not a nudge.
+    sim.advance(500);
+    sim.motion(MAC, 500.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), controlling(&sim, 1));
+    // While the Mac drives the PC its motion is the PC's: no nudges.
+    sim.motion(MAC, 300.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.dev[MAC].nudges, vec![0, 200]);
+    assert!(sim.dev[PC].nudges.is_empty());
+}
+
+#[test]
+fn heading_for_the_mac_nudges_it_from_the_pc() {
+    let mut sim = Sim::mac_and_pc();
+    // From the middle of the PC's screen (x 768) to 268 units from its left
+    // edge.
+    sim.motion(PC, -500.0, 0.0);
+    assert_eq!(sim.dev[PC].nudges, vec![0]);
+    assert!(sim.dev[MAC].nudges.is_empty());
+}
+
+#[test]
+fn moving_away_along_or_far_from_the_shared_edge_does_not_nudge() {
+    let mut sim = Sim::mac_and_pc();
+    // Straight for the edge, but 656 units from it.
+    sim.motion(MAC, 100.0, 0.0);
+    assert!(sim.dev[MAC].nudges.is_empty(), "too far");
+    sim.motion(MAC, 544.0, 0.0);
+    assert_eq!(sim.cursor(MAC), Point::new(1400.0, 491.0));
+    assert_eq!(sim.dev[MAC].nudges.len(), 1);
+    // Long after that nudge, near the edge: away from it, along it, and
+    // toward it from a corner dead zone, where it leads nowhere.
+    sim.advance(1000);
+    sim.motion(MAC, -10.0, 0.0);
+    sim.motion(MAC, 0.0, 40.0);
+    sim.motion(MAC, 0.0, -526.0);
+    assert_eq!(sim.cursor(MAC), Point::new(1390.0, 5.0));
+    sim.motion(MAC, 10.0, 0.0);
+    assert_eq!(sim.dev[MAC].nudges.len(), 1);
+    // Level with the shared part of the edge again and heading for it.
+    sim.motion(MAC, 10.0, 100.0);
+    assert_eq!(sim.dev[MAC].nudges.len(), 2);
+}
+
+#[test]
+fn a_pc_that_cannot_be_reached_is_not_nudged() {
+    let mut sim = Sim::mac_and_pc();
+    sim.disconnect();
+    sim.motion(MAC, 600.0, 0.0);
+    sim.advance(300);
+    sim.motion(MAC, 100.0, 0.0);
+    assert!(sim.dev[MAC].nudges.is_empty(), "disconnected");
+    // Once it is back, heading for it nudges it again.
+    sim.reconnect();
+    sim.motion(MAC, 10.0, 0.0);
+    assert_eq!(sim.dev[MAC].nudges.len(), 1);
+
+    // Connected, but with displays the Mac refused: no edge leads to it.
+    let mut sim = Sim::mac_and_pc();
+    let peer = sim.id(PC);
+    sim.handle(
+        MAC,
+        Event::PeerConnected {
+            peer,
+            os: Os::Windows,
+            displays: vec![display(1, f64::NAN, 0.0, 10.0, 10.0, 1.0)],
+        },
+    );
+    sim.motion(MAC, 600.0, 0.0);
+    assert!(sim.dev[MAC].nudges.is_empty(), "refused displays");
+}
+
+#[test]
+fn a_nudge_distance_of_0_turns_nudges_off() {
+    let mut sim = Sim::with_core(CoreConfig {
+        nudge_distance: 0.0,
+        ..CoreConfig::default()
+    });
+    // Up to the Mac's last column and the PC's first one, right on its left
+    // edge line.
+    for _ in 0..5 {
+        sim.motion(MAC, 151.0, 0.0);
+        sim.advance(250);
+    }
+    assert_eq!(sim.cursor(MAC), Point::new(1511.0, 491.0));
+    sim.motion(PC, -768.0, 0.0);
+    assert_eq!(sim.cursor(PC), Point::new(0.0, 432.0));
+    assert!(sim.dev[MAC].nudges.is_empty() && sim.dev[PC].nudges.is_empty());
+    // Crossing works as ever.
+    sim.motion(MAC, 5.0, 0.0);
+    sim.settle();
+    assert_eq!(sim.state(MAC), controlling(&sim, 1));
+}
+
+#[test]
+fn nudges_follow_the_shared_edge_when_a_monitor_is_plugged_in_and_out() {
+    let mut sim = Sim::mac_and_pc();
+    // A 1920-wide monitor centered above the laptop: only its right edge
+    // (x 1716) leads to the PC now, as in
+    // `plugging_in_a_monitor_moves_the_shared_edge`.
+    let monitor = display(2, -204.0, -1080.0, 1920.0, 1080.0, 1.0);
+    sim.set_displays(MAC, vec![mac_laptop(), monitor]);
+    sim.motion(MAC, 700.0, 0.0);
+    assert_eq!(sim.cursor(MAC), Point::new(1456.0, 491.0));
+    assert!(
+        sim.dev[MAC].nudges.is_empty(),
+        "the laptop's edge is a wall"
+    );
+    sim.motion(MAC, 0.0, -1031.0);
+    sim.motion(MAC, 10.0, 0.0);
+    assert_eq!(sim.cursor(MAC), Point::new(1466.0, -540.0));
+    assert_eq!(sim.dev[MAC].nudges.len(), 1, "250 units from the monitor's");
+    // Unplugged again: the laptop's edge leads to the PC once more.
+    sim.set_displays(MAC, vec![mac_laptop()]);
+    assert_eq!(sim.cursor(MAC), Point::new(1466.0, 0.0));
+    sim.advance(1000);
+    sim.motion(MAC, 0.0, 100.0);
+    sim.motion(MAC, 10.0, 0.0);
+    assert_eq!(sim.dev[MAC].nudges.len(), 2);
+}

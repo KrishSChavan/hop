@@ -22,13 +22,28 @@
 //! key the user keeps holding through a stall is not carried to the peer at
 //! the next crossing: lost, never stuck. The simulation tracks those keys and
 //! checks that no `Enter` ever carries one.
+//!
+//! It also follows the cursor a session leaves behind (docs/M4-M5-DESIGN.md,
+//! section 2): it checks that a device hides its cursor exactly when it was
+//! controlled and the cursor left it through an edge, that the cursor is
+//! hidden only while idle, that it is shown again first thing on that
+//! device's own pointer input (never on keys), and that it is never moved or
+//! parked while hidden. And it checks every nudge (section 1) against the
+//! rule itself: each physical motion must nudge the peer exactly when it
+//! stays on screen while idle, heads for an edge that leads to the peer
+//! ([`Core::edges_toward`], computed afresh) and ends within
+//! `nudge_distance` of it, at least `nudge_interval_ms` after the last
+//! nudge. The configured nudge values must already be sane, as the defaults
+//! are.
 
 // Each test binary uses a different subset of the helpers.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 
-use hop_core::{Action, CaptureMode, Core, CoreConfig, Event, Layout, Millis, Notice, State};
+use hop_core::{
+    Action, CaptureMode, Core, CoreConfig, EndReason, Event, Layout, Millis, Notice, State,
+};
 use hop_types::{
     CoreMessage, DeviceId, DisplayInfo, Edge, InputEvent, KeyCode, MouseButton, Os, Point, Rect,
     ScrollUnit,
@@ -122,6 +137,9 @@ pub struct Device {
     pub displays: Vec<DisplayInfo>,
     pub cursor: Point,
     pub parked: bool,
+    /// Hidden where a session left it (`ConcealCursor`), until
+    /// `RevealCursor`.
+    pub concealed: bool,
     pub capture: CaptureMode,
     pub injected: Vec<Injected>,
     /// Keys and buttons injected for the peer and not released yet.
@@ -150,6 +168,11 @@ pub struct Device {
     /// The state each `LocalStall` found this device in.
     pub stalls: Vec<State>,
     pub release_all: usize,
+    /// When each nudge to the peer went out.
+    pub nudges: Vec<Millis>,
+    /// What showed the hidden cursor again, each time: "pointer input", "an
+    /// Enter" or "a stall".
+    pub reveals: Vec<&'static str>,
     pub notices: Vec<Notice>,
     pub sent: Vec<(Millis, CoreMessage)>,
     /// Every action, for determinism checks.
@@ -391,6 +414,7 @@ impl Sim {
                 displays: mine.to_vec(),
                 cursor: start,
                 parked: false,
+                concealed: false,
                 capture: CaptureMode::Passive,
                 injected: Vec::new(),
                 remote_keys: BTreeSet::new(),
@@ -404,6 +428,8 @@ impl Sim {
                 unheard: BTreeSet::new(),
                 stalls: Vec::new(),
                 release_all: 0,
+                nudges: Vec::new(),
+                reveals: Vec::new(),
                 notices: Vec::new(),
                 sent: Vec::new(),
                 log: Vec::new(),
@@ -558,6 +584,7 @@ impl Sim {
             .emergency_chord
             .is_completed_by(&event, &dev.physical_keys);
         let before = dev.core.state();
+        let was_concealed = dev.concealed;
         let actions = self.handle(
             d,
             Event::LocalInput {
@@ -566,12 +593,26 @@ impl Sim {
                 physical: true,
             },
         );
+        // This device's own pointer shows a hidden cursor; keys and button
+        // releases never change whether it is hidden.
+        let concealed = self.dev[d].concealed;
+        let at = self.now;
+        match event {
+            InputEvent::PointerMotion { .. }
+            | InputEvent::Button { pressed: true, .. }
+            | InputEvent::Scroll { .. } => {
+                assert!(!concealed, "{event:?} left the cursor hidden at t={at}");
+            }
+            InputEvent::Key { .. } | InputEvent::Button { pressed: false, .. } => assert_eq!(
+                concealed, was_concealed,
+                "{event:?} changed the hidden cursor at t={at}: {actions:?}"
+            ),
+        }
         // Rule 9: the chord ends a crossing or session at once, tells the
         // peer, and its last key never reaches the peer.
         if let (true, State::Entering { seq, .. } | State::Controlling { seq, .. }) =
             (chord, &before)
         {
-            let at = self.now;
             assert_eq!(self.state(d), State::Idle, "chord at t={at}");
             assert!(
                 actions.iter().any(|a| matches!(a,
@@ -615,9 +656,10 @@ impl Sim {
     /// Checks that any session ends at once and that the peer is told, as
     /// for the emergency chord; that the only local injections are key-ups
     /// for what the injector held for local apps (modifiers pressed again
-    /// when the cursor came home), so nothing is left in the injector; and
-    /// that with no session and no key believed held the stall acts exactly
-    /// like a plain `Tick`.
+    /// when the cursor came home), so nothing is left in the injector; that
+    /// a hidden cursor is shown again; and that with no session, no key
+    /// believed held and no hidden cursor the stall acts exactly like a
+    /// plain `Tick`.
     pub fn stall(&mut self, d: usize) -> Vec<Action> {
         let before = self.state(d);
         let dev = &self.dev[d];
@@ -637,7 +679,7 @@ impl Sim {
             .chain(&dev.unheard)
             .copied()
             .collect();
-        let twin = (before == State::Idle && believed.is_empty()).then(|| {
+        let twin = (before == State::Idle && believed.is_empty() && !dev.concealed).then(|| {
             let mut twin = dev.core.clone();
             let actions = twin.handle(self.now, Event::Tick);
             (twin, actions)
@@ -695,6 +737,7 @@ impl Sim {
             dev.injector_keys,
             ctx()
         );
+        assert!(!dev.concealed, "the cursor is still hidden, {}", ctx());
         if let Some((twin, expected)) = twin {
             assert_eq!(actions, expected, "an idle stall acted, {}", ctx());
             assert_eq!(
@@ -862,9 +905,47 @@ impl Sim {
     /// Feeds one event to device `d`'s core, carries out the actions and
     /// checks the invariants.
     pub fn handle(&mut self, d: usize, event: Event) -> Vec<Action> {
+        let motion = match event {
+            Event::LocalInput {
+                event: InputEvent::PointerMotion { dx, dy },
+                cursor,
+                physical: true,
+            } => Some((cursor, dx, dy)),
+            _ => None,
+        };
+        // Timers fire before the event is applied, so a motion meets the
+        // core in the state a plain tick would leave it in.
+        let idle_at_motion = motion.is_some() && {
+            let mut twin = self.dev[d].core.clone();
+            twin.handle(self.now, Event::Tick);
+            twin.state() == State::Idle
+        };
+        // The only things that may show a hidden cursor again (which input
+        // counts is checked in `physical`).
+        let reveal_cause = match event {
+            Event::LocalInput { physical: true, .. } => Some("pointer input"),
+            Event::PeerMessage {
+                msg: CoreMessage::Enter { .. },
+                ..
+            } => Some("an Enter"),
+            Event::LocalStall => Some("a stall"),
+            _ => None,
+        };
         let before = self.dev[d].core.state();
         let actions = self.dev[d].core.handle(self.now, event);
         let after = self.dev[d].core.state();
+        // Decided before `apply` records this event's nudge.
+        let nudge_due = idle_at_motion && motion.is_some_and(|m| self.nudge_due(d, m));
+        if actions.contains(&Action::RevealCursor) {
+            let at = self.now;
+            let cause = reveal_cause.unwrap_or_else(|| {
+                panic!(
+                    "{} showed its cursor at t={at}: {actions:#?}",
+                    self.dev[d].id
+                )
+            });
+            self.dev[d].reveals.push(cause);
+        }
         self.apply(d, &actions, &after);
         let me = &self.dev[d].id;
         let session = session_key(me, &after);
@@ -872,8 +953,55 @@ impl Sim {
             self.session_start[d] = self.now;
         }
         self.check(d, &before, &after, &actions);
+        let nudges = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Nudge { .. }))
+            .count();
+        assert_eq!(
+            nudges,
+            usize::from(nudge_due),
+            "{} at t={} after {motion:?}: {actions:#?}",
+            self.dev[d].id,
+            self.now
+        );
         self.check_remote_keys();
         actions
+    }
+
+    /// The nudge rule (docs/M4-M5-DESIGN.md, section 1), worked out here
+    /// independently of the core: whether device `d`, idle, must nudge its
+    /// peer for a physical motion by `(dx, dy)` from `from`. It must when
+    /// the motion stays on screen, moves outward through an edge that leads
+    /// to the peer, ends on that edge's display beside the part that leads
+    /// there and within `nudge_distance` of the edge line, and comes at
+    /// least `nudge_interval_ms` after the last nudge.
+    fn nudge_due(&self, d: usize, (from, dx, dy): (Point, f64, f64)) -> bool {
+        let dev = &self.dev[d];
+        let reach = self.config.core.nudge_distance;
+        let to = Point::new(from.x + dx, from.y + dy);
+        if reach <= 0.0 || !dev.on_screen(to) {
+            return false;
+        }
+        let rested = dev
+            .nudges
+            .last()
+            .is_none_or(|&last| self.now - last >= self.config.core.nudge_interval_ms);
+        let peer = &self.dev[1 - d].id;
+        rested
+            && dev.core.edges_toward(peer).iter().any(|part| {
+                let frame = part.frame;
+                let (outward, along, gap) = match part.edge {
+                    Edge::Left => (-dx, to.y, to.x - frame.min_x()),
+                    Edge::Right => (dx, to.y, frame.max_x() - to.x),
+                    Edge::Top => (-dy, to.x, to.y - frame.min_y()),
+                    Edge::Bottom => (dy, to.x, frame.max_y() - to.y),
+                };
+                outward > 0.0
+                    && frame.contains(to)
+                    && part.start <= along
+                    && along <= part.end
+                    && gap <= reach
+            })
     }
 
     /// Carries out `actions` of device `d`, whose core is now in `after`.
@@ -925,7 +1053,11 @@ impl Sim {
                     self.net.send(now, 1 - d, msg.clone(), session);
                 }
                 Action::SetCaptureMode(mode) => self.dev[d].capture = *mode,
-                Action::ParkCursor => self.dev[d].parked = true,
+                Action::ParkCursor => {
+                    let dev = &mut self.dev[d];
+                    assert!(!dev.concealed, "parked a hidden cursor at t={now}");
+                    dev.parked = true;
+                }
                 Action::RestoreCursor { at } => {
                     let dev = &mut self.dev[d];
                     dev.cursor = *at;
@@ -933,7 +1065,29 @@ impl Sim {
                 }
                 Action::MoveCursorTo { to } => {
                     assert!(controlled, "MoveCursorTo while {after:?} at t={now}");
-                    self.dev[d].cursor = *to;
+                    let dev = &mut self.dev[d];
+                    assert!(!dev.concealed, "moved a hidden cursor at t={now}");
+                    dev.cursor = *to;
+                }
+                Action::ConcealCursor => {
+                    let dev = &mut self.dev[d];
+                    assert_eq!(*after, State::Idle, "ConcealCursor at t={now}");
+                    assert!(
+                        !dev.parked && !dev.concealed,
+                        "ConcealCursor on a parked or hidden cursor at t={now}"
+                    );
+                    dev.concealed = true;
+                }
+                Action::RevealCursor => {
+                    let dev = &mut self.dev[d];
+                    assert!(dev.concealed, "RevealCursor with nothing hidden at t={now}");
+                    dev.concealed = false;
+                }
+                Action::Nudge { to } => {
+                    assert_eq!(*after, State::Idle, "Nudge at t={now}");
+                    assert_eq!(*to, self.dev[1 - d].id, "only the peer exists");
+                    assert!(self.net.connected, "nudged a disconnected peer at t={now}");
+                    self.dev[d].nudges.push(now);
                 }
                 Action::Inject { event, source_os } => {
                     let dev = &mut self.dev[d];
@@ -978,9 +1132,6 @@ impl Sim {
                     }
                 }
                 Action::Notify(notice) => self.dev[d].notices.push(notice.clone()),
-                // Recorded in `log` above; nothing simulated depends on
-                // them yet.
-                Action::ConcealCursor | Action::RevealCursor | Action::Nudge { .. } => {}
             }
         }
     }
@@ -1009,6 +1160,63 @@ impl Sim {
                 ctx()
             );
         }
+
+        // The cursor a session leaves behind is hidden only while idle ...
+        assert!(
+            !dev.concealed || *after == State::Idle,
+            "cursor hidden while {after:?}, {}",
+            ctx()
+        );
+        // ... exactly when this device was controlled and the cursor left it
+        // through an edge, after the Leave and ReleaseAllInjected and before
+        // the notice ...
+        let left_here = matches!(before, State::Controlled { .. })
+            && actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::Notify(Notice::SessionEnded {
+                        reason: EndReason::CursorLeft,
+                        ..
+                    })
+                )
+            });
+        let conceals: Vec<usize> = (0..actions.len())
+            .filter(|&i| actions[i] == Action::ConcealCursor)
+            .collect();
+        assert_eq!(conceals.len(), usize::from(left_here), "hiding, {}", ctx());
+        if let [conceal] = conceals[..] {
+            let leave = actions.iter().position(|a| {
+                matches!(
+                    a,
+                    Action::Send {
+                        msg: CoreMessage::Leave { .. },
+                        ..
+                    }
+                )
+            });
+            let released = actions
+                .iter()
+                .position(|a| *a == Action::ReleaseAllInjected);
+            let notice = actions
+                .iter()
+                .position(|a| matches!(a, Action::Notify(Notice::SessionEnded { .. })));
+            assert!(
+                matches!((leave, released, notice),
+                    (Some(l), Some(r), Some(n)) if l < r && r < conceal && conceal < n),
+                "ConcealCursor out of order, {}",
+                ctx()
+            );
+        }
+        // ... and shown again first thing in a list, once.
+        let reveals = actions
+            .iter()
+            .filter(|a| **a == Action::RevealCursor)
+            .count();
+        assert!(
+            reveals == 0 || (reveals == 1 && actions[0] == Action::RevealCursor),
+            "RevealCursor not first, {}",
+            ctx()
+        );
 
         // Two devices never control each other at the same time.
         let (mac, pc) = (self.state(MAC), self.state(PC));

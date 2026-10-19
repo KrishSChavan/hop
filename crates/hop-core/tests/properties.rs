@@ -5,9 +5,12 @@
 //! messages, the emergency chord, a monitor plugged in and out, and the
 //! agent reporting a stall (`LocalStall`), sometimes after losing a key-up.
 //! The simulation (see `sim`) checks the spec's invariants after every event,
-//! including that messages from stale sessions change nothing and that no
-//! key or button is left stuck on either side; these tests add made-up stale
-//! messages, eventual agreement once input stops, and determinism.
+//! including that messages from stale sessions change nothing, that no key or
+//! button is left stuck on either side, that the cursor a session leaves
+//! behind is hidden and shown again exactly as docs/M4-M5-DESIGN.md says, and
+//! that each motion nudges the peer exactly when the nudge rule says so; these
+//! tests add made-up stale messages, eventual agreement once input stops, and
+//! determinism.
 
 mod sim;
 
@@ -432,8 +435,11 @@ proptest! {
 /// Guards against a vacuous property test: random runs from a fixed seed
 /// must start sessions in both directions, bring the cursor back through the
 /// edge from both sides, press buttons on both sides for the peer (drags that
-/// block exits), stall in every role, and reach every common kind of session
-/// ending, each several times.
+/// block exits), stall in every role, reach every common kind of session
+/// ending, and on both sides hide the cursor left behind, show it again for
+/// each reason there is (pointer input, a peer entering, a stall) and nudge
+/// the peer, so the simulation's checks of all that do run, each several
+/// times.
 ///
 /// The other endings are left to targeted tests because random runs reach
 /// them too rarely to count on, or not at all: `Superseded` and
@@ -478,6 +484,8 @@ fn random_runs_exercise_every_kind_of_ending() {
                         event: InputEvent::Button { pressed: true, .. },
                         source_os,
                     } if *source_os != dev.os => format!("button for the peer on {}", dev.id),
+                    Action::ConcealCursor => format!("ConcealCursor on {}", dev.id),
+                    Action::Nudge { .. } => format!("Nudge from {}", dev.id),
                     _ => continue,
                 };
                 *counts.entry(name).or_default() += 1;
@@ -490,6 +498,11 @@ fn random_runs_exercise_every_kind_of_ending() {
                 };
                 *counts
                     .entry(format!("LocalStall while {role}"))
+                    .or_default() += 1;
+            }
+            for cause in &dev.reveals {
+                *counts
+                    .entry(format!("RevealCursor on {} after {cause}", dev.id))
                     .or_default() += 1;
             }
         }
@@ -515,6 +528,11 @@ fn random_runs_exercise_every_kind_of_ending() {
             format!("ControlStarted by {id}"),
             format!("Leave from {id}"),
             format!("button for the peer on {id}"),
+            format!("ConcealCursor on {id}"),
+            format!("RevealCursor on {id} after pointer input"),
+            format!("RevealCursor on {id} after an Enter"),
+            format!("RevealCursor on {id} after a stall"),
+            format!("Nudge from {id}"),
         ]
     });
     for name in names.chain(per_device) {

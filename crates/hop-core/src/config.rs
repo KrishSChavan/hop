@@ -10,9 +10,10 @@ use crate::chord::Chord;
 /// these numbers blindly: [`Core::new`](crate::Core::new) replaces any value it
 /// cannot use (a negative or non-finite distance, a pointer speed that is not
 /// positive, a timeout or heartbeat interval of zero, an empty input buffer)
-/// with its default, and shortens a heartbeat interval longer than a third of
-/// the peer timeout, so a bad config file can never make it panic or
-/// misbehave.
+/// with its default, shortens a heartbeat interval longer than a third of the
+/// peer timeout, caps the nudge distance at 5000 units and keeps the nudge
+/// interval between 50 ms and 10 s, so a bad config file can never make it
+/// panic or misbehave.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoreConfig {
     /// How long the cursor must keep pushing against an edge before it
@@ -42,6 +43,15 @@ pub struct CoreConfig {
     pub enter_buffer_limit: usize,
     /// The emergency chord that ends a session from the controller.
     pub emergency_chord: Chord,
+    /// While idle, a connected peer is nudged
+    /// ([`Action::Nudge`](crate::Action::Nudge)) when this device's own
+    /// pointer heads for an edge that leads to it and ends at most this many
+    /// units from that edge, so the peer's Wi-Fi radio is awake by the time
+    /// the cursor crosses. 0 turns nudges off; at most 5000.
+    pub nudge_distance: f64,
+    /// The shortest time between two nudges to the same peer, in
+    /// milliseconds: 50 to 10,000.
+    pub nudge_interval_ms: Millis,
 }
 
 impl CoreConfig {
@@ -63,6 +73,20 @@ impl CoreConfig {
     pub const DEFAULT_PEER_TIMEOUT_MS: Millis = 1500;
     /// The default size of the input buffer used while entering.
     pub const DEFAULT_ENTER_BUFFER_LIMIT: usize = 64;
+    /// The default nudge distance, in logical units.
+    pub const DEFAULT_NUDGE_DISTANCE: f64 = 300.0;
+    /// The default time between two nudges to the same peer.
+    pub const DEFAULT_NUDGE_INTERVAL_MS: Millis = 200;
+
+    /// Farther than any real screen is wide: beyond this, every motion
+    /// toward the peer's side would nudge it.
+    const MAX_NUDGE_DISTANCE: f64 = 5000.0;
+    /// Nudges are tiny, but more than 20 a second would only add traffic in
+    /// front of the crossing they are meant to speed up.
+    const MIN_NUDGE_INTERVAL_MS: Millis = 50;
+    /// Beyond this, nudges are so rare that a radio dozes off again long
+    /// before the next one, while the cursor lingers near the edge.
+    const MAX_NUDGE_INTERVAL_MS: Millis = 10_000;
 
     /// This config with every unusable value replaced by its default.
     pub(crate) fn sanitized(mut self) -> Self {
@@ -78,6 +102,11 @@ impl CoreConfig {
             distance(self.adjacency_tolerance, Self::DEFAULT_ADJACENCY_TOLERANCE);
         self.takeback_threshold =
             distance(self.takeback_threshold, Self::DEFAULT_TAKEBACK_THRESHOLD);
+        self.nudge_distance = distance(self.nudge_distance, Self::DEFAULT_NUDGE_DISTANCE)
+            .min(Self::MAX_NUDGE_DISTANCE);
+        self.nudge_interval_ms = self
+            .nudge_interval_ms
+            .clamp(Self::MIN_NUDGE_INTERVAL_MS, Self::MAX_NUDGE_INTERVAL_MS);
         if !(self.pointer_speed.is_finite() && self.pointer_speed > 0.0) {
             self.pointer_speed = Self::DEFAULT_POINTER_SPEED;
         }
@@ -123,6 +152,8 @@ impl Default for CoreConfig {
             peer_timeout_ms: Self::DEFAULT_PEER_TIMEOUT_MS,
             enter_buffer_limit: Self::DEFAULT_ENTER_BUFFER_LIMIT,
             emergency_chord: Chord::default(),
+            nudge_distance: Self::DEFAULT_NUDGE_DISTANCE,
+            nudge_interval_ms: Self::DEFAULT_NUDGE_INTERVAL_MS,
         }
     }
 }
@@ -140,6 +171,9 @@ mod tests {
         assert_eq!(c.takeback_threshold, 4.0);
         assert_eq!(c.enter_buffer_limit, 64);
         assert_eq!(c.edge_delay_ms, 0);
+        // docs/M4-M5-DESIGN.md, section 1.
+        assert_eq!(c.nudge_distance, 300.0);
+        assert_eq!(c.nudge_interval_ms, 200);
     }
 
     #[test]
@@ -153,10 +187,41 @@ mod tests {
             enter_timeout_ms: 0,
             heartbeat_interval_ms: 0,
             peer_timeout_ms: 0,
+            nudge_distance: f64::NAN,
             ..CoreConfig::default()
         }
         .sanitized();
         assert_eq!(c, CoreConfig::default());
+    }
+
+    #[test]
+    fn sanitizing_keeps_nudges_sane() {
+        let nudges = |distance: f64, interval: Millis| {
+            let c = CoreConfig {
+                nudge_distance: distance,
+                nudge_interval_ms: interval,
+                ..CoreConfig::default()
+            }
+            .sanitized();
+            (c.nudge_distance, c.nudge_interval_ms)
+        };
+        // A distance the core cannot use falls back to the default, and an
+        // absurd one is capped.
+        for unusable in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.5] {
+            assert_eq!(nudges(unusable, 200), (300.0, 200), "{unusable}");
+        }
+        assert_eq!(nudges(1e9, 200), (5000.0, 200));
+        assert_eq!(nudges(5000.0, 200), (5000.0, 200));
+        // 0 turns nudges off, so it stays.
+        assert_eq!(nudges(0.0, 200), (0.0, 200));
+        assert_eq!(nudges(42.5, 200), (42.5, 200));
+        // The interval stays between 50 ms and 10 s.
+        assert_eq!(nudges(300.0, 0), (300.0, 50));
+        assert_eq!(nudges(300.0, 49), (300.0, 50));
+        assert_eq!(nudges(300.0, 50), (300.0, 50));
+        assert_eq!(nudges(300.0, 10_000), (300.0, 10_000));
+        assert_eq!(nudges(300.0, 10_001), (300.0, 10_000));
+        assert_eq!(nudges(300.0, Millis::MAX), (300.0, 10_000));
     }
 
     #[test]
@@ -194,6 +259,8 @@ mod tests {
             corner_dead_zone: 0.0,
             pointer_speed: 2.5,
             edge_delay_ms: 150,
+            nudge_distance: 0.0,
+            nudge_interval_ms: 1000,
             ..CoreConfig::default()
         };
         assert_eq!(c.clone().sanitized(), c);

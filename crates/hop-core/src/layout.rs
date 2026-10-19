@@ -127,6 +127,35 @@ pub struct SharedEdge {
     pub end: f64,
 }
 
+impl SharedEdge {
+    /// Whether a pointer motion by `(dx, dy)` that ends at `to` (both in the
+    /// same coordinates as the edge) heads for this part of the edge and
+    /// ends near it: it moves toward the edge (its component along the
+    /// edge's outward normal is positive), and `to` lies on the edge's
+    /// display, within the part's span (ends included) and at most `reach`
+    /// from the edge line. Anything non-finite never counts. The nudge rule
+    /// of [`Action::Nudge`](crate::Action::Nudge).
+    pub(crate) fn is_approached(&self, to: Point, dx: f64, dy: f64, reach: f64) -> bool {
+        let outward = match self.edge {
+            Edge::Left => -dx,
+            Edge::Right => dx,
+            Edge::Top => -dy,
+            Edge::Bottom => dy,
+        };
+        let (along, across) = if self.edge.is_vertical() {
+            (to.y, to.x)
+        } else {
+            (to.x, to.y)
+        };
+        // Every comparison is false for NaN.
+        outward > 0.0
+            && self.frame.contains(to)
+            && self.start <= along
+            && along <= self.end
+            && (self.frame.edge_line(self.edge) - across).abs() <= reach
+    }
+}
+
 /// A device placed by [`Layout::two_devices`]: flush against `side` of the
 /// device `of`, and re-placed whenever either one's displays change.
 #[derive(Clone, Debug, PartialEq)]
@@ -1130,6 +1159,63 @@ mod tests {
         // A dead zone that covers the whole edge leaves nothing.
         assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 400.0), []);
         assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 500.0), []);
+    }
+
+    #[test]
+    fn a_motion_approaches_an_edge_by_heading_for_it_and_ending_near_it() {
+        // The laptop's right edge, as the default corner dead zone leaves it.
+        let right = shared(&laptop(), Edge::Right, 10.0, 972.0);
+        let approached = |x, y, dx, dy| right.is_approached(Point::new(x, y), dx, dy, 300.0);
+        // Heading right, ending 300 units from the edge or less.
+        assert!(approached(1212.0, 491.0, 5.0, 0.0));
+        assert!(approached(1511.5, 491.0, 5.0, 0.0));
+        assert!(!approached(1211.9, 491.0, 5.0, 0.0), "too far");
+        // Mostly along the edge, but a little outward, still heads for it.
+        assert!(approached(1400.0, 491.0, 0.25, -40.0));
+        // Away from the edge, or along it, does not.
+        assert!(!approached(1400.0, 491.0, -5.0, 0.0));
+        assert!(!approached(1400.0, 491.0, 0.0, 40.0));
+        assert!(!approached(1400.0, 491.0, -0.25, 40.0));
+        // Only beside the part, ends included: not in the corner dead zones.
+        assert!(approached(1400.0, 10.0, 5.0, 0.0));
+        assert!(approached(1400.0, 972.0, 5.0, 0.0));
+        assert!(!approached(1400.0, 9.9, 5.0, 0.0));
+        assert!(!approached(1400.0, 972.1, 5.0, 0.0));
+        // Only on the edge's own display.
+        assert!(!approached(1512.0, 491.0, 5.0, 0.0), "past the edge");
+        assert!(!approached(1400.0, -1.0, 5.0, 0.0), "above the display");
+        // Nothing non-finite counts.
+        assert!(!approached(f64::NAN, 491.0, 5.0, 0.0));
+        assert!(!approached(1400.0, f64::INFINITY, 5.0, 0.0));
+        assert!(!approached(1400.0, 491.0, f64::NAN, 0.0));
+        assert!(!right.is_approached(Point::new(1400.0, 491.0), 5.0, 0.0, f64::NAN));
+    }
+
+    #[test]
+    fn each_edge_is_approached_from_its_own_side() {
+        let screen = display(3, 100.0, 200.0, 1000.0, 800.0, 1.0);
+        let frame = screen.frame;
+        // A point 50 units inside each edge, halfway along it, and the way
+        // out through that edge.
+        let cases = [
+            (Edge::Left, Point::new(150.0, 600.0), (-1.0, 0.0)),
+            (Edge::Right, Point::new(1050.0, 600.0), (1.0, 0.0)),
+            (Edge::Top, Point::new(600.0, 250.0), (0.0, -1.0)),
+            (Edge::Bottom, Point::new(600.0, 950.0), (0.0, 1.0)),
+        ];
+        for (edge, to, (dx, dy)) in cases {
+            let (start, end) = frame.edge_span(edge);
+            let part = shared(&screen, edge, start, end);
+            assert!(part.is_approached(to, dx, dy, 50.0), "{edge:?}");
+            assert!(!part.is_approached(to, dx, dy, 49.0), "{edge:?}: too far");
+            assert!(!part.is_approached(to, -dx, -dy, 50.0), "{edge:?}: away");
+            assert!(!part.is_approached(to, dy, dx, 50.0), "{edge:?}: along");
+        }
+        // Right on a left or top edge line, even a reach of 0 counts: the
+        // core turns nudges off with a nudge distance of 0 itself.
+        let (start, end) = frame.edge_span(Edge::Left);
+        let left = shared(&screen, Edge::Left, start, end);
+        assert!(left.is_approached(Point::new(100.0, 600.0), -1.0, 0.0, 0.0));
     }
 
     #[test]
