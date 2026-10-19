@@ -7,10 +7,12 @@ The user asked for a simple app on each computer that does what the terminal did
 
 Both apps download from the GitHub Releases page. This document is the spec for that work, updated to match what was built. The menu-bar and tray icon, launch at login and the Windows installer stay in M6's later part.
 
+Since then (docs/M4-M5-DESIGN.md), the window also offers the Shortcuts choice, and Activity says when copy and paste works and what happened to files sent between the computers.
+
 ## Shape
 
 - **`crates/hop-agent`** (new library). Everything in `apps/hop/src` moved here:
-  - the agent: `agent/` (with `exec`, `link`, `start`, `fake`, `tests`);
+  - the agent: `agent/` (with `exec`, `link`, `start`, `clipboard`, `files`, `fake`, `tests`);
   - `logging`, `native`, `paths`, `simulate` and `startup`;
   - the pairing flow (`pairing/`, with the save rules in `pairing/save.rs`);
   - the command line itself (`cli`).
@@ -25,7 +27,7 @@ Both apps download from the GitHub Releases page. This document is the spec for 
 
 ## The window
 
-One window titled "Hop", about 480×680 points (380×420 at the smallest), resizable, with the icon from `assets/icon`. Sections run top to bottom. The labels in quotes are normative, because `docs/INSTALL.md` quotes them; `apps/hop-app/src/model/words.rs` holds every sentence, and its tests pin the quoted ones.
+One window titled "Hop", about 480×680 points (380×420 at the smallest), resizable, with the icon from `assets/icon`. Sections run top to bottom. The labels in quotes are normative, because `docs/INSTALL.md` quotes them; `apps/hop-app/src/model/words.rs` holds every sentence, and its tests pin the quoted ones. The agent's status lines and the drop zone's label are hop-agent's (`agent/clipboard.rs`, `agent/files.rs`), and pinned there.
 
 1. **Header:** "Hop" and "version {X.Y.Z}", then "This computer: {name} ({OS})".
    - If the settings cannot be read, a red box says "Hop could not read its settings: {error}." with a "Try again" button. Until then the sharing button is greyed out with the hint "Hop cannot share until it can read its settings (see above).", and Your other computer says "Hop cannot show your other computer until it can read its settings (see above)."
@@ -54,7 +56,14 @@ One window titled "Hop", about 480×680 points (380×420 at the smallest), resiz
      - "Forget…", which asks "Forget {name}? You will need to pair again." with "Forget" and "Cancel".
      - A change that cannot be saved says "Not saved: {error}." under that computer.
    - A change saves at once. Sharing restarts when it is running. Forgetting the last paired computer stops sharing instead.
-4. **Pair**, with two buttons: "Show a pairing code" and "Enter a code".
+4. **Shortcuts:** what Cmd and Ctrl do with the other computer's keyboard on this one. The computer the keys arrive on applies the choice, so each computer has its own, and the words are about the other computer's keyboard.
+   - "With {peer}'s keyboard on this computer:" ("With the other computer's keyboard on this computer:" before pairing), then two choices, the first one the default:
+     - on the PC, for keys from the Mac's keyboard: "Keep keys as they are: Ctrl+C copies, Cmd is the Windows key" and "Swap Cmd and Ctrl: Cmd+C copies, as on a Mac";
+     - on the Mac, for keys from the PC's keyboard: "Keep keys as they are: the Windows key is Cmd" and "Swap Ctrl and Cmd: Ctrl+C copies, as on a PC".
+   - Under them: "The choice for this computer's keyboard is in Hop on {peer}." ("…on the other computer." before pairing).
+   - A choice saves at once (`keymap.cmd_ctrl`, `keep` or `swap`), and sharing restarts when it is running, because the agent maps keys as it starts. A change that cannot be saved says "Not saved: {error}." under the choice.
+   - While the settings cannot be read: "Hop cannot show this choice until it can read its settings (see above)."
+5. **Pair**, with two buttons: "Show a pairing code" and "Enter a code".
    - **Show a pairing code:**
      - "Getting a code…", then the code, large: "482 913". It cannot be selected, so a stray drag cannot copy it.
      - "On the other computer, open Hop, click Enter a code and type this code. It works once, for 2 minutes. Never show it in a screen share."
@@ -72,13 +81,16 @@ One window titled "Hop", about 480×680 points (380×420 at the smallest), resiz
      - The typed code stays after a failure, so "click Pair again" works. It is wiped once pairing succeeds, when the form is cancelled, and when this computer shows a code instead.
    - **The result:** "Paired with {name}. It sits {to the left of/to the right of/above/below} this screen; change that under Your other computer." When the pairing replaced one with another key, "It replaces the pairing with {old}, whose old key can no longer connect to this computer." When this computer saved the pairing but cannot be sure the other heard the yes, "However: {reason}." Or "Not paired: {reason}." When sharing was running, it restarts with the new pairing.
    - **Reasons** are the app's own sentences, never the terminal's ("run hop pair again"): for example "the code did not match. Check it against the code the other computer shows, and click Pair again".
-5. **Permissions** (Mac only)
+6. **Permissions** (Mac only)
    - "Accessibility: Allowed" with a green tick.
    - Or "Accessibility: Not allowed yet" with the button "Allow…", and under it "Hop needs Accessibility to share this Mac's keyboard and mouse." The button shows macOS's prompt and opens System Settings > Privacy & Security > Accessibility.
    - The state is checked again every 2 seconds until it is granted.
-6. **Activity**
+7. **Activity**
    - The last 100 status lines, newest at the bottom, in a scroll area.
    - Pairing progress lines go here too, but never to the log: a reason can quote the address the user typed. The log gets one line per pairing, with the name and the side.
+   - **Copy and paste:** the agent's status line "Copy and paste now work between this computer and {peer}." once for each connection that carries clipboard text. Nothing is said per copy, and copied text is never shown or logged.
+   - **Files:** the agent's status lines count files and give reasons, never names: "Sending 3 items to {peer}…" when files are dropped on the edge, then "Sent 3 files to {peer}." (with how many folders or unreadable files were left out), or a line saying why not ("The files you dropped were not sent: {peer} is not connected.", "{peer} did not take the files: …", "Not all the files reached {peer}: …"). The computer that receives them says "Received 2 files from {peer}. Their folder opens now." (or "Its folder" for one file), and opens the folder: in Finder or Explorer, one file shows selected (`open -R`, `explorer /select,"…"`), several show in their folder.
+   - Files that arrived are also named, by the app's own line "Files from {peer}: notes.txt, photo.jpg" ("File from" for one): the first 10 names, then "and {n} more". The names come in the agent's `FilesReceived` update; they are shown here and never written to the log.
    - "Open log folder".
 
 **Closing the window** stops sharing first (failing open: input back, then goodbye), waits at most 3 seconds, and quits:
@@ -98,6 +110,7 @@ pub enum AgentUpdate {
     Connected { name: String, os: Os },
     Disconnected,
     Session(Session),
+    FilesReceived { from: String, names: Vec<String> }, // file names: show them, never log them
     Stopped { error: Option<String> },               // always the last update
 }
 pub struct AgentHandle { /* signals, thread */ }     // dropping it stops the agent
@@ -120,6 +133,8 @@ pub fn on_quit_signal(on_quit: impl FnOnce() + Send + 'static) -> std::io::Resul
 - **Updates:**
   - The core thread only ever `send`s on an unbounded channel, so it never waits for the app.
   - Session updates go out only when the session kind changes.
+  - `FilesReceived` goes out once files from the other computer have arrived complete in the Received folder, with the sender's name and the name each file was saved under. It is apart from the session: it never changes the session kind. It is the one update with file names in it, so no update is ever logged, its `Debug` included.
+  - Files sent, and transfers that stopped, are status lines (counts and reasons only), so they reach Activity as every status line does, and the terminal too under `hop run`.
 - **The app's side:** a bridge thread for each agent run and each pairing session drains its channel into the app's state and calls `request_repaint`. A panic while handing one item over does not end the bridge, so the last word always arrives; the log's tap for the Activity list is guarded the same way.
 - **Panics while the app runs:** a panic anywhere asks the running agent to quit, as `hop run`'s hook does, and the hook logs only fixed text. On a Mac, AppKit calls the window's code through functions a panic cannot unwind out of, so a panic on the main thread would abort the process before anything was dropped. Therefore:
   - on the main thread, the hook also waits up to 3 seconds for the agent to have stopped (an agent never waits for the main thread, so this cannot deadlock), then up to 1 second for the log;
@@ -159,12 +174,13 @@ impl PairSession {
 
 ```rust
 // settings: read and change the config file. Each change re-reads the file, validates, and saves atomically.
-pub struct Overview { pub name: String, pub os: Os, pub config_path: PathBuf, pub peers: Vec<PeerView>, pub notes: Vec<String> }
+pub struct Overview { pub name: String, pub os: Os, pub config_path: PathBuf, pub peers: Vec<PeerView>, pub cmd_ctrl: CmdCtrl, pub notes: Vec<String> }
 pub struct PeerView { pub id: DeviceId, pub name: String, pub os: Os, pub side: Side, pub address: Option<String>, pub paired: bool }
 pub fn overview() -> anyhow::Result<Overview>;  // startup::load(): makes the key and config on a first run
 pub fn set_side(id: &DeviceId, side: Side) -> anyhow::Result<()>;  // refuses a side another peer has
 pub fn set_address(id: &DeviceId, address: Option<&str>) -> anyhow::Result<()>;  // trimmed; empty = none
 pub fn forget(id: &DeviceId) -> anyhow::Result<()>;  // an id that is already gone is fine
+pub fn set_cmd_ctrl(choice: CmdCtrl) -> anyhow::Result<()>;  // Shortcuts: Keep (the default) or Swap
 pub fn opposite(side: Side) -> Side;
 // …plus `_at(path, …)` versions for tests.
 
@@ -177,7 +193,7 @@ pub fn use_app_name();                         // Mac: names the process "Hop" f
 pub fn stay_responsive() -> Responsive;        // App Nap exemption while sharing (hold it on the main thread)
 ```
 
-The window reads the settings again after every change and pairing. What loading has to say (a key made just now, a problem with the config) goes to the log and Activity once, as at startup.
+The window reads the settings again after every change and pairing. A change of the computers or of the Shortcuts choice restarts a running agent. What loading has to say (a key made just now, a problem with the config) goes to the log and Activity once, as at startup.
 
 ## Logging in the app
 
@@ -185,7 +201,7 @@ The window reads the settings again after every change and pairing. What loading
   - The file is `hop-app.log` in the usual log folder, rotated like `hop.log` (to `hop-app.old.log`).
   - Status lines also go to a tap, a callback that runs on the log's writer thread and feeds the Activity list.
   - Nothing is echoed to stdout.
-- **The rules are unchanged:** never a key, clipboard text, pairing code or secret.
+- **The rules are unchanged:** never a key, clipboard text, pairing code or secret, and never a file name or a file's contents. File names appear only in Activity, from `FilesReceived`; the log counts files.
 
 ## Development
 
@@ -206,5 +222,5 @@ The window reads the settings again after every change and pairing. What loading
 - An installer.
 - Signing Hop.exe and notarizing Hop.app. Until then each computer warns the first time, and Smart App Control, when it is on, blocks Hop.exe.
 - Renaming the computer.
-- Changing other settings: they keep their defaults.
+- Changing other settings (besides the side, the address and Shortcuts): they keep their defaults.
 - The self-test, which stays a `hop` command.

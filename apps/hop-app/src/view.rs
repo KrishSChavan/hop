@@ -1,6 +1,6 @@
 //! Draws the window from the model, top to bottom (docs/M6-APP.md, "The
-//! window"): the header, Sharing, Your other computer, Pair, Permissions
-//! (on a Mac) and Activity, plus the two dialogs.
+//! window"): the header, Sharing, Your other computer, Shortcuts, Pair,
+//! Permissions (on a Mac) and Activity, plus the two dialogs.
 //!
 //! Drawing changes nothing but the text fields: every click becomes an
 //! [`Action`] for the app to carry out after the frame. So the view can be
@@ -9,11 +9,11 @@
 use std::time::Instant;
 
 use eframe::egui::{
-    self, Button, Color32, Id, Key, Label, Modal, RichText, ScrollArea, Sense, Stroke, TextEdit,
-    TextStyle, Ui, pos2, vec2,
+    self, Button, Color32, Id, Key, Label, Modal, RadioButton, RichText, ScrollArea, Sense, Stroke,
+    TextEdit, TextStyle, Ui, pos2, vec2,
 };
 use hop_agent::settings::PeerView;
-use hop_agent::{DeviceId, PermissionState, Side};
+use hop_agent::{CmdCtrl, DeviceId, PermissionState, Side};
 
 use crate::model::pairing::{self, Joining, Outcome, Pairing, Showing, Stage};
 use crate::model::sharing::Tone;
@@ -36,6 +36,8 @@ pub enum Action {
     CancelForget,
     /// The dialog's "Forget".
     Forget(DeviceId),
+    /// One of the two Shortcuts choices, when it is not the one in use.
+    SetShortcuts(CmdCtrl),
     /// "Show a pairing code".
     ShowCode,
     /// "Enter a code": opens the form.
@@ -84,6 +86,8 @@ pub fn show(ui: &mut Ui, model: &mut Model, now: Instant, actions: &mut Vec<Acti
                 sharing(ui, model, actions);
                 section(ui, words::YOUR_OTHER_COMPUTER);
                 peers(ui, model, actions);
+                section(ui, words::SHORTCUTS);
+                shortcuts(ui, model, actions);
                 section(ui, words::PAIRING);
                 pair(ui, model, now, actions);
                 if let Some(state) = model.permission {
@@ -264,6 +268,30 @@ fn peer_card(ui: &mut Ui, model: &mut Model, peer: &PeerView, actions: &mut Vec<
         .clicked()
     {
         actions.push(Action::AskForget(peer.id.clone()));
+    }
+}
+
+/// "Shortcuts": what Cmd and Ctrl do with the other computer's keyboard on
+/// this one. Each computer applies its own choice to the keys that arrive
+/// there, so the words name the other computer's keyboard.
+fn shortcuts(ui: &mut Ui, model: &Model, actions: &mut Vec<Action>) {
+    let Some(current) = model.cmd_ctrl() else {
+        wrapped(ui, RichText::new(words::SHORTCUTS_UNKNOWN).weak());
+        return;
+    };
+    let other = model.other_computer();
+    wrapped(ui, words::with_keyboard(other));
+    for (choice, label) in words::shortcut_choices(model.os) {
+        let clicked = ui
+            .add_enabled(!model.quitting, RadioButton::new(current == choice, label))
+            .clicked();
+        if clicked && current != choice {
+            actions.push(Action::SetShortcuts(choice));
+        }
+    }
+    wrapped(ui, RichText::new(words::this_keyboard_there(other)).weak());
+    if let Some(problem) = &model.shortcuts_problem {
+        wrapped(ui, RichText::new(problem).color(PROBLEM));
     }
 }
 

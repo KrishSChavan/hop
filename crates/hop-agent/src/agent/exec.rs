@@ -4,15 +4,27 @@
 //! The executor owns the [`Platform`], so it is the one place that gives
 //! input back: [`Executor::fail_open`] on the way out, and its `Drop` when
 //! the core thread unwinds from a panic.
+//!
+//! It also knows what each peer's current connection negotiated
+//! ([`Features`]), because it sends: the clipboard goes out right after the
+//! `Enter` or `Leave` the cursor leaves with (docs/M4-M5-DESIGN.md,
+//! section 4), and only to a peer that takes clipboard text. Reading the
+//! clipboard can take a while ([`hop_platform::CLIPBOARD_TIMEOUT`]), so it
+//! waits for the end of the batch, where it holds up nothing (the `Leave`
+//! comes before releasing what was injected), unless another message comes
+//! first: then it goes just before that one, so the text still follows the
+//! `Enter` or `Leave` on the control stream.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use hop_core::{Action, CaptureMode, EndReason, Notice};
 use hop_keymap::{ButtonTracker, ModifierPolicy, Translator};
+use hop_net::SendError;
 use hop_platform::{CaptureMode as PlatformMode, Platform};
 use hop_types::{CoreMessage, DeviceId, InputEvent, Os, Point, RejectReason};
 
+use super::clipboard::{ClipboardSettings, ClipboardSync, Offer};
 use super::link::Link;
 use crate::status;
 
@@ -27,6 +39,18 @@ pub(crate) struct Outcome {
     /// the cursor, injecting) failed, so the core must be told with
     /// `Event::LocalStall`.
     pub(crate) stalled: bool,
+}
+
+/// What a peer's current connection carries besides input, as far as both
+/// computers agreed and this one has it turned on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Features {
+    /// Clipboard text travels both ways: both computers negotiated
+    /// `clipboard.text`, and sync is on here.
+    pub(crate) clipboard: bool,
+    /// Files travel both ways: both computers negotiated `files` (so both
+    /// receive files), and this one shows its drop zone.
+    pub(crate) files: bool,
 }
 
 /// Which side of a session the core last reported, for wording status
@@ -73,6 +97,13 @@ pub(crate) struct Executor<L: Link> {
     pub(crate) last_cursor: Point,
     /// Peer names for status lines.
     names: HashMap<DeviceId, String>,
+    /// The peers with a current connection, and what each one carries.
+    connected: HashMap<DeviceId, Features>,
+    /// Clipboard sync: whether it is on, and what both computers last had.
+    clipboard: ClipboardSync,
+    /// The computer the cursor just left for with an `Enter` or a `Leave`,
+    /// until it has been offered the clipboard.
+    clipboard_for: Option<DeviceId>,
     role: Role,
     quitting: bool,
     limiter: RateLimit,
@@ -93,6 +124,9 @@ impl<L: Link> Executor<L> {
             entered_at: None,
             last_cursor: Point::default(),
             names: HashMap::new(),
+            connected: HashMap::new(),
+            clipboard: ClipboardSync::new(ClipboardSettings::OFF),
+            clipboard_for: None,
             role: Role::None,
             quitting: false,
             limiter: RateLimit::default(),
@@ -110,6 +144,39 @@ impl<L: Link> Executor<L> {
             .get(peer)
             .cloned()
             .unwrap_or_else(|| "the other computer".to_owned())
+    }
+
+    /// Syncs the clipboard with `settings` from now on, starting from the
+    /// clipboard's change count right now (sharing starts), so a clipboard
+    /// from before is never pushed at the first crossing.
+    pub(crate) fn share_clipboard(&mut self, settings: ClipboardSettings) {
+        self.clipboard = ClipboardSync::new(settings);
+        self.clipboard.start(self.platform.clipboard.as_ref());
+    }
+
+    /// Whether clipboard sync is on here.
+    pub(crate) fn clipboard_enabled(&self) -> bool {
+        self.clipboard.enabled()
+    }
+
+    /// `peer` has a new current connection, which carries `features`.
+    pub(crate) fn peer_up(&mut self, peer: DeviceId, features: Features) {
+        self.connected.insert(peer, features);
+    }
+
+    /// `peer`'s connection closed.
+    pub(crate) fn peer_down(&mut self, peer: &DeviceId) {
+        self.connected.remove(peer);
+    }
+
+    /// Whether `peer` has a current connection.
+    pub(crate) fn is_connected(&self, peer: &DeviceId) -> bool {
+        self.connected.contains_key(peer)
+    }
+
+    /// What `peer`'s current connection carries; nothing when it has none.
+    pub(crate) fn features(&self, peer: &DeviceId) -> Features {
+        self.connected.get(peer).copied().unwrap_or_default()
     }
 
     /// From now on, status lines say that Hop is quitting.
@@ -162,6 +229,8 @@ impl<L: Link> Executor<L> {
                 Action::Notify(notice) => self.notify(notice),
             }
         }
+        // Last, so that a slow clipboard holds up nothing else in the batch.
+        self.offer_clipboard();
         outcome
     }
 
@@ -187,6 +256,17 @@ impl<L: Link> Executor<L> {
     }
 
     fn send(&mut self, to: &DeviceId, msg: CoreMessage) {
+        // A clipboard still waiting goes first, so it directly follows the
+        // `Enter` or `Leave` it goes with.
+        self.offer_clipboard();
+        // The cursor leaves this computer with an `Enter` (for the computer
+        // entered) or a `Leave` (for the computer it goes on to, normally the
+        // one it came from): that computer is offered the clipboard next.
+        let leaving_for = match &msg {
+            CoreMessage::Enter { .. } => Some(to.clone()),
+            CoreMessage::Leave { to: next, .. } => Some(next.clone()),
+            _ => None,
+        };
         if matches!(msg, CoreMessage::Enter { .. }) {
             self.entered_at = Some(Instant::now());
         }
@@ -195,6 +275,66 @@ impl<L: Link> Executor<L> {
             && let Some(suppressed) = self.limiter.allow("send")
         {
             tracing::info!(peer = %to, error = %error, suppressed, "could not send to the other computer");
+        }
+        self.clipboard_for = leaving_for;
+    }
+
+    /// Sends this computer's clipboard text to the computer the cursor just
+    /// left for, if there is one, when the two computers take clipboard text
+    /// and the clipboard changed since they last had the same content. On
+    /// the control stream right after the `Enter` or `Leave`, so it arrives
+    /// before any later key. The text is never logged.
+    fn offer_clipboard(&mut self) {
+        let Some(to) = self.clipboard_for.take() else {
+            return;
+        };
+        if !self.features(&to).clipboard {
+            return;
+        }
+        match self.clipboard.offer(self.platform.clipboard.as_ref()) {
+            Ok(Offer::Unchanged | Offer::NothingToSend) => {}
+            Ok(Offer::Text { count, message }) => match self.link.send(&to, message) {
+                Ok(()) => self.clipboard.sent(count),
+                Err(error) => {
+                    // A connection on its way out (`PeerDown` follows) did
+                    // not take it: the first crossing on the next connection
+                    // offers it again. Anything else can never go (text over
+                    // the protocol's limit, say), so it is not offered again
+                    // until the clipboard changes.
+                    if !matches!(error, SendError::NotConnected | SendError::Overloaded) {
+                        self.clipboard.sent(count);
+                    }
+                    if let Some(suppressed) = self.limiter.allow("clipboard send") {
+                        tracing::info!(peer = %to, error = %error, suppressed, "could not send the clipboard to the other computer");
+                    }
+                }
+            },
+            Err(error) => self.warn(
+                "clipboard read",
+                "could not read the clipboard; the next crossing tries again",
+                &error,
+            ),
+        }
+    }
+
+    /// Puts clipboard text from `from` on this computer's clipboard, before
+    /// the next event is handled (so its next key pastes it), if the two
+    /// computers take clipboard text. A failure is only logged, without the
+    /// text.
+    pub(crate) fn receive_clipboard(&mut self, from: &DeviceId, text: &str) {
+        if !self.features(from).clipboard {
+            tracing::debug!(peer = %from, "ignored clipboard text from a computer that does not sync the clipboard");
+            return;
+        }
+        if let Err(error) = self
+            .clipboard
+            .receive(self.platform.clipboard.as_mut(), text)
+        {
+            self.warn(
+                "clipboard write",
+                "could not put the other computer's clipboard text on this computer's clipboard",
+                &error,
+            );
         }
     }
 

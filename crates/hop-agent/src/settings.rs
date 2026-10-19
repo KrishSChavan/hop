@@ -1,5 +1,5 @@
 //! Reading and changing the config file, for the app: where the other
-//! computer sits, its address, and forgetting it.
+//! computer sits, its address, forgetting it, and the Shortcuts setting.
 //!
 //! Every change re-reads the file first, so a newer version (another
 //! pairing, an edit by hand) is never overwritten; then the config's rules
@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use hop_config::{Config, PeerConfig, Side};
+use hop_config::{CmdCtrl, Config, PeerConfig, Side};
 use hop_types::{DeviceId, Os};
 
 use crate::startup::{self, Startup};
@@ -28,6 +28,11 @@ pub struct Overview {
     pub config_path: PathBuf,
     /// The other computers, in the file's order.
     pub peers: Vec<PeerView>,
+    /// The Shortcuts setting (`keymap.cmd_ctrl`): whether Cmd and Ctrl
+    /// trade places on keys from the other computer's keyboard. This
+    /// computer applies it to the keys that arrive here, so each computer
+    /// has its own.
+    pub cmd_ctrl: CmdCtrl,
     /// Sentences worth telling the user from loading: a new key, the name
     /// this computer got on a first run, config warnings. They name files
     /// and settings, never secrets.
@@ -95,6 +100,7 @@ fn describe(startup: Startup) -> Overview {
         os: Os::current(),
         config_path: startup.config_path,
         peers,
+        cmd_ctrl: startup.config.keymap.cmd_ctrl,
         // In the app's words: it pairs in its window, not with hop pair.
         notes: startup
             .notes
@@ -197,6 +203,31 @@ pub fn forget_at(path: &Path, id: &DeviceId) -> Result<()> {
         let before = config.peers.len();
         config.peers.retain(|peer| peer.id != *id);
         Ok(config.peers.len() != before)
+    })
+}
+
+/// Sets the Shortcuts setting: whether Cmd and Ctrl trade places on keys
+/// that arrive here from the other computer's keyboard.
+///
+/// # Errors
+///
+/// The file cannot be read or saved.
+pub fn set_cmd_ctrl(choice: CmdCtrl) -> Result<()> {
+    set_cmd_ctrl_at(&config_path()?, choice)
+}
+
+/// [`set_cmd_ctrl`] in the config at `path`.
+///
+/// # Errors
+///
+/// As [`set_cmd_ctrl`].
+pub fn set_cmd_ctrl_at(path: &Path, choice: CmdCtrl) -> Result<()> {
+    change(path, |config| {
+        if config.keymap.cmd_ctrl == choice {
+            return Ok(false);
+        }
+        config.keymap.cmd_ctrl = choice;
+        Ok(true)
     })
 }
 
@@ -467,6 +498,52 @@ mod tests {
         let missing = dir.join("missing.toml");
         forget_at(&missing, &id('a')).expect("nothing to forget");
         assert!(!missing.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_shortcuts_setting_keeps_keys_as_labelled_until_changed() {
+        let dir = scratch("shortcuts");
+        let path = two_peers(&dir);
+        let identity = dir.join("identity.pem");
+        let overview = overview_at(&path, &identity).expect("overview");
+        assert_eq!(overview.cmd_ctrl, CmdCtrl::Keep, "the default");
+
+        set_cmd_ctrl_at(&path, CmdCtrl::Swap).expect("swap");
+        assert_eq!(load(&path).keymap.cmd_ctrl, CmdCtrl::Swap);
+        assert_eq!(
+            overview_at(&path, &identity).expect("overview").cmd_ctrl,
+            CmdCtrl::Swap
+        );
+        let saved = fs::read_to_string(&path).expect("config");
+        assert!(saved.contains("cmd_ctrl = \"swap\""), "{saved}");
+
+        // The same choice again leaves the file as it is.
+        set_cmd_ctrl_at(&path, CmdCtrl::Swap).expect("swap again");
+        assert_eq!(fs::read_to_string(&path).expect("config"), saved);
+
+        set_cmd_ctrl_at(&path, CmdCtrl::Keep).expect("keep");
+        let config = load(&path);
+        assert_eq!(config.keymap.cmd_ctrl, CmdCtrl::Keep);
+        assert_eq!(config.peers.len(), 2, "nothing else changed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_shortcuts_setting_is_saved_into_the_newest_file() {
+        let dir = scratch("shortcuts-reread");
+        let path = two_peers(&dir);
+        let mut newer = load(&path);
+        newer.peers[0].address = Some("192.168.1.20".to_owned());
+        newer.save(&path).expect("save");
+        set_cmd_ctrl_at(&path, CmdCtrl::Swap).expect("swap");
+        let config = load(&path);
+        assert_eq!(config.keymap.cmd_ctrl, CmdCtrl::Swap);
+        assert_eq!(
+            config.peers[0].address.as_deref(),
+            Some("192.168.1.20"),
+            "the newer file was kept"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

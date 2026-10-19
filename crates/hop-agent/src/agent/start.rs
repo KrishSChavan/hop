@@ -20,13 +20,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use hop_config::{CmdCtrl, Config, Side};
 use hop_core::{Chord, CoreConfig};
 use hop_keymap::ModifierPolicy;
-use hop_net::{Fingerprint, NetConfig, NetError, PinnedPeer};
-use hop_platform::{Permission, PermissionState, Platform, PlatformError};
-use hop_types::{KeyCode, Os};
+use hop_net::{FilesConfig, Fingerprint, NetConfig, NetError, PinnedPeer};
+use hop_platform::{Permission, PermissionState, Platform, PlatformError, TextClipboard};
+use hop_types::{DisplayInfo, KeyCode, Os};
 use tokio::runtime::Runtime;
 
+use super::clipboard::ClipboardSettings;
 use super::link::NetLink;
-use super::{Agent, AgentError, PeerPlacement, Settings, Signals};
+use super::{Agent, AgentError, PeerPlacement, Settings, ShowFiles, Signals};
 use crate::logging::{Destination, Filter, Log};
 use crate::service::AgentUpdate;
 use crate::startup::Startup;
@@ -105,7 +106,8 @@ pub(crate) fn run(
     let chosen = choose_peer(config, &startup.config_path)?;
     let core = core_config(config);
     let emergency = core.emergency_chord.clone();
-    let settings = Settings {
+    let files = files_config(config, &startup.config_path);
+    let mut settings = Settings {
         me: startup.identity.device_id(),
         os: Os::current(),
         core,
@@ -115,6 +117,9 @@ pub(crate) fn run(
             name: chosen.pin.name.clone(),
             side: chosen.side.edge(),
         },
+        clipboard: clipboard_settings(config),
+        files: files.is_some(),
+        show_files: ShowFiles::system(),
     };
 
     // Asked to quit before anything started (an app's Stop sharing, a
@@ -129,15 +134,16 @@ pub(crate) fn run(
         .displays
         .displays()
         .context("could not read this computer's displays")?;
+    settings.clipboard = usable_clipboard(settings.clipboard, platform.clipboard.as_ref());
 
     let runtime = NetRuntime::new()?;
-    let mut net = NetConfig::new(
-        config.network.port,
-        config.device.name.clone(),
-        env!("CARGO_PKG_VERSION"),
+    let mut net = net_config(
+        config,
+        displays,
+        chosen.pin.clone(),
+        &settings.clipboard,
+        files,
     );
-    net.displays = displays;
-    net.peers = vec![chosen.pin.clone()];
     let ring = signals.clone();
     net.on_event = Some(Arc::new(move || ring.ring()));
     // Bound before capture starts: the port is the single-instance lock.
@@ -410,6 +416,74 @@ fn modifier_policy(config: &Config) -> ModifierPolicy {
             CmdCtrl::Keep => false,
             CmdCtrl::Swap => true,
         },
+    }
+}
+
+/// The network's settings: this computer's port, name and displays, the
+/// paired computer, and what this computer offers besides input. Both
+/// computers must offer a feature for it to work: clipboard text when sync
+/// is on (and this computer has a clipboard), files when receiving them is
+/// on and has a folder.
+fn net_config(
+    config: &Config,
+    displays: Vec<DisplayInfo>,
+    peer: PinnedPeer,
+    clipboard: &ClipboardSettings,
+    files: Option<FilesConfig>,
+) -> NetConfig {
+    let mut net = NetConfig::new(
+        config.network.port,
+        config.device.name.clone(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    net.displays = displays;
+    net.peers = vec![peer];
+    net.clipboard = clipboard.enabled;
+    net.files = files;
+    net
+}
+
+/// Clipboard sync from `[clipboard]`.
+fn clipboard_settings(config: &Config) -> ClipboardSettings {
+    ClipboardSettings {
+        enabled: config.clipboard.enabled,
+        max_text_bytes: config.clipboard.max_text_bytes,
+    }
+}
+
+/// Clipboard sync as this computer can do it: off, with a status line,
+/// when its platform has no clipboard yet, so the other computer is never
+/// told it may send text here. Asking costs only the change count; no
+/// text is read.
+fn usable_clipboard(
+    settings: ClipboardSettings,
+    clipboard: &dyn TextClipboard,
+) -> ClipboardSettings {
+    if settings.enabled && matches!(clipboard.change_count(), Err(PlatformError::Unsupported)) {
+        status!("Copy and paste between the computers does not work on this computer yet.");
+        return ClipboardSettings::OFF;
+    }
+    settings
+}
+
+/// Receiving files, from `[transfer]`: the folder they go in, or `None`
+/// when receiving is off. Without it this computer does not offer files at
+/// all, so no files travel either way (and no drop zone shows). A computer
+/// without a folder for them says so.
+fn files_config(config: &Config, config_path: &Path) -> Option<FilesConfig> {
+    if !config.transfer.enabled {
+        return None;
+    }
+    match config.transfer.received_dir_or_default() {
+        Some(received_dir) => Some(FilesConfig { received_dir }),
+        None => {
+            status!(
+                "Hop cannot send or receive files, because it could not work out where the \
+                 Downloads folder is. To fix it, set transfer.received_dir in {} to a folder.",
+                config_path.display()
+            );
+            None
+        }
     }
 }
 
@@ -888,5 +962,103 @@ mod tests {
         );
         config.keymap.cmd_ctrl = CmdCtrl::Swap;
         assert!(modifier_policy(&config).swap_cmd_ctrl);
+    }
+
+    #[test]
+    fn the_clipboard_settings_reach_the_agent() {
+        let mut config = Config::default();
+        assert_eq!(
+            clipboard_settings(&config),
+            ClipboardSettings {
+                enabled: true,
+                max_text_bytes: 1_048_576
+            }
+        );
+        config.clipboard.enabled = false;
+        config.clipboard.max_text_bytes = 4096;
+        assert_eq!(
+            clipboard_settings(&config),
+            ClipboardSettings {
+                enabled: false,
+                max_text_bytes: 4096
+            }
+        );
+    }
+
+    /// A platform without a clipboard, as backends were before M4.
+    struct NoClipboard;
+
+    impl TextClipboard for NoClipboard {
+        fn change_count(&self) -> hop_platform::Result<u64> {
+            Err(PlatformError::Unsupported)
+        }
+
+        fn read_text(&self, _: usize) -> hop_platform::Result<Option<String>> {
+            Err(PlatformError::Unsupported)
+        }
+
+        fn write_text(&mut self, _: &str) -> hop_platform::Result<u64> {
+            Err(PlatformError::Unsupported)
+        }
+    }
+
+    #[test]
+    fn without_a_clipboard_this_computer_does_not_offer_clipboard_text() {
+        let on = clipboard_settings(&Config::default());
+        assert_eq!(usable_clipboard(on, &NoClipboard), ClipboardSettings::OFF);
+        // A clipboard that works stays in use, and so does one that only
+        // failed this once (it may have been busy).
+        let (platform, fake) = crate::agent::fake::Fake::new(1512.0, 982.0);
+        assert_eq!(usable_clipboard(on, platform.clipboard.as_ref()), on);
+        fake.state().fail_clipboard_count = true;
+        assert_eq!(usable_clipboard(on, platform.clipboard.as_ref()), on);
+        assert_eq!(
+            usable_clipboard(ClipboardSettings::OFF, platform.clipboard.as_ref()),
+            ClipboardSettings::OFF
+        );
+    }
+
+    #[test]
+    fn the_network_offers_clipboard_text_and_files_only_when_they_are_on() {
+        let mut config = Config::default();
+        config.peers.push(peer("PC", 'b', Side::Right, true));
+        let peer = choose_peer(&config, Path::new("config.toml"))
+            .expect("paired")
+            .pin;
+        let folder = std::env::temp_dir().join("Hop Received");
+        let files = Some(FilesConfig {
+            received_dir: folder,
+        });
+        let on = net_config(
+            &config,
+            Vec::new(),
+            peer.clone(),
+            &clipboard_settings(&config),
+            files.clone(),
+        );
+        assert!(on.clipboard);
+        assert_eq!(on.files, files);
+        assert_eq!(on.peers, std::slice::from_ref(&peer));
+        assert_eq!(on.bind.port(), config.network.port);
+
+        let off = net_config(&config, Vec::new(), peer, &ClipboardSettings::OFF, None);
+        assert!(!off.clipboard);
+        assert_eq!(off.files, None);
+    }
+
+    #[test]
+    fn files_travel_only_while_receiving_them_is_on() {
+        let path = Path::new("config.toml");
+        let mut config = Config::default();
+        let folder = std::env::temp_dir().join("Hop Received");
+        config.transfer.received_dir = Some(folder.clone());
+        assert_eq!(
+            files_config(&config, path),
+            Some(FilesConfig {
+                received_dir: folder
+            })
+        );
+        config.transfer.enabled = false;
+        assert_eq!(files_config(&config, path), None);
     }
 }

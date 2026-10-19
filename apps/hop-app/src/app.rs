@@ -20,7 +20,7 @@ use hop_agent::logging::Log;
 use hop_agent::pairing::{PairEvent, PairRole, PairSession};
 use hop_agent::service::{AgentHandle, AgentUpdate};
 use hop_agent::system::{self, Responsive};
-use hop_agent::{DeviceId, PermissionState, settings, status};
+use hop_agent::{CmdCtrl, DeviceId, PermissionState, settings, status};
 
 use crate::bridge::{self, News, Shared};
 use crate::model::sharing::Next;
@@ -134,13 +134,14 @@ impl HopApp {
         self.schedule(ctx, now);
     }
 
-    /// An update from the agent: only the running one's count.
+    /// An update from the agent: only the running one's count. Never logged:
+    /// one kind carries the names of files that arrived.
     fn agent_update(&mut self, run: u64, update: AgentUpdate) {
         if self.agent.as_ref().is_none_or(|agent| agent.run != run) {
             return;
         }
         let stopped = matches!(update, AgentUpdate::Stopped { .. });
-        if self.model.sharing.apply(update) == Next::StartAgain {
+        if self.model.agent_update(update) == Next::StartAgain {
             self.start_pending = true;
         }
         if stopped {
@@ -247,8 +248,8 @@ impl HopApp {
         }
     }
 
-    /// The computers changed: a running agent restarts to use them, or
-    /// stops when nothing is paired any more.
+    /// The computers or the Shortcuts setting changed: a running agent
+    /// restarts to use them, or stops when nothing is paired any more.
     fn restart_sharing(&mut self) {
         if !self.model.has_paired_peer() {
             if self.model.sharing.stop() {
@@ -262,7 +263,8 @@ impl HopApp {
         }
     }
 
-    /// Reads the settings again. Returns whether the computers changed.
+    /// Reads the settings again. Returns whether the computers or the
+    /// Shortcuts setting changed.
     ///
     /// What loading has to say goes to the log and the Activity list, as at
     /// startup: a key made just now (after the old one was deleted, say), or
@@ -315,6 +317,29 @@ impl HopApp {
                 self.model.activity.push(line.clone());
                 self.model.peers.problem = Some((id.clone(), line));
                 false
+            }
+        }
+    }
+
+    /// Saves the Shortcuts choice, then reads the settings again and
+    /// restarts sharing to use it: the agent maps keys as it starts. A
+    /// failure is shown under the choice.
+    fn set_shortcuts(&mut self, choice: CmdCtrl) {
+        match settings::set_cmd_ctrl(choice) {
+            Ok(()) => {
+                tracing::info!(
+                    swap = choice == CmdCtrl::Swap,
+                    "the Shortcuts setting changed"
+                );
+                self.model.shortcuts_problem = None;
+                if self.reload_settings() {
+                    self.restart_sharing();
+                }
+            }
+            Err(error) => {
+                let line = words::not_saved(&format!("{error:#}"));
+                self.model.activity.push(line.clone());
+                self.model.shortcuts_problem = Some(line);
             }
         }
     }
@@ -387,6 +412,7 @@ impl HopApp {
                 self.model.peers.forgetting = None;
                 self.change(&id, settings::forget);
             }
+            Action::SetShortcuts(choice) => self.set_shortcuts(choice),
             Action::ShowCode => {
                 if self.model.can_pair() && self.model.pairing.begin_show() {
                     // Showing a code wiped the typed one.

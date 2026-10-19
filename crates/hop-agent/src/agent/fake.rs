@@ -31,6 +31,10 @@ pub(crate) enum Call {
     Move(Point),
     Inject(InputEvent),
     ReleaseAll,
+    /// The clipboard's text was read.
+    ReadClipboard,
+    /// Text was put on the clipboard (it is in [`FakeState::clipboard`]).
+    WriteClipboard,
 }
 
 type Sink = Box<dyn FnMut(CapturedEvent) + Send>;
@@ -59,9 +63,21 @@ pub(crate) struct FakeState {
     /// The clipboard's text, if it holds any, and its change count.
     pub(crate) clipboard: Option<String>,
     pub(crate) clipboard_count: u64,
+    /// Reading the change count fails.
+    pub(crate) fail_clipboard_count: bool,
+    /// Reading the clipboard's text fails, as a read that took too long
+    /// does.
+    pub(crate) fail_clipboard_read: bool,
+    /// Writing the clipboard fails.
+    pub(crate) fail_clipboard_write: bool,
+    /// How many times the clipboard's text was read.
+    pub(crate) clipboard_reads: u32,
     /// The drop zones the agent set last, and the label it gave them.
     pub(crate) zones: Vec<DropZone>,
     pub(crate) label: String,
+    /// There is no drop target: setting zones fails as with
+    /// [`hop_platform::NoDrops`], and clearing them works.
+    pub(crate) no_drop_target: bool,
     /// Drops waiting for the agent, oldest first.
     pub(crate) drops: VecDeque<Vec<PathBuf>>,
 }
@@ -111,8 +127,13 @@ impl Fake {
             fail_conceal: false,
             clipboard: None,
             clipboard_count: 0,
+            fail_clipboard_count: false,
+            fail_clipboard_read: false,
+            fail_clipboard_write: false,
+            clipboard_reads: 0,
             zones: Vec::new(),
             label: String::new(),
+            no_drop_target: false,
             drops: VecDeque::new(),
         }));
         let part = || Part(state.clone());
@@ -174,6 +195,21 @@ impl Fake {
     /// Moves this fake computer's mouse.
     pub(crate) fn motion(&self, dx: f64, dy: f64) {
         self.physical(InputEvent::PointerMotion { dx, dy });
+    }
+
+    /// Copies `text` in some app on this fake computer: the clipboard holds
+    /// it, and its change count moves on.
+    pub(crate) fn copy(&self, text: &str) {
+        let mut state = self.state();
+        state.clipboard = Some(text.to_owned());
+        state.clipboard_count += 1;
+    }
+
+    /// Drops `paths` on the drop zone, as the drop target would hand them
+    /// to the agent.
+    pub(crate) fn drop_files(&self, paths: &[&str]) {
+        let paths = paths.iter().map(PathBuf::from).collect();
+        self.state().drops.push_back(paths);
     }
 }
 
@@ -322,11 +358,20 @@ impl Displays for Part {
 /// A clipboard in memory; no test reads or writes the real one.
 impl TextClipboard for Part {
     fn change_count(&self) -> Result<u64> {
-        Ok(self.state().clipboard_count)
+        let state = self.state();
+        if state.fail_clipboard_count {
+            return Err(refused("read the clipboard's change count"));
+        }
+        Ok(state.clipboard_count)
     }
 
     fn read_text(&self, max_bytes: usize) -> Result<Option<String>> {
-        let state = self.state();
+        let mut state = self.state();
+        if state.fail_clipboard_read {
+            return Err(refused("read the clipboard"));
+        }
+        state.clipboard_reads += 1;
+        state.calls.push(Call::ReadClipboard);
         Ok(state
             .clipboard
             .clone()
@@ -335,8 +380,12 @@ impl TextClipboard for Part {
 
     fn write_text(&mut self, text: &str) -> Result<u64> {
         let mut state = self.state();
+        if state.fail_clipboard_write {
+            return Err(refused("write the clipboard"));
+        }
         state.clipboard = Some(text.to_owned());
         state.clipboard_count += 1;
+        state.calls.push(Call::WriteClipboard);
         Ok(state.clipboard_count)
     }
 }
@@ -344,6 +393,9 @@ impl TextClipboard for Part {
 impl DropCatcher for Part {
     fn set_zones(&mut self, zones: Vec<DropZone>, label: &str) -> Result<()> {
         let mut state = self.state();
+        if state.no_drop_target && !zones.is_empty() {
+            return Err(PlatformError::Unsupported);
+        }
         state.zones = zones;
         state.label = label.to_owned();
         Ok(())
@@ -383,6 +435,9 @@ pub(crate) struct FakeNet {
     pub(crate) files: Vec<(DeviceId, Vec<PathBuf>)>,
     /// Every peer the agent nudged, in order.
     pub(crate) nudges: Vec<DeviceId>,
+    /// While set, clipboard text is not sent but refused with the error
+    /// this makes; every other message still goes.
+    pub(crate) refuse_clipboard: Option<fn() -> SendError>,
 }
 
 /// A fake network: sends are recorded, events are whatever the test queues.
@@ -410,6 +465,18 @@ impl FakeLink {
         self.net().files.clone()
     }
 
+    /// Every clipboard text sent so far, with the recipient.
+    pub(crate) fn sent_clipboard(&self) -> Vec<(DeviceId, String)> {
+        self.net()
+            .sent
+            .iter()
+            .filter_map(|(to, msg)| match msg {
+                CoreMessage::ClipboardText { text, .. } => Some((to.clone(), text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every peer nudged so far, in order.
     pub(crate) fn nudges(&self) -> Vec<DeviceId> {
         self.net().nudges.clone()
@@ -418,7 +485,11 @@ impl FakeLink {
 
 impl Link for FakeLink {
     fn send(&self, to: &DeviceId, msg: CoreMessage) -> std::result::Result<(), SendError> {
-        self.net().sent.push((to.clone(), msg));
+        let mut net = self.net();
+        if let (CoreMessage::ClipboardText { .. }, Some(refuse)) = (&msg, net.refuse_clipboard) {
+            return Err(refuse());
+        }
+        net.sent.push((to.clone(), msg));
         Ok(())
     }
 

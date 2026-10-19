@@ -37,6 +37,8 @@
 //!   gives it, so it never waits for the app.
 //! - [`AgentUpdate::Stopped`] is always the last update, even when the
 //!   agent could not start or its thread panicked.
+//! - File names reach the app only in [`AgentUpdate::FilesReceived`], to
+//!   show; the agent never logs them, and the app must not either.
 //! - A panic anywhere in the app asks the running agent to quit failing
 //!   open, once [`install_panic_hook`] is in place. A panic on the main
 //!   thread also waits (at most 3 seconds) for it to have stopped.
@@ -94,6 +96,10 @@ pub enum Session {
 
 /// What the agent tells the app, in order. Text in here is plain sentences
 /// for the user; none of it is ever a key, clipboard text or a code.
+///
+/// One update carries file names, [`AgentUpdate::FilesReceived`], for the
+/// app to show. Names never go in the log, so never log an update (its
+/// `Debug` included).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentUpdate {
     /// The agent is running: it has the network and watches the keyboard
@@ -118,6 +124,19 @@ pub enum AgentUpdate {
     Disconnected,
     /// The session kind changed. Sent only on a change.
     Session(Session),
+    /// Files from the other computer arrived complete in the Received
+    /// folder, which opens with them. Separate from the session: it says
+    /// nothing about who uses which keyboard and mouse.
+    ///
+    /// This is the one update with file names in it. The app shows them;
+    /// they must never be logged (the status line about the same files only
+    /// counts them).
+    FilesReceived {
+        /// The computer that sent them, as it calls itself.
+        from: String,
+        /// The name each file was saved under, in the order they were sent.
+        names: Vec<String>,
+    },
     /// The agent stopped, failing open: input is back on both computers.
     /// Always the last update.
     Stopped {

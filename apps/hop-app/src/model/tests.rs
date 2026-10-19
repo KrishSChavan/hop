@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use hop_agent::pairing::{PairEvent, PairRole, Replaced, Saved};
 use hop_agent::service::{AgentUpdate, Session};
 use hop_agent::settings::{Overview, PeerView};
-use hop_agent::{DeviceId, Os, Side, Zeroizing};
+use hop_agent::{CmdCtrl, DeviceId, Os, Side, Zeroizing};
 
 use super::pairing::{Outcome, Stage};
 use super::sharing::{Next, Running, Tone};
@@ -35,6 +35,7 @@ fn overview(peers: Vec<PeerView>) -> Overview {
         os: Os::MacOs,
         config_path: PathBuf::from("config.toml"),
         peers,
+        cmd_ctrl: CmdCtrl::Keep,
         notes: Vec::new(),
     }
 }
@@ -345,6 +346,80 @@ fn only_paired_computers_are_listed() {
     ]);
     let names: Vec<&str> = model.paired_peers().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["Windows PC"]);
+}
+
+#[test]
+fn a_new_shortcuts_choice_counts_as_a_change_so_sharing_restarts() {
+    let pc = || vec![peer("Windows PC", 'a', Side::Right, true)];
+    let with = |cmd_ctrl| {
+        Settings::Loaded(Overview {
+            cmd_ctrl,
+            ..overview(pc())
+        })
+    };
+    let mut model = paired_model();
+    assert_eq!(model.cmd_ctrl(), Some(CmdCtrl::Keep), "keys as they are");
+    assert!(model.set_settings(with(CmdCtrl::Swap)));
+    assert_eq!(model.cmd_ctrl(), Some(CmdCtrl::Swap));
+    assert!(!model.set_settings(with(CmdCtrl::Swap)), "the same again");
+    assert!(model.set_settings(with(CmdCtrl::Keep)));
+
+    assert!(!model.set_settings(Settings::Failed("gone".to_owned())));
+    assert_eq!(model.cmd_ctrl(), None, "unknown while unreadable");
+    assert!(
+        !model.set_settings(Settings::Loaded(overview(Vec::new()))),
+        "nothing known to compare with, and no computer left"
+    );
+}
+
+#[test]
+fn the_other_computer_is_the_first_paired_one() {
+    let listed = model(vec![
+        peer("Old PC", 'b', Side::Left, false),
+        peer("Windows PC", 'a', Side::Right, true),
+    ]);
+    assert_eq!(listed.other_computer(), Some("Windows PC"));
+    assert_eq!(model(Vec::new()).other_computer(), None);
+}
+
+#[test]
+fn files_that_arrive_are_named_in_activity_and_change_nothing_else() {
+    let mut model = paired_model();
+    model.sharing.start();
+    model.agent_update(started());
+    model.agent_update(AgentUpdate::Connected {
+        name: "Windows PC".to_owned(),
+        os: Os::Windows,
+    });
+    let before = model.sharing.clone();
+    assert_eq!(
+        model.agent_update(AgentUpdate::FilesReceived {
+            from: "Windows PC".to_owned(),
+            names: vec!["report.pdf".to_owned(), "photo.jpg".to_owned()],
+        }),
+        Next::Nothing
+    );
+    assert_eq!(model.sharing, before, "files say nothing about the session");
+    assert_eq!(
+        lines(&model.activity),
+        ["Files from Windows PC: report.pdf, photo.jpg"]
+    );
+
+    // No names, no line; and the other updates add none: Activity's status
+    // lines come from the log.
+    model.agent_update(AgentUpdate::FilesReceived {
+        from: "Windows PC".to_owned(),
+        names: Vec::new(),
+    });
+    model.agent_update(AgentUpdate::Session(Session::Controlling));
+    assert_eq!(lines(&model.activity).len(), 1);
+
+    // The rest still moves sharing on, and says what to do next.
+    model.sharing.restart();
+    assert_eq!(
+        model.agent_update(AgentUpdate::Stopped { error: None }),
+        Next::StartAgain
+    );
 }
 
 #[test]

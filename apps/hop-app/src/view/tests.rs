@@ -12,10 +12,10 @@ use eframe::egui::{
 use hop_agent::pairing::{PairEvent, Replaced, Saved};
 use hop_agent::service::{AgentUpdate, Session};
 use hop_agent::settings::{Overview, PeerView};
-use hop_agent::{DeviceId, Os, PermissionState, Side, Zeroizing};
+use hop_agent::{CmdCtrl, DeviceId, Os, PermissionState, Side, Zeroizing};
 
 use super::{Action, show};
-use crate::model::{Model, Settings};
+use crate::model::{Model, Settings, words};
 
 const KEYS: &str = "If the keyboard and mouse ever seem stuck on the other computer, press \
                     Control + Option + Shift + Escape (the left-hand keys) on this one to bring \
@@ -38,6 +38,7 @@ fn model_with(os: Os, peers: Vec<PeerView>) -> Model {
         os,
         config_path: PathBuf::from("config.toml"),
         peers,
+        cmd_ctrl: CmdCtrl::Keep,
         notes: Vec::new(),
     };
     Model::new(
@@ -49,6 +50,39 @@ fn model_with(os: Os, peers: Vec<PeerView>) -> Model {
 
 fn paired() -> Model {
     model_with(Os::MacOs, vec![pc()])
+}
+
+/// The PC's window, paired with the Mac on its left.
+fn paired_pc() -> Model {
+    let mac = PeerView {
+        id: DeviceId::new("c".repeat(32)),
+        name: "Mac".to_owned(),
+        os: Os::MacOs,
+        side: Side::Left,
+        address: None,
+        paired: true,
+    };
+    let mut model = model_with(Os::Windows, vec![mac]);
+    model.permission = None;
+    model
+}
+
+/// `model` with the Shortcuts setting at `cmd_ctrl`.
+fn with_shortcuts(mut model: Model, cmd_ctrl: CmdCtrl) -> Model {
+    if let Settings::Loaded(overview) = &mut model.settings {
+        overview.cmd_ctrl = cmd_ctrl;
+    }
+    model
+}
+
+/// A running window that just heard of files from the PC.
+fn received_files() -> Model {
+    let mut model = running(true, Session::Idle);
+    model.agent_update(AgentUpdate::FilesReceived {
+        from: "Windows PC".to_owned(),
+        names: vec!["report.pdf".to_owned(), "photo (2).jpg".to_owned()],
+    });
+    model
 }
 
 fn running(connected: bool, session: Session) -> Model {
@@ -457,13 +491,68 @@ fn settings_that_cannot_be_read() {
         Settings::Failed("could not load config.toml: expected `=`".to_owned()),
         Some(PermissionState::Granted),
     );
-    shows(
+    let text = shows(
         &mut model,
         &[
             "Hop could not read its settings: could not load config.toml: expected `=`.",
             "Try again",
             "Hop cannot share until it can read its settings (see above).",
+            "Shortcuts",
+            "Hop cannot show this choice until it can read its settings (see above).",
         ],
+    );
+    assert!(!text.contains(words::MAC_KEEP_KEYS), "{text}");
+}
+
+#[test]
+fn the_shortcuts_are_worded_for_the_other_computers_keyboard() {
+    // The Mac applies the choice to keys from the PC's keyboard.
+    let text = shows(
+        &mut paired(),
+        &[
+            "Shortcuts",
+            "With Windows PC's keyboard on this computer:",
+            "Keep keys as they are: the Windows key is Cmd",
+            "Swap Ctrl and Cmd: Ctrl+C copies, as on a PC",
+            "The choice for this computer's keyboard is in Hop on Windows PC.",
+        ],
+    );
+    assert!(!text.contains(words::PC_KEEP_KEYS), "{text}");
+
+    // The PC applies it to keys from the Mac's keyboard.
+    let text = shows(
+        &mut paired_pc(),
+        &[
+            "With Mac's keyboard on this computer:",
+            "Keep keys as they are: Ctrl+C copies, Cmd is the Windows key",
+            "Swap Cmd and Ctrl: Cmd+C copies, as on a Mac",
+            "The choice for this computer's keyboard is in Hop on Mac.",
+        ],
+    );
+    assert!(!text.contains(words::MAC_KEEP_KEYS), "{text}");
+
+    // Before pairing, the other computer has no name yet.
+    shows(
+        &mut model_with(Os::MacOs, Vec::new()),
+        &[
+            "With the other computer's keyboard on this computer:",
+            "The choice for this computer's keyboard is in Hop on the other computer.",
+        ],
+    );
+}
+
+#[test]
+fn a_shortcuts_change_that_was_not_saved_shows_under_the_choice() {
+    let mut model = paired();
+    model.shortcuts_problem = Some("Not saved: could not save config.toml.".to_owned());
+    shows(&mut model, &["Not saved: could not save config.toml."]);
+}
+
+#[test]
+fn files_that_arrived_are_named_in_activity() {
+    shows(
+        &mut received_files(),
+        &["Files from Windows PC: report.pdf, photo (2).jpg"],
     );
 }
 
@@ -531,12 +620,18 @@ fn every_state_draws_at_the_real_size_and_at_the_smallest() {
     let mut models = vec![
         model_with(Os::MacOs, Vec::new()),
         paired(),
+        paired_pc(),
+        with_shortcuts(paired_pc(), CmdCtrl::Swap),
         running(true, Session::Controlling),
+        received_files(),
         showing(now),
     ];
     let mut joining = paired();
     joining.pairing.open_join();
     models.push(joining);
+    let mut not_saved = paired();
+    not_saved.shortcuts_problem = Some("Not saved: could not save config.toml.".to_owned());
+    models.push(not_saved);
     for model in &mut models {
         for size in [WINDOW, crate::WINDOW_MIN] {
             let (text, actions) = draw_in(model, now, size);
@@ -667,6 +762,33 @@ fn clicks_become_actions() {
     let mut missing = paired();
     missing.permission = Some(PermissionState::Denied);
     assert_eq!(click(&mut missing, "Allow…"), [Action::AllowAccessibility]);
+}
+
+#[test]
+fn a_shortcuts_choice_becomes_an_action_only_when_it_changes_something() {
+    assert_eq!(
+        click(&mut paired(), words::MAC_SWAP_KEYS),
+        [Action::SetShortcuts(CmdCtrl::Swap)]
+    );
+    assert_eq!(
+        click(&mut paired(), words::MAC_KEEP_KEYS),
+        [],
+        "it is chosen already"
+    );
+    let mut swapped = with_shortcuts(paired_pc(), CmdCtrl::Swap);
+    assert_eq!(
+        click(&mut swapped, words::PC_KEEP_KEYS),
+        [Action::SetShortcuts(CmdCtrl::Keep)]
+    );
+    assert_eq!(click(&mut swapped, words::PC_SWAP_KEYS), []);
+
+    let mut closing = paired();
+    closing.quitting = true;
+    assert_eq!(
+        click(&mut closing, words::MAC_SWAP_KEYS),
+        [],
+        "greyed out while the window closes"
+    );
 }
 
 #[test]

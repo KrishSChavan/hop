@@ -29,8 +29,19 @@
 //! - **Updates for an app** ([`Agent::report_to`]): connections and session
 //!   changes also go to an unbounded channel, with a `send` that never
 //!   waits, so a slow app can never hold this thread up.
+//! - **The clipboard** (docs/M4-M5-DESIGN.md, section 4): text goes out
+//!   right after the `Enter` or `Leave` the cursor leaves with, and text
+//!   that arrives is written before the next event; the core never sees it
+//!   ([`clipboard`]).
+//! - **Files** (section 5.3): the drop zones follow the edges that lead to
+//!   the other computer while it is connected and takes files; files
+//!   dropped there go to it, and what happens to them becomes status lines
+//!   with counts and reasons only. The names of files that arrived go to
+//!   the app alone ([`files`]).
 
+pub(crate) mod clipboard;
 pub(crate) mod exec;
+pub(crate) mod files;
 pub(crate) mod link;
 pub(crate) mod start;
 
@@ -39,6 +50,8 @@ pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 
+use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
@@ -47,11 +60,12 @@ use std::time::{Duration, Instant};
 
 use hop_core::{CaptureMode, Core, CoreConfig, Event, Layout, Millis, State};
 use hop_keymap::ModifierPolicy;
-use hop_net::NetEvent;
-use hop_platform::{CaptureMode as PlatformMode, CapturedEvent, Platform, PlatformError};
-use hop_types::{DeviceId, DisplayInfo, Edge, Os};
+use hop_net::{NetEvent, PeerUp, SendError, TransferEvent};
+use hop_platform::{CaptureMode as PlatformMode, CapturedEvent, DropZone, Platform, PlatformError};
+use hop_types::{CoreMessage, DeviceId, DisplayInfo, Edge, Os};
 
-use self::exec::Executor;
+use self::clipboard::ClipboardSettings;
+use self::exec::{Executor, Features};
 use self::link::Link;
 use crate::service::{AgentUpdate, Session};
 use crate::status;
@@ -151,6 +165,47 @@ pub(crate) struct Settings {
     pub(crate) policy: ModifierPolicy,
     /// The paired computer.
     pub(crate) peer: PeerPlacement,
+    /// Text clipboard sync (`[clipboard]`).
+    pub(crate) clipboard: ClipboardSettings,
+    /// Files travel: receiving them is on and has a folder, so this
+    /// computer advertises `files` and shows its drop zone (`[transfer]`).
+    pub(crate) files: bool,
+    /// How files that just arrived are shown.
+    pub(crate) show_files: ShowFiles,
+}
+
+/// Shows files that just arrived. It must return at once: the core thread
+/// calls it.
+type Show = dyn Fn(&[PathBuf]) + Send + Sync;
+
+/// How the core thread shows files that just arrived: selected in Finder
+/// or Explorer ([`ShowFiles::system`]), or, in tests, only recorded, since
+/// a test must never open a window.
+#[derive(Clone)]
+pub(crate) struct ShowFiles(Arc<Show>);
+
+impl ShowFiles {
+    /// Finder or Explorer, from a short-lived thread of its own
+    /// ([`crate::system::show_received`]).
+    pub(crate) fn system() -> ShowFiles {
+        ShowFiles(Arc::new(crate::system::show_received))
+    }
+
+    /// Shows files with `show`, which must return at once.
+    #[cfg(test)]
+    pub(crate) fn with(show: impl Fn(&[PathBuf]) + Send + Sync + 'static) -> ShowFiles {
+        ShowFiles(Arc::new(show))
+    }
+
+    fn show(&self, files: &[PathBuf]) {
+        (self.0)(files);
+    }
+}
+
+impl fmt::Debug for ShowFiles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ShowFiles")
+    }
 }
 
 /// Why the core thread could not start.
@@ -177,6 +232,12 @@ pub(crate) struct Agent<L: Link> {
     displays: Vec<DisplayInfo>,
     next_display_check: Instant,
     told_local_network: bool,
+    /// Whether files travel from this computer's side (see
+    /// [`Settings::files`]).
+    files: bool,
+    show_files: ShowFiles,
+    /// Whether the log already says this computer has no drop target.
+    told_no_drops: bool,
     updates: Option<Updates>,
 }
 
@@ -249,6 +310,7 @@ impl<L: Link> Agent<L> {
             .map_err(AgentError::Capture)?;
         let mut exec = Executor::new(platform, link, settings.os, settings.policy);
         exec.set_peer_name(settings.peer.id.clone(), settings.peer.name.clone());
+        exec.share_clipboard(settings.clipboard);
         Ok(Agent {
             core,
             exec,
@@ -260,14 +322,18 @@ impl<L: Link> Agent<L> {
             displays,
             next_display_check: Instant::now() + DISPLAY_CHECK,
             told_local_network: false,
+            files: settings.files,
+            show_files: settings.show_files,
+            told_no_drops: false,
             updates: None,
         })
     }
 
     /// From now on, also tells `updates` about connections
-    /// ([`AgentUpdate::Connected`], [`AgentUpdate::Disconnected`]) and
-    /// session changes ([`AgentUpdate::Session`], only when the kind
-    /// changes). Sending never waits.
+    /// ([`AgentUpdate::Connected`], [`AgentUpdate::Disconnected`]), session
+    /// changes ([`AgentUpdate::Session`], only when the kind changes) and
+    /// files that arrived ([`AgentUpdate::FilesReceived`]). Sending never
+    /// waits.
     pub(crate) fn report_to(&mut self, updates: Sender<AgentUpdate>) {
         let session = session_of(&self.core.state());
         self.updates = Some(Updates {
@@ -351,10 +417,12 @@ impl<L: Link> Agent<L> {
         busy
     }
 
-    /// One tick: timers, the lease, and the slower checks.
+    /// One tick: timers, the lease, files dropped at the edge, and the
+    /// slower checks.
     pub(crate) fn tick(&mut self) {
         self.feed(Event::Tick);
         self.renew_lease();
+        self.send_drops();
         let now = Instant::now();
         if now >= self.next_display_check {
             self.next_display_check = now + DISPLAY_CHECK;
@@ -366,14 +434,16 @@ impl<L: Link> Agent<L> {
     /// Quits failing open, in the design's order: input comes back first
     /// (a session ends the way a stall ends it: `Release` or `TakeBack`
     /// queued for the peer, the cursor restored where it left, capture
-    /// passive, injected keys released), then capture stops. The caller
-    /// then shuts the network down, which delivers the goodbye.
+    /// passive, injected keys released), then the drop zones go and capture
+    /// stops. The caller then shuts the network down, which delivers the
+    /// goodbye.
     pub(crate) fn quit(&mut self) {
         self.exec.begin_quit();
         if self.core.state() != State::Idle {
             self.feed(Event::LocalStall);
         }
         self.exec.fail_open();
+        self.set_zones(Vec::new());
         self.exec.platform.capture.stop();
     }
 
@@ -422,28 +492,7 @@ impl<L: Link> Agent<L> {
 
     fn on_net_event(&mut self, event: NetEvent) {
         match event {
-            NetEvent::PeerUp(up) => {
-                tracing::info!(
-                    peer = %up.peer,
-                    name = %up.name,
-                    os = %up.os,
-                    version = %up.app_version,
-                    address = %up.remote,
-                    dialled_by_us = up.dialled_by_us,
-                    "connected"
-                );
-                status!("Connected to {} ({}).", up.name, up.os);
-                self.report(AgentUpdate::Connected {
-                    name: up.name.clone(),
-                    os: up.os,
-                });
-                self.exec.set_peer_name(up.peer.clone(), up.name.clone());
-                self.feed(Event::PeerConnected {
-                    peer: up.peer,
-                    os: up.os,
-                    displays: up.displays,
-                });
-            }
+            NetEvent::PeerUp(up) => self.on_peer_up(up),
             NetEvent::PeerDown { peer, reason } => {
                 tracing::info!(peer = %peer, reason = %reason, "disconnected");
                 if !self.exec.is_quitting() {
@@ -455,12 +504,185 @@ impl<L: Link> Agent<L> {
                 // Before the core hears it, so a session it ends is
                 // reported after the connection.
                 self.report(AgentUpdate::Disconnected);
+                self.exec.peer_down(&peer);
                 self.feed(Event::PeerDisconnected { peer });
+                self.update_zones();
             }
+            // The agent's own: written here, before the next event, so the
+            // next key pastes it. The core never sees clipboard text.
+            NetEvent::Message {
+                from,
+                msg: CoreMessage::ClipboardText { text, .. },
+            } => self.receive_clipboard(&from, &text),
             NetEvent::Message { from, msg } => self.feed(Event::PeerMessage { from, msg }),
-            // Files sent or received: the agent's own, from work package T5
-            // on. The core never sees files.
-            NetEvent::Transfer(_) => {}
+            // Files sent or received: the agent's own too.
+            NetEvent::Transfer(transfer) => self.on_transfer(transfer),
+        }
+    }
+
+    fn on_peer_up(&mut self, up: PeerUp) {
+        tracing::info!(
+            peer = %up.peer,
+            name = %up.name,
+            os = %up.os,
+            version = %up.app_version,
+            address = %up.remote,
+            dialled_by_us = up.dialled_by_us,
+            clipboard = up.supports_clipboard(),
+            files = up.supports_files(),
+            "connected"
+        );
+        status!("Connected to {} ({}).", up.name, up.os);
+        self.report(AgentUpdate::Connected {
+            name: up.name.clone(),
+            os: up.os,
+        });
+        self.exec.set_peer_name(up.peer.clone(), up.name.clone());
+        let features = Features {
+            clipboard: self.exec.clipboard_enabled() && up.supports_clipboard(),
+            files: self.files && up.supports_files(),
+        };
+        self.exec.peer_up(up.peer.clone(), features);
+        if features.clipboard {
+            // Once per connection, so the user always knows that what they
+            // copy can travel; nothing is said per copy.
+            status!("{}", clipboard::works_with(&up.name));
+        }
+        self.feed(Event::PeerConnected {
+            peer: up.peer,
+            os: up.os,
+            displays: up.displays,
+        });
+        // Only now: the core knows the edges toward the peer once it has
+        // handled the connection.
+        self.update_zones();
+    }
+
+    /// Clipboard text from `from`, written only if it is the paired
+    /// computer (and the two sync the clipboard).
+    fn receive_clipboard(&mut self, from: &DeviceId, text: &str) {
+        if *from == self.peer.id {
+            self.exec.receive_clipboard(from, text);
+        } else {
+            tracing::debug!(peer = %from, "ignored clipboard text from a computer Hop does not share with");
+        }
+    }
+
+    /// Shows the drop zones along the edges that lead to the paired
+    /// computer while it is connected and takes files, and takes them down
+    /// otherwise.
+    fn update_zones(&mut self) {
+        let zones = if self.exec.features(&self.peer.id).files {
+            files::drop_zones(self.core.edges_toward(&self.peer.id))
+        } else {
+            Vec::new()
+        };
+        self.set_zones(zones);
+    }
+
+    /// Hands `zones` to the drop target. A computer without one is noted in
+    /// the log once: files can still arrive there, only not be dropped.
+    fn set_zones(&mut self, zones: Vec<DropZone>) {
+        let label = files::drop_label(&self.exec.name_of(&self.peer.id));
+        match self.exec.platform.drops.set_zones(zones, &label) {
+            Ok(()) => {}
+            Err(PlatformError::Unsupported) => {
+                if !std::mem::replace(&mut self.told_no_drops, true) {
+                    tracing::info!(
+                        "this computer has no drop target yet, so files cannot be dropped at \
+                         the edge of its screen to send them"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "could not set up the drop zones"),
+        }
+    }
+
+    /// Sends what was dropped on the drop zone to the paired computer, or
+    /// says why not. Status lines count what was dropped; they never name
+    /// it.
+    fn send_drops(&mut self) {
+        for paths in self.exec.platform.drops.take_drops() {
+            if paths.is_empty() {
+                continue;
+            }
+            let peer = self.peer.id.clone();
+            let name = self.exec.name_of(&peer);
+            let dropped = paths.len();
+            let refused = if !self.exec.is_connected(&peer) {
+                Some(SendError::NotConnected)
+            } else if !self.exec.features(&peer).files {
+                Some(SendError::NotNegotiated)
+            } else {
+                None
+            };
+            let sent = match refused {
+                Some(error) => Err(error),
+                None => self.exec.link.send_files(&peer, paths),
+            };
+            match sent {
+                Ok(id) => {
+                    tracing::info!(peer = %peer, id, items = dropped, "sending dropped files");
+                    status!("{}", files::sending(dropped, &name));
+                }
+                Err(error) => {
+                    tracing::info!(peer = %peer, items = dropped, error = %error, "dropped files were not sent");
+                    status!("{}", files::not_sent(&error, &name));
+                }
+            }
+        }
+    }
+
+    /// What happened to a file transfer becomes a status line with counts
+    /// and reasons. Files that arrived also open in their folder, and the
+    /// app (alone) hears their names.
+    fn on_transfer(&mut self, transfer: TransferEvent) {
+        match transfer {
+            TransferEvent::Received {
+                from,
+                id,
+                files: saved,
+            } => {
+                tracing::info!(peer = %from, id, files = saved.len(), "files received");
+                if saved.is_empty() {
+                    return;
+                }
+                let name = self.exec.name_of(&from);
+                status!("{}", files::received(saved.len(), &name));
+                self.show_files.show(&saved);
+                self.report(AgentUpdate::FilesReceived {
+                    from: name,
+                    names: files::names(&saved),
+                });
+            }
+            TransferEvent::Sent {
+                to,
+                id,
+                files: sent,
+                skipped,
+            } => {
+                tracing::info!(peer = %to, id, files = sent, skipped, "files sent");
+                status!("{}", files::sent(sent, skipped, &self.exec.name_of(&to)));
+            }
+            TransferEvent::Failed {
+                peer,
+                id,
+                outgoing,
+                reason,
+            } => {
+                // A fixed name for the reason: it never names a file.
+                tracing::info!(
+                    peer = %peer,
+                    id,
+                    outgoing,
+                    reason = files::failure_kind(&reason),
+                    "a file transfer stopped"
+                );
+                status!(
+                    "{}",
+                    files::failed(outgoing, &reason, &self.exec.name_of(&peer))
+                );
+            }
         }
     }
 
@@ -506,6 +728,8 @@ impl<L: Link> Agent<L> {
                 self.displays = displays.clone();
                 self.feed(Event::LayoutChanged(layout));
                 self.exec.link.set_displays(displays);
+                // The edges toward the peer moved with the screens.
+                self.update_zones();
             }
             Ok(_) => {}
             Err(error) => {

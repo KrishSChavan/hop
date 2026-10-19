@@ -1,6 +1,6 @@
 # Installing and using Hop
 
-Hop lets one keyboard and mouse control both your Mac and your Windows PC. You install it once on each computer and pair the two computers once. After that, you open Hop on both and click **Start sharing**.
+Hop lets one keyboard and mouse control both your Mac and your Windows PC. It also carries copied text from one computer to the other, and sends files you drop at the edge of the screen. You install it once on each computer and pair the two computers once. After that, you open Hop on both and click **Start sharing**.
 
 You need:
 - both computers on the same home Wi-Fi;
@@ -100,7 +100,17 @@ The examples here are what the Mac shows when the PC is on its right.
 1. Click **Start sharing** on both computers. The status line, next to the coloured dot, says "Looking for Windows PC…" and then "Connected to Windows PC."
 2. Push the cursor past the edge Hop names: "Push the cursor past the right edge of this screen to move to Windows PC." The cursor carries on onto the other computer, and the keyboard follows. Hop says "Using Windows PC: this keyboard and mouse control it now."
 3. To come back, move the cursor back the way it came, across the border between the two screens. Or just use the other computer's own trackpad, mouse or keyboard: that takes control back.
-4. Keys stay as labelled. With the Mac's keyboard on the PC, use the PC's shortcuts: Ctrl+C copies and Ctrl+V pastes, and the Mac's Cmd key acts as the Windows key. With the PC's keyboard on the Mac, the Windows key acts as Cmd, so Windows key + C copies.
+4. **Keys stay as labelled.** With the Mac's keyboard on the PC, use the PC's shortcuts: Ctrl+C copies and Ctrl+V pastes, and the Mac's Cmd key acts as the Windows key. With the PC's keyboard on the Mac, the Windows key acts as Cmd, so Windows key + C copies.
+   - To use the Mac's shortcuts on the PC instead (Cmd+C copies there too): in Hop on the PC, under **Shortcuts**, choose "Swap Cmd and Ctrl: Cmd+C copies, as on a Mac".
+   - To use the PC's shortcuts on the Mac (Ctrl+C copies there too): in Hop on the Mac, under **Shortcuts**, choose "Swap Ctrl and Cmd: Ctrl+C copies, as on a PC".
+   - Each computer has its own choice, for the keys that arrive on it. To go back, choose "Keep keys as they are". Sharing restarts by itself after a change, which takes a few seconds.
+5. **Copy and paste** works between the computers, for text. Copy on one computer, move the cursor to the other one, and paste there. The text goes along when the cursor crosses, so move the cursor after you copy. Text copied from a password manager never goes to the other computer.
+6. **Send files** by dropping them at the edge of the screen:
+   1. Drag the files from Finder (or File Explorer) towards the edge that leads to the other computer. The cursor stays on this screen while you drag.
+   2. Near the edge, a box appears: "Drop to send to Windows PC". Drop the files on it.
+   3. Hop copies them to the other computer, into the **Hop Received** folder inside its **Downloads** folder, and opens that folder there to show them. The originals stay where they were.
+
+   Hop sends files, not folders: to send what is in a folder, open it and drag the files. The first time files arrive on the Mac, macOS asks whether Hop may access files in your Downloads folder. Click **Allow**.
 
 **The emergency keys.** If the keyboard and mouse ever seem stuck on the other computer, press these keys together on the computer you are typing on. Use the keys on the left side of the keyboard. Control comes back at once.
 - On the Mac: **Control + Option + Shift + Escape**.
@@ -116,7 +126,7 @@ Hop does not start by itself yet. Each time, open Hop and click **Start sharing*
 2. **On the Mac:** quit Hop (Cmd+Q). Unzip the new Hop and drag it into the same Applications folder as before, then click **Replace**. macOS blocks the new Hop's first open again, so use Open Anyway or the Terminal line from step 2.4. Accessibility stays allowed.
 3. **On the PC:** close Hop. Extract the new zip into the same Hop folder as before, and choose **Replace the files in the destination**. Keep the same folder, so Windows Firewall still knows Hop. If Windows says "Windows protected your PC", click **More info**, then **Run anyway**.
 
-Your pairing and your **Where is it?** choices stay as they are. Hop keeps them in its settings, not in the app.
+Your pairing and your **Where is it?** and **Shortcuts** choices stay as they are. Hop keeps them in its settings, not in the app.
 
 ## If something goes wrong
 
@@ -128,5 +138,8 @@ Your pairing and your **Where is it?** choices stay as they are. Hop keeps them 
   - Type the other computer's address into **Address**, under **Your other computer**, and click **Save address**. Do this on both computers. The PC's address is found as in step 4. The Mac's is in System Settings → Wi-Fi: click **Details…** next to your network, then TCP/IP.
 - **You clicked Cancel when Windows asked about networks.** Open Windows Security → Firewall & network protection → Allow an app through firewall. Click **Change settings**, find Hop, tick **Private**, and click **OK**. If Hop is not in the list, click **Allow another app…** and choose Hop.exe in your Hop folder.
 - **Start sharing is greyed out.** Hop says "Pair with your other computer first." Pair them as in step 4.
+- **Paste gives the old text.** Copied text goes to the other computer when the cursor crosses. Copy first, then move the cursor across, then paste. Both computers need the same version of Hop.
+- **No box appears when you drag files to the edge.** Check that both computers are connected ("Connected to …") and run the same version of Hop. The box appears only while you drag files, close to the edge that leads to the other computer. **Activity** says what happened to files you dropped.
+- **Files from the PC never arrive on the Mac.** If you clicked Don't Allow when macOS asked about the Downloads folder: open System Settings → Privacy & Security → Files & Folders, find Hop, and switch on **Downloads Folder**.
 - **To pair again**, for example with a new computer: click **Forget…** under **Your other computer**, then pair as in step 4.
-- **Hop's log.** Click **Open log folder** under **Activity** in Hop's window. On the Mac the log is in `~/Library/Logs/Hop`, and on the PC in `%LOCALAPPDATA%\Hop\Logs`. The log never contains what you type or copy, or pairing codes, so you can share it with Claude.
+- **Hop's log.** Click **Open log folder** under **Activity** in Hop's window. On the Mac the log is in `~/Library/Logs/Hop`, and on the PC in `%LOCALAPPDATA%\Hop\Logs`. The log never contains what you type or copy, the names of files you send, or pairing codes, so you can share it with Claude.

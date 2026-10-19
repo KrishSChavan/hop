@@ -16,13 +16,6 @@ pub(crate) trait Link {
     fn send(&self, to: &DeviceId, msg: CoreMessage) -> Result<(), SendError>;
     /// Sends the files at `paths` to `to` and returns the transfer's id at
     /// once; the outcome arrives later as `NetEvent::Transfer`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the agent sends dropped files from work package T5 on"
-        )
-    )]
     fn send_files(&self, to: &DeviceId, paths: Vec<PathBuf>) -> Result<u64, SendError>;
     /// Wakes `to`'s Wi-Fi radio with a tiny datagram, best effort.
     fn nudge(&self, to: &DeviceId);

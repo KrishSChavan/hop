@@ -7,7 +7,7 @@
 //! - [`pairing`]: pairing the two computers once with a code, the flow
 //!   behind `hop pair`, without a terminal.
 //! - [`settings`]: reading and changing the config file (where the other
-//!   computer sits, its address, forgetting it).
+//!   computer sits, its address, forgetting it, the Shortcuts setting).
 //! - [`system`]: small helpers: the Accessibility permission, opening
 //!   System Settings and the log folder, and keeping macOS from napping Hop.
 //! - [`logging`]: the log every part writes to, and its status lines.
@@ -37,6 +37,9 @@ mod simulate;
 mod startup;
 pub mod system;
 
+/// The Shortcuts setting: whether Cmd and Ctrl trade places on keys from
+/// the other computer's keyboard.
+pub use hop_config::CmdCtrl;
 /// Where the other computer sits: the side of this computer's screens the
 /// cursor crosses to reach it.
 pub use hop_config::Side;

@@ -175,6 +175,9 @@ impl Sharing {
                     running.session = session;
                 }
             }
+            // Files say nothing about who uses which keyboard and mouse. The
+            // model lists their names in Activity (`Model::agent_update`).
+            AgentUpdate::FilesReceived { .. } => {}
             AgentUpdate::Stopped { error } => {
                 if let Sharing::Stopping { restart: true } = self {
                     *self = Sharing::Starting;

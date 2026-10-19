@@ -1,30 +1,36 @@
 //! Tests of the agent with fake platforms: the action executor, the core
-//! loop's fail-open duties, the updates an app hears, and two agents talking
-//! over loopback hop-net. Nothing here captures or injects real input, and
-//! the network tests bind 127.0.0.1 only, with discovery off (no multicast).
+//! loop's fail-open duties, the updates an app hears, the clipboard and
+//! files, and two agents talking over loopback hop-net. Nothing here
+//! captures or injects real input, touches the real clipboard or opens a
+//! window, and the network tests bind 127.0.0.1 only, with discovery off
+//! (no multicast).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use hop_core::{Action, CaptureMode as CoreMode, Chord, CoreConfig, State};
 use hop_keymap::ModifierPolicy;
-use hop_net::{DownReason, Identity, NetConfig, NetEvent, PeerUp, PinnedPeer};
-use hop_platform::{CaptureMode, DropZone};
-use hop_proto::{Capability, Negotiated, PROTO_MAJOR, caps};
+use hop_net::{
+    DownReason, Identity, NetConfig, NetEvent, PeerUp, PinnedPeer, Refusal, SendError,
+    TransferEvent, TransferFailure,
+};
+use hop_platform::{CaptureMode, DropZone, Platform};
+use hop_proto::{Capability, Negotiated, PROTO_MAJOR, ProtoError, caps};
 use hop_types::{
     CoreMessage, DeviceId, DisplayInfo, Edge, EntryPoint, InputEvent, KeyCode, MotionMark,
     MouseButton, Os, Point, Rect, ScrollUnit,
 };
 
-use super::exec::Executor;
+use super::clipboard::ClipboardSettings;
+use super::exec::{Executor, Features};
 use super::fake::{Call, Fake, FakeLink};
 use super::link::{Link, NetLink};
 use super::start::Host;
-use super::{Agent, INPUT_QUEUE, PeerPlacement, Settings, Signals};
+use super::{Agent, INPUT_QUEUE, PeerPlacement, Settings, ShowFiles, Signals};
 use crate::agent::start::chord;
 use crate::logging;
 use crate::service::{AgentHandle, AgentUpdate, PANICKED, Session};
@@ -51,7 +57,9 @@ fn display(width: f64, height: f64) -> DisplayInfo {
 }
 
 /// Settings for a test agent. The Cmd/Ctrl swap is on (it is off by
-/// default), so the tests show keys being mapped on their way.
+/// default), so the tests show keys being mapped on their way. Clipboard
+/// sync and files are on, as by default; they work only with a peer that
+/// negotiated them.
 fn settings(me: DeviceId, os: Os, peer: DeviceId, peer_name: &str, side: Edge) -> Settings {
     Settings {
         me,
@@ -65,10 +73,29 @@ fn settings(me: DeviceId, os: Os, peer: DeviceId, peer_name: &str, side: Edge) -
             name: peer_name.to_owned(),
             side,
         },
+        clipboard: ClipboardSettings {
+            enabled: true,
+            max_text_bytes: 1_048_576,
+        },
+        files: true,
+        // A test never opens a window: files that arrive are not shown.
+        show_files: ShowFiles::with(|_| {}),
     }
 }
 
+/// A connection that negotiated input only, as with a Hop from before M4.
 fn peer_up(peer: DeviceId, name: &str, os: Os, screen: DisplayInfo) -> NetEvent {
+    peer_up_with(peer, name, os, screen, &[caps::INPUT])
+}
+
+/// A connection that negotiated `capabilities`.
+fn peer_up_with(
+    peer: DeviceId,
+    name: &str,
+    os: Os,
+    screen: DisplayInfo,
+    capabilities: &[&str],
+) -> NetEvent {
     NetEvent::PeerUp(PeerUp {
         peer,
         name: name.to_owned(),
@@ -78,7 +105,10 @@ fn peer_up(peer: DeviceId, name: &str, os: Os, screen: DisplayInfo) -> NetEvent 
         negotiated: Negotiated {
             proto_major: PROTO_MAJOR,
             proto_minor: 0,
-            capabilities: vec![Capability::new(caps::INPUT, 1)],
+            capabilities: capabilities
+                .iter()
+                .map(|name| Capability::new(*name, 1))
+                .collect(),
         },
         remote: SocketAddr::from(([127, 0, 0, 1], 47800)),
         dialled_by_us: true,
@@ -514,6 +544,96 @@ fn failing_open_gives_everything_back() {
         state.cursor,
         Point::new(1500.0, 400.0),
         "back where it left"
+    );
+}
+
+/// An executor on `os` that syncs the clipboard with `peer`, which is
+/// connected and takes clipboard text; something new is on the clipboard.
+fn syncing_executor(os: Os, peer: DeviceId) -> (Executor<FakeLink>, Fake, FakeLink) {
+    let (mut exec, fake, link) = executor(os, false);
+    exec.share_clipboard(ClipboardSettings {
+        enabled: true,
+        max_text_bytes: 1_048_576,
+    });
+    exec.peer_up(
+        peer,
+        Features {
+            clipboard: true,
+            files: false,
+        },
+    );
+    fake.copy("copied");
+    (exec, fake, link)
+}
+
+fn copied() -> CoreMessage {
+    CoreMessage::ClipboardText {
+        generation: 1,
+        text: "copied".to_owned(),
+    }
+}
+
+#[test]
+fn the_clipboard_follows_its_enter_even_when_another_message_comes_next() {
+    let (mut exec, _, link) = syncing_executor(Os::MacOs, pc_id());
+    let enter = CoreMessage::Enter {
+        seq: 1,
+        entry: EntryPoint {
+            display_id: 1,
+            edge: Edge::Left,
+            position: Point::new(1.0, 400.0),
+        },
+        held_keys: Vec::new(),
+        source_os: Os::MacOs,
+    };
+    let heartbeat = CoreMessage::Heartbeat { seq: 1 };
+    let _ = exec.execute(vec![
+        Action::Send {
+            to: pc_id(),
+            msg: enter.clone(),
+        },
+        Action::Send {
+            to: pc_id(),
+            msg: heartbeat.clone(),
+        },
+    ]);
+    assert_eq!(link.sent(), [enter, copied(), heartbeat]);
+}
+
+#[test]
+fn reading_the_clipboard_holds_up_nothing_else_the_cursor_leaving_does() {
+    // The controlled side: the Leave comes before letting go of what was
+    // injected, and the clipboard is read only once that is done.
+    let (mut exec, fake, link) = syncing_executor(Os::Windows, mac_id());
+    let _ = exec.execute(vec![inject_from_mac(KeyCode::LEFT_SHIFT, true)]);
+    fake.state().calls.clear();
+    let leave = CoreMessage::Leave {
+        seq: 1,
+        to: mac_id(),
+        entry: EntryPoint {
+            display_id: 1,
+            edge: Edge::Right,
+            position: Point::new(1511.0, 400.0),
+        },
+    };
+    let _ = exec.execute(vec![
+        Action::Send {
+            to: mac_id(),
+            msg: leave.clone(),
+        },
+        Action::ReleaseAllInjected,
+        Action::ConcealCursor,
+    ]);
+    assert_eq!(link.sent(), [leave, copied()]);
+    let state = fake.state();
+    assert_eq!(
+        state.calls,
+        [
+            Call::Inject(key(KeyCode::LEFT_SHIFT, false)),
+            Call::ReleaseAll,
+            Call::Conceal,
+            Call::ReadClipboard,
+        ]
     );
 }
 
@@ -1038,6 +1158,704 @@ fn an_unpaired_computer_stops_with_the_reason_before_touching_input() {
     };
     assert!(error.contains("not paired"), "{error}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ----- the clipboard and files -----------------------------------------------
+
+/// What a connection between two current builds negotiates: input,
+/// clipboard text and files.
+const EVERYTHING: [&str; 3] = [caps::INPUT, caps::CLIPBOARD_TEXT, caps::FILES];
+
+/// The V key.
+const V: KeyCode = KeyCode::keyboard(0x19);
+
+/// A test agent with everything around it: its fake platform and network,
+/// what it told the app, and the files it showed.
+struct Rig {
+    agent: Agent<FakeLink>,
+    fake: Fake,
+    link: FakeLink,
+    app: mpsc::Receiver<AgentUpdate>,
+    shown: Arc<Mutex<Vec<Vec<PathBuf>>>>,
+    /// The other computer's id and name, as its connection gives them.
+    peer: (DeviceId, String),
+    /// The other computer's OS and screen.
+    peer_screen: (Os, DisplayInfo),
+}
+
+impl Rig {
+    /// A Mac with the PC, which calls itself `name`, on its right, with its
+    /// settings changed by `adjust`. Not connected yet.
+    fn mac(name: &str, adjust: impl FnOnce(&mut Settings)) -> Rig {
+        Rig::start(
+            Fake::new(1512.0, 982.0),
+            settings(mac_id(), Os::MacOs, pc_id(), name, Edge::Right),
+            adjust,
+            (Os::Windows, display(1536.0, 864.0)),
+        )
+    }
+
+    /// A PC with the Mac, which calls itself `name`, on its left, with its
+    /// settings changed by `adjust`. Not connected yet.
+    fn pc(name: &str, adjust: impl FnOnce(&mut Settings)) -> Rig {
+        Rig::start(
+            Fake::new(1536.0, 864.0),
+            settings(pc_id(), Os::Windows, mac_id(), name, Edge::Left),
+            adjust,
+            (Os::MacOs, display(1512.0, 982.0)),
+        )
+    }
+
+    fn start(
+        (platform, fake): (Platform, Fake),
+        mut settings: Settings,
+        adjust: impl FnOnce(&mut Settings),
+        peer_screen: (Os, DisplayInfo),
+    ) -> Rig {
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let record = shown.clone();
+        settings.show_files = ShowFiles::with(move |files| {
+            record
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(files.to_vec());
+        });
+        adjust(&mut settings);
+        let peer = (settings.peer.id.clone(), settings.peer.name.clone());
+        let link = FakeLink::default();
+        let mut agent = Agent::start(
+            platform,
+            link.clone(),
+            settings,
+            Arc::new(Signals::default()),
+        )
+        .expect("agent");
+        let (tx, app) = mpsc::channel();
+        agent.report_to(tx);
+        Rig {
+            agent,
+            fake,
+            link,
+            app,
+            shown,
+            peer,
+            peer_screen,
+        }
+    }
+
+    /// The other computer connects, over a link that negotiated
+    /// `capabilities`.
+    fn connect(&mut self, capabilities: &[&str]) {
+        let (id, name) = &self.peer;
+        let (os, screen) = &self.peer_screen;
+        self.deliver(peer_up_with(
+            id.clone(),
+            name,
+            *os,
+            screen.clone(),
+            capabilities,
+        ));
+    }
+
+    /// The other computer's connection closes.
+    fn disconnect(&mut self) {
+        self.deliver(NetEvent::PeerDown {
+            peer: self.peer.0.clone(),
+            reason: DownReason::TimedOut,
+        });
+    }
+
+    /// Hands `event` to the agent, as the network would.
+    fn deliver(&mut self, event: NetEvent) {
+        self.link.deliver(event);
+        let _ = self.agent.poll();
+    }
+
+    /// Pushes the Mac's cursor past its right edge and lets the PC accept.
+    fn cross(&mut self) -> u64 {
+        cross_to_the_pc(&mut self.agent, &self.fake, &self.link)
+    }
+
+    /// The PC hands the cursor back to the Mac through its left edge, as
+    /// the session `seq` ends; `then` arrives right after the `Leave`.
+    fn come_back(&mut self, seq: u64, then: Option<NetEvent>) {
+        self.link.deliver(NetEvent::Message {
+            from: pc_id(),
+            msg: CoreMessage::Leave {
+                seq,
+                to: mac_id(),
+                entry: EntryPoint {
+                    display_id: 1,
+                    edge: Edge::Right,
+                    position: Point::new(1511.0, 400.0),
+                },
+            },
+        });
+        if let Some(event) = then {
+            self.link.deliver(event);
+        }
+        let _ = self.agent.poll();
+        assert_eq!(self.agent.state(), State::Idle);
+    }
+
+    /// What the agent told the app since the last call.
+    fn updates(&self) -> Vec<AgentUpdate> {
+        self.app.try_iter().collect()
+    }
+
+    /// The files the agent showed in Finder or Explorer, as it would have.
+    fn shown(&self) -> Vec<Vec<PathBuf>> {
+        self.shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Clipboard text from `from`.
+fn clipboard_from(from: DeviceId, text: &str) -> NetEvent {
+    NetEvent::Message {
+        from,
+        msg: CoreMessage::ClipboardText {
+            generation: 1,
+            text: text.to_owned(),
+        },
+    }
+}
+
+/// Where in `link`'s messages the first one `is` matches is.
+fn position_of(link: &FakeLink, is: impl Fn(&CoreMessage) -> bool) -> usize {
+    link.sent()
+        .iter()
+        .position(is)
+        .expect("the message was sent")
+}
+
+#[test]
+fn the_clipboard_goes_to_the_pc_right_after_enter() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("Clipboard PC", |_| {});
+    rig.connect(&EVERYTHING);
+    rig.fake.copy("clipboard-secret-going-over");
+    rig.cross();
+    let enter = position_of(&rig.link, |msg| matches!(msg, CoreMessage::Enter { .. }));
+    assert_eq!(
+        rig.link.net().sent.get(enter + 1),
+        Some(&(
+            pc_id(),
+            CoreMessage::ClipboardText {
+                generation: 1,
+                text: "clipboard-secret-going-over".to_owned()
+            }
+        )),
+        "right after the Enter, so it arrives before any key"
+    );
+    assert_eq!(rig.link.sent_clipboard().len(), 1);
+
+    let log = logging::tests::captured_text();
+    assert!(
+        log.contains("Copy and paste now work between this computer and Clipboard PC."),
+        "said once the connection carries clipboard text"
+    );
+    assert!(
+        !log.contains("clipboard-secret"),
+        "the log never has clipboard text"
+    );
+}
+
+#[test]
+fn the_clipboard_goes_to_the_mac_right_after_leave() {
+    let mut rig = Rig::pc("Mac", |_| {});
+    rig.connect(&EVERYTHING);
+    let seq = mac_enters(&mut rig.agent, &rig.link);
+    // Ctrl+C from the Mac's keyboard copied something on the PC.
+    rig.fake.copy("copied on the PC");
+    // The Mac moves the cursor out through the PC's left edge.
+    rig.deliver(NetEvent::Message {
+        from: mac_id(),
+        msg: CoreMessage::Motion {
+            seq,
+            mark: MotionMark {
+                n: 1,
+                total_dx: -50.0,
+                total_dy: 0.0,
+            },
+        },
+    });
+    assert_eq!(rig.agent.state(), State::Idle);
+    let leave = position_of(&rig.link, |msg| matches!(msg, CoreMessage::Leave { .. }));
+    let sent = rig.link.net().sent.clone();
+    assert_eq!(sent[leave].0, mac_id());
+    assert_eq!(
+        sent.get(leave + 1),
+        Some(&(
+            mac_id(),
+            CoreMessage::ClipboardText {
+                generation: 1,
+                text: "copied on the PC".to_owned()
+            }
+        )),
+        "right after the Leave, to the computer the cursor goes to"
+    );
+}
+
+#[test]
+fn what_was_copied_before_sharing_started_stays_here() {
+    let (platform, fake) = Fake::new(1512.0, 982.0);
+    fake.copy("copied before sharing started");
+    let mut rig = Rig::start(
+        (platform, fake),
+        settings(mac_id(), Os::MacOs, pc_id(), "PC", Edge::Right),
+        |_| {},
+        (Os::Windows, display(1536.0, 864.0)),
+    );
+    rig.connect(&EVERYTHING);
+    rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), []);
+    assert_eq!(rig.fake.state().clipboard_reads, 0, "not even read");
+}
+
+#[test]
+fn the_clipboard_goes_once_and_not_again_until_it_changes() {
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    rig.fake.copy("one");
+    let seq = rig.cross();
+    rig.come_back(seq, None);
+    let seq = rig.cross();
+    assert_eq!(
+        rig.link.sent_clipboard(),
+        [(pc_id(), "one".to_owned())],
+        "unchanged, so not sent again"
+    );
+    assert_eq!(rig.fake.state().clipboard_reads, 1, "and not even read");
+
+    rig.come_back(seq, None);
+    rig.fake.copy("two");
+    rig.cross();
+    assert_eq!(
+        rig.link.sent_clipboard(),
+        [(pc_id(), "one".to_owned()), (pc_id(), "two".to_owned())]
+    );
+}
+
+#[test]
+fn a_clipboard_that_could_not_be_read_is_tried_again_at_the_next_crossing() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    rig.fake.copy("clipboard-secret-read-later");
+    // The app that copied did not answer in time.
+    rig.fake.state().fail_clipboard_read = true;
+    let seq = rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), []);
+    rig.come_back(seq, None);
+
+    rig.fake.state().fail_clipboard_read = false;
+    rig.cross();
+    assert_eq!(
+        rig.link.sent_clipboard(),
+        [(pc_id(), "clipboard-secret-read-later".to_owned())],
+        "nothing was recorded, so it went this time"
+    );
+    let log = logging::tests::captured_text();
+    assert!(
+        log.contains("could not read the clipboard; the next crossing tries again"),
+        "{log}"
+    );
+    assert!(!log.contains("clipboard-secret"));
+}
+
+#[test]
+fn text_from_the_other_computer_is_pasted_here_and_never_sent_back() {
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    rig.fake.copy("copied on the Mac");
+    let seq = rig.cross();
+    // The cursor comes back with the PC's clipboard right after the Leave.
+    rig.come_back(seq, Some(clipboard_from(pc_id(), "copied on the PC")));
+    assert_eq!(
+        rig.fake.state().clipboard.as_deref(),
+        Some("copied on the PC")
+    );
+
+    let seq = rig.cross();
+    assert_eq!(
+        rig.link.sent_clipboard(),
+        [(pc_id(), "copied on the Mac".to_owned())],
+        "the PC's text is not echoed back"
+    );
+    rig.come_back(seq, None);
+    rig.fake.copy("copied on the Mac again");
+    rig.cross();
+    assert_eq!(
+        rig.link.sent_clipboard().last(),
+        Some(&(pc_id(), "copied on the Mac again".to_owned()))
+    );
+}
+
+#[test]
+fn text_that_arrives_is_on_the_clipboard_before_the_next_key_is_typed() {
+    let mut rig = Rig::pc("Mac", |_| {});
+    rig.connect(&EVERYTHING);
+    // The Mac crosses with its clipboard and types Ctrl+V at once: all of
+    // it waits in the queue together.
+    rig.link.deliver(NetEvent::Message {
+        from: mac_id(),
+        msg: CoreMessage::Enter {
+            seq: 1,
+            entry: EntryPoint {
+                display_id: 1,
+                edge: Edge::Left,
+                position: Point::new(1.0, 400.0),
+            },
+            held_keys: Vec::new(),
+            source_os: Os::MacOs,
+        },
+    });
+    rig.link
+        .deliver(clipboard_from(mac_id(), "copied on the Mac"));
+    rig.link
+        .deliver(key_input(1, 0, KeyCode::LEFT_CONTROL, true));
+    rig.link.deliver(key_input(1, 0, V, true));
+    let _ = rig.agent.poll();
+    let state = rig.fake.state();
+    assert_eq!(state.clipboard.as_deref(), Some("copied on the Mac"));
+    let written = state
+        .calls
+        .iter()
+        .position(|call| *call == Call::WriteClipboard)
+        .expect("written");
+    let pasted = state
+        .calls
+        .iter()
+        .position(|call| *call == Call::Inject(key(V, true)))
+        .expect("V typed");
+    assert!(written < pasted, "{:?}", state.calls);
+}
+
+#[test]
+fn a_computer_without_clipboard_sync_gets_no_text_and_its_text_is_not_written() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("PC from before M4", |_| {});
+    rig.connect(&[caps::INPUT]);
+    rig.fake.copy("copied on the Mac");
+    let seq = rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), []);
+    assert_eq!(rig.fake.state().clipboard_reads, 0, "not even read");
+    // The network delivers no text without the capability; the agent does
+    // not write any either.
+    rig.come_back(seq, Some(clipboard_from(pc_id(), "from the PC")));
+    // Nor text from a computer Hop does not share with.
+    rig.deliver(clipboard_from(
+        DeviceId::new("b".repeat(32)),
+        "from a stranger",
+    ));
+    assert_eq!(
+        rig.fake.state().clipboard.as_deref(),
+        Some("copied on the Mac")
+    );
+    let log = logging::tests::captured_text();
+    assert!(!log.contains("this computer and PC from before M4."));
+}
+
+#[test]
+fn with_clipboard_sync_off_nothing_is_read_sent_or_written() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("PC with sync off on the Mac", |settings| {
+        settings.clipboard = ClipboardSettings::OFF;
+    });
+    rig.connect(&EVERYTHING);
+    rig.fake.copy("copied on the Mac");
+    let seq = rig.cross();
+    rig.come_back(seq, Some(clipboard_from(pc_id(), "copied on the PC")));
+    assert_eq!(rig.link.sent_clipboard(), []);
+    let state = rig.fake.state();
+    assert_eq!(state.clipboard.as_deref(), Some("copied on the Mac"));
+    assert_eq!(state.clipboard_reads, 0);
+    assert!(!state.calls.contains(&Call::WriteClipboard));
+    let log = logging::tests::captured_text();
+    assert!(!log.contains("this computer and PC with sync off on the Mac."));
+}
+
+#[test]
+fn text_a_closing_connection_did_not_take_goes_at_the_next_crossing() {
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    rig.fake.copy("one");
+    rig.link.net().refuse_clipboard = Some(|| SendError::NotConnected);
+    let seq = rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), []);
+    rig.come_back(seq, None);
+    rig.link.net().refuse_clipboard = None;
+    rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), [(pc_id(), "one".to_owned())]);
+}
+
+#[test]
+fn text_that_can_never_go_is_not_read_again_until_the_clipboard_changes() {
+    let mut rig = Rig::mac("PC", |settings| settings.clipboard.max_text_bytes = 16);
+    rig.connect(&EVERYTHING);
+    // Over this computer's limit: never cut short, so nothing goes.
+    rig.fake.copy("more than sixteen bytes of text");
+    let seq = rig.cross();
+    rig.come_back(seq, None);
+    // Within it, but the network cannot carry it.
+    rig.fake.copy("short enough");
+    rig.link.net().refuse_clipboard = Some(|| {
+        SendError::Encode(ProtoError::ClipboardTooLarge {
+            len: 2_000_000,
+            max: 1_048_576,
+        })
+    });
+    let seq = rig.cross();
+    rig.come_back(seq, None);
+    rig.link.net().refuse_clipboard = None;
+    rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), [], "neither is offered again");
+    assert_eq!(rig.fake.state().clipboard_reads, 2, "each was read once");
+}
+
+#[test]
+fn the_drop_zone_follows_the_edge_toward_the_pc_while_it_is_connected() {
+    let mut rig = Rig::mac("Zone PC", |_| {});
+    assert_eq!(rig.fake.state().zones, [], "none before the PC connects");
+    rig.connect(&EVERYTHING);
+    {
+        let state = rig.fake.state();
+        // The whole right edge but its corners, also beside the PC's lower
+        // screen: the cursor crosses there too.
+        assert_eq!(
+            state.zones,
+            [DropZone {
+                display: Rect::new(0.0, 0.0, 1512.0, 982.0),
+                edge: Edge::Right,
+                start: 10.0,
+                end: 972.0,
+            }]
+        );
+        assert_eq!(state.label, "Drop to send to Zone PC");
+    }
+
+    // A bigger screen moves the zone with the edge.
+    rig.fake.state().displays = vec![display(1728.0, 1117.0)];
+    rig.agent.next_display_check = Instant::now();
+    rig.agent.tick();
+    assert_eq!(
+        rig.fake.state().zones,
+        [DropZone {
+            display: Rect::new(0.0, 0.0, 1728.0, 1117.0),
+            edge: Edge::Right,
+            start: 10.0,
+            end: 1107.0,
+        }]
+    );
+
+    rig.disconnect();
+    assert_eq!(rig.fake.state().zones, [], "gone with the connection");
+    rig.connect(&EVERYTHING);
+    assert_eq!(rig.fake.state().zones.len(), 1, "back with it");
+    rig.agent.quit();
+    assert_eq!(rig.fake.state().zones, [], "gone when Hop quits");
+}
+
+#[test]
+fn there_is_no_drop_zone_unless_both_computers_take_files() {
+    let mut old = Rig::mac("PC", |_| {});
+    old.connect(&[caps::INPUT, caps::CLIPBOARD_TEXT]);
+    assert_eq!(old.fake.state().zones, [], "the PC cannot take files");
+
+    let mut off = Rig::mac("PC", |settings| settings.files = false);
+    off.connect(&EVERYTHING);
+    assert_eq!(off.fake.state().zones, [], "receiving files is off here");
+}
+
+#[test]
+fn a_computer_without_a_drop_target_says_so_in_the_log_once() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.fake.state().no_drop_target = true;
+    rig.connect(&EVERYTHING);
+    rig.disconnect();
+    rig.connect(&EVERYTHING);
+    let log = logging::tests::captured_text();
+    assert_eq!(
+        log.matches("this computer has no drop target yet").count(),
+        1,
+        "{log}"
+    );
+}
+
+#[test]
+fn files_dropped_at_the_edge_go_to_the_pc() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("Drop PC", |_| {});
+    rig.connect(&EVERYTHING);
+    rig.fake.drop_files(&[
+        "/Users/krish/Desktop/file-secret-plans.txt",
+        "/Users/krish/Desktop/file-secret-folder",
+    ]);
+    rig.fake
+        .drop_files(&["/Users/krish/Desktop/file-secret-notes.md"]);
+    rig.agent.tick();
+    assert_eq!(
+        rig.link.sent_files(),
+        [
+            (
+                pc_id(),
+                vec![
+                    PathBuf::from("/Users/krish/Desktop/file-secret-plans.txt"),
+                    PathBuf::from("/Users/krish/Desktop/file-secret-folder"),
+                ]
+            ),
+            (
+                pc_id(),
+                vec![PathBuf::from("/Users/krish/Desktop/file-secret-notes.md")]
+            ),
+        ]
+    );
+    let log = logging::tests::captured_text();
+    assert!(log.contains("Sending 2 items to Drop PC…"), "{log}");
+    assert!(log.contains("Sending 1 item to Drop PC…"), "{log}");
+    assert!(!log.contains("file-secret"), "the log never names a file");
+}
+
+#[test]
+fn files_dropped_while_the_pc_cannot_take_them_are_not_sent() {
+    let _ = logging::tests::capture();
+    let mut gone = Rig::mac("Gone PC", |_| {});
+    gone.connect(&EVERYTHING);
+    gone.disconnect();
+    gone.fake.drop_files(&["/Users/krish/file-secret-late.txt"]);
+    gone.agent.tick();
+
+    let mut old = Rig::mac("Old PC for files", |_| {});
+    old.connect(&[caps::INPUT]);
+    old.fake.drop_files(&["/Users/krish/file-secret-old.txt"]);
+    old.agent.tick();
+
+    assert_eq!(gone.link.sent_files(), []);
+    assert_eq!(old.link.sent_files(), []);
+    let log = logging::tests::captured_text();
+    assert!(
+        log.contains("The files you dropped were not sent: Gone PC is not connected."),
+        "{log}"
+    );
+    assert!(
+        log.contains(
+            "The files you dropped were not sent: Old PC for files cannot receive files (its \
+             Hop is older, or receiving files is turned off there)."
+        ),
+        "{log}"
+    );
+    assert!(!log.contains("file-secret"));
+}
+
+#[test]
+fn files_that_arrive_are_shown_and_named_to_the_app_alone() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::pc("Sending Mac", |_| {});
+    rig.connect(&EVERYTHING);
+    let folder = PathBuf::from("Downloads").join("Hop Received");
+    let files = vec![
+        folder.join("file-secret-report.pdf"),
+        folder.join("file-secret-photo (2).jpg"),
+    ];
+    rig.deliver(NetEvent::Transfer(TransferEvent::Received {
+        from: mac_id(),
+        id: 7,
+        files: files.clone(),
+    }));
+    assert_eq!(
+        rig.updates(),
+        [
+            connected("Sending Mac", Os::MacOs),
+            AgentUpdate::FilesReceived {
+                from: "Sending Mac".to_owned(),
+                names: vec![
+                    "file-secret-report.pdf".to_owned(),
+                    "file-secret-photo (2).jpg".to_owned()
+                ],
+            }
+        ]
+    );
+    assert_eq!(rig.shown(), [files], "shown in their folder");
+    let log = logging::tests::captured_text();
+    assert!(
+        log.contains("Received 2 files from Sending Mac. Their folder opens now."),
+        "{log}"
+    );
+    assert!(!log.contains("file-secret"), "the log never names a file");
+}
+
+#[test]
+fn sent_and_failed_transfers_become_status_lines_only() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("Status PC", |_| {});
+    rig.connect(&EVERYTHING);
+    for transfer in [
+        TransferEvent::Sent {
+            to: pc_id(),
+            id: 1,
+            files: 3,
+            skipped: 1,
+        },
+        TransferEvent::Failed {
+            peer: pc_id(),
+            id: 2,
+            outgoing: true,
+            reason: TransferFailure::Refused(Refusal::Busy),
+        },
+        TransferEvent::Failed {
+            peer: pc_id(),
+            id: 9,
+            outgoing: false,
+            reason: TransferFailure::Disconnected,
+        },
+    ] {
+        rig.deliver(NetEvent::Transfer(transfer));
+    }
+    assert_eq!(rig.updates(), [connected("Status PC", Os::Windows)]);
+    assert_eq!(rig.shown(), Vec::<Vec<PathBuf>>::new());
+    let log = logging::tests::captured_text();
+    for line in [
+        "Sent 3 files to Status PC. Left out 1 item: a folder, or a file Hop could not read.",
+        "Status PC did not take the files: it is busy with other files. Drop these again once \
+         those have arrived.",
+        "Not all the files from Status PC arrived: the connection closed. The ones that arrived \
+         complete are in the Received folder.",
+    ] {
+        assert!(log.contains(line), "{line:?} is not in the log:\n{log}");
+    }
+}
+
+#[test]
+fn files_that_arrive_during_a_session_are_reported_apart_from_it() {
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    let seq = rig.cross();
+    rig.deliver(NetEvent::Transfer(TransferEvent::Received {
+        from: pc_id(),
+        id: 1,
+        files: vec![
+            PathBuf::from("Downloads")
+                .join("Hop Received")
+                .join("a.txt"),
+        ],
+    }));
+    rig.come_back(seq, None);
+    assert_eq!(
+        rig.updates(),
+        [
+            connected("PC", Os::Windows),
+            AgentUpdate::Session(Session::Controlling),
+            AgentUpdate::FilesReceived {
+                from: "PC".to_owned(),
+                names: vec!["a.txt".to_owned()],
+            },
+            AgentUpdate::Session(Session::Idle),
+        ]
+    );
 }
 
 // ----- two agents over loopback ---------------------------------------------

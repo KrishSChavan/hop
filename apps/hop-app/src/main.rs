@@ -10,7 +10,8 @@
 //! - `launch`: on a Mac, hands `hop` subcommands to the command line.
 //!
 //! The rules of the `hop` command hold here too: nothing logs keys,
-//! clipboard text, pairing codes or secrets, and every way out (Stop
+//! clipboard text, pairing codes, secrets or file names (the names of files
+//! that arrived are shown in Activity only), and every way out (Stop
 //! sharing, closing the window, Cmd+Q, a quit signal on a Mac, a panic)
 //! gives the keyboard and mouse back first.
 

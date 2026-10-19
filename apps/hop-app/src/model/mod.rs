@@ -14,10 +14,12 @@ mod tests;
 
 use std::collections::{HashMap, VecDeque};
 
+use hop_agent::service::AgentUpdate;
 use hop_agent::settings::{Overview, PeerView};
-use hop_agent::{DeviceId, Os, PermissionState};
+use hop_agent::{CmdCtrl, DeviceId, Os, PermissionState};
 
 pub use self::pairing::Pairing;
+use self::sharing::Next;
 pub use self::sharing::Sharing;
 
 /// How many lines the Activity list keeps.
@@ -35,6 +37,9 @@ pub struct Model {
     pub pairing: Pairing,
     /// The fields and dialogs of "Your other computer".
     pub peers: PeerForms,
+    /// The last Shortcuts change that could not be saved: why, shown under
+    /// the choice.
+    pub shortcuts_problem: Option<String>,
     /// The Accessibility permission on a Mac; `None` elsewhere, where the
     /// Permissions section is not shown.
     pub permission: Option<PermissionState>,
@@ -92,6 +97,7 @@ impl Model {
             sharing: Sharing::default(),
             pairing: Pairing::default(),
             peers: PeerForms::default(),
+            shortcuts_problem: None,
             permission,
             activity: Activity::default(),
             quitting: false,
@@ -120,18 +126,48 @@ impl Model {
         matches!(self.settings, Settings::Loaded(_))
     }
 
+    /// The name of the computer Hop shares with (the first paired one), for
+    /// sentences that are clearer with it.
+    pub fn other_computer(&self) -> Option<&str> {
+        self.paired_peers().next().map(|peer| peer.name.as_str())
+    }
+
+    /// The Shortcuts setting, while the settings can be read.
+    pub fn cmd_ctrl(&self) -> Option<CmdCtrl> {
+        match &self.settings {
+            Settings::Loaded(overview) => Some(overview.cmd_ctrl),
+            Settings::Failed(_) => None,
+        }
+    }
+
+    /// Applies what the agent said: files that arrived are listed by name in
+    /// Activity (shown, never logged), and every update then moves Sharing
+    /// on. Returns what the app must do next.
+    pub fn agent_update(&mut self, update: AgentUpdate) -> Next {
+        if let AgentUpdate::FilesReceived { from, names } = &update
+            && !names.is_empty()
+        {
+            self.activity.push(words::files_from(from, names));
+        }
+        self.sharing.apply(update)
+    }
+
     /// Takes newly read settings. Returns whether the computers changed (a
-    /// side, an address, a pairing), so a running agent must restart.
+    /// side, an address, a pairing) or the Shortcuts setting did, so a
+    /// running agent must restart.
     ///
     /// Each Address field follows the config, unless the user has typed
     /// something else there that is not saved yet.
     pub fn set_settings(&mut self, settings: Settings) -> bool {
-        let old_peers = match &self.settings {
-            Settings::Loaded(overview) => overview.peers.clone(),
-            Settings::Failed(_) => Vec::new(),
+        let (old_peers, old_cmd_ctrl) = match &self.settings {
+            Settings::Loaded(overview) => (overview.peers.clone(), Some(overview.cmd_ctrl)),
+            Settings::Failed(_) => (Vec::new(), None),
         };
         let changed = match &settings {
-            Settings::Loaded(overview) => overview.peers != old_peers,
+            Settings::Loaded(overview) => {
+                overview.peers != old_peers
+                    || old_cmd_ctrl.is_some_and(|old| old != overview.cmd_ctrl)
+            }
             Settings::Failed(_) => false,
         };
         if let Settings::Loaded(overview) = &settings {

@@ -6,7 +6,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use hop_agent::settings::opposite;
-use hop_agent::{Os, Side};
+use hop_agent::{CmdCtrl, Os, Side};
 
 /// The window's title, and the name in its header.
 pub const HOP: &str = "Hop";
@@ -15,6 +15,8 @@ pub const HOP: &str = "Hop";
 pub const SHARING: &str = "Sharing";
 /// The paired computers, where they sit, their addresses.
 pub const YOUR_OTHER_COMPUTER: &str = "Your other computer";
+/// What Cmd and Ctrl do with the other computer's keyboard here.
+pub const SHORTCUTS: &str = "Shortcuts";
 /// Pairing.
 pub const PAIRING: &str = "Pair";
 /// The Accessibility permission (Mac only).
@@ -53,6 +55,18 @@ pub const ADDRESS: &str = "Address";
 pub const ADDRESS_NOTE: &str = "only if it is not found automatically";
 /// The address field's button.
 pub const SAVE_ADDRESS: &str = "Save address";
+
+/// On a Mac, for keys from the PC's keyboard: every key arrives as itself.
+pub const MAC_KEEP_KEYS: &str = "Keep keys as they are: the Windows key is Cmd";
+/// On a Mac, for keys from the PC's keyboard: Ctrl and Cmd trade places.
+pub const MAC_SWAP_KEYS: &str = "Swap Ctrl and Cmd: Ctrl+C copies, as on a PC";
+/// On the PC, for keys from the Mac's keyboard: every key arrives as itself.
+pub const PC_KEEP_KEYS: &str = "Keep keys as they are: Ctrl+C copies, Cmd is the Windows key";
+/// On the PC, for keys from the Mac's keyboard: Cmd and Ctrl trade places.
+pub const PC_SWAP_KEYS: &str = "Swap Cmd and Ctrl: Cmd+C copies, as on a Mac";
+/// "Shortcuts" when the settings could not be read.
+pub const SHORTCUTS_UNKNOWN: &str =
+    "Hop cannot show this choice until it can read its settings (see above).";
 /// Greyed out in an empty address field.
 pub const ADDRESS_HINT: &str = "e.g. 192.168.1.23";
 /// Greyed out in an empty Code field.
@@ -201,6 +215,78 @@ pub fn choose_there(name: &str, side: Side) -> String {
         "On {name}, choose {} for this computer.",
         side_label(opposite(side))
     )
+}
+
+/// Above the Shortcuts choice: whose keys it is about. The computer the
+/// keys arrive on applies the choice, so here it is about the other
+/// computer's keyboard, named when it is known.
+pub fn with_keyboard(peer: Option<&str>) -> String {
+    match peer {
+        Some(name) => format!("With {name}'s keyboard on this computer:"),
+        None => "With the other computer's keyboard on this computer:".to_owned(),
+    }
+}
+
+/// The Shortcuts choice on `os`, keeping keys as they are first: on a Mac
+/// it is about keys from a PC's keyboard, elsewhere about keys from a Mac's.
+pub fn shortcut_choices(os: Os) -> [(CmdCtrl, &'static str); 2] {
+    match os {
+        Os::MacOs => [
+            (CmdCtrl::Keep, MAC_KEEP_KEYS),
+            (CmdCtrl::Swap, MAC_SWAP_KEYS),
+        ],
+        Os::Windows | Os::Linux => [(CmdCtrl::Keep, PC_KEEP_KEYS), (CmdCtrl::Swap, PC_SWAP_KEYS)],
+    }
+}
+
+/// Under the Shortcuts choice: this computer's own keyboard is the other
+/// computer's choice.
+pub fn this_keyboard_there(peer: Option<&str>) -> String {
+    format!(
+        "The choice for this computer's keyboard is in Hop on {}.",
+        peer.unwrap_or("the other computer")
+    )
+}
+
+/// How many names the Activity line about files that arrived lists; the
+/// rest are counted.
+pub const NAMES_LISTED: usize = 10;
+
+/// The Activity line naming the files that just arrived from `peer`: "Files
+/// from Mac: notes.txt, photo.jpg", the first [`NAMES_LISTED`] by name and
+/// the rest counted. It is shown in the window and never logged.
+pub fn files_from(peer: &str, names: &[String]) -> String {
+    let what = if names.len() == 1 { "File" } else { "Files" };
+    let listed: Vec<String> = names
+        .iter()
+        .take(NAMES_LISTED)
+        .map(|name| printable(name))
+        .collect();
+    let mut line = format!("{what} from {peer}: {}", listed.join(", "));
+    let more = names.len().saturating_sub(NAMES_LISTED);
+    if more > 0 {
+        line.push_str(&format!(" and {more} more"));
+    }
+    line
+}
+
+/// `name` with anything that could garble a line shown as "\u{FFFD}":
+/// control characters, and the marks that reorder text. Hop cleans names
+/// before it saves a file; this is the window's own guard.
+fn printable(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let reorders = matches!(
+                c,
+                '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+            );
+            if c.is_control() || reorders {
+                '\u{FFFD}'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// "Forget {name}? You will need to pair again."
@@ -394,6 +480,95 @@ mod tests {
         assert_eq!(
             this_computer("Mac", Os::MacOs),
             "This computer: Mac (macOS)"
+        );
+        assert_eq!(SHORTCUTS, "Shortcuts");
+        assert_eq!(
+            PC_KEEP_KEYS,
+            "Keep keys as they are: Ctrl+C copies, Cmd is the Windows key"
+        );
+        assert_eq!(PC_SWAP_KEYS, "Swap Cmd and Ctrl: Cmd+C copies, as on a Mac");
+        assert_eq!(
+            MAC_KEEP_KEYS,
+            "Keep keys as they are: the Windows key is Cmd"
+        );
+        assert_eq!(
+            MAC_SWAP_KEYS,
+            "Swap Ctrl and Cmd: Ctrl+C copies, as on a PC"
+        );
+    }
+
+    #[test]
+    fn each_computer_words_the_shortcuts_for_the_other_ones_keyboard() {
+        assert_eq!(
+            shortcut_choices(Os::MacOs),
+            [
+                (
+                    CmdCtrl::Keep,
+                    "Keep keys as they are: the Windows key is Cmd"
+                ),
+                (
+                    CmdCtrl::Swap,
+                    "Swap Ctrl and Cmd: Ctrl+C copies, as on a PC"
+                ),
+            ]
+        );
+        assert_eq!(
+            shortcut_choices(Os::Windows),
+            [
+                (
+                    CmdCtrl::Keep,
+                    "Keep keys as they are: Ctrl+C copies, Cmd is the Windows key"
+                ),
+                (
+                    CmdCtrl::Swap,
+                    "Swap Cmd and Ctrl: Cmd+C copies, as on a Mac"
+                ),
+            ]
+        );
+        assert_eq!(shortcut_choices(Os::Linux), shortcut_choices(Os::Windows));
+        assert_eq!(
+            with_keyboard(Some("Windows PC")),
+            "With Windows PC's keyboard on this computer:"
+        );
+        assert_eq!(
+            with_keyboard(None),
+            "With the other computer's keyboard on this computer:"
+        );
+        assert_eq!(
+            this_keyboard_there(Some("Mac")),
+            "The choice for this computer's keyboard is in Hop on Mac."
+        );
+        assert_eq!(
+            this_keyboard_there(None),
+            "The choice for this computer's keyboard is in Hop on the other computer."
+        );
+    }
+
+    #[test]
+    fn files_that_arrived_are_named_and_the_rest_counted() {
+        let names = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("f{i}.txt")).collect() };
+        assert_eq!(
+            files_from("Mac", &["notes.txt".to_owned()]),
+            "File from Mac: notes.txt"
+        );
+        assert_eq!(
+            files_from("Mac", &["notes.txt".to_owned(), "photo (2).jpg".to_owned()]),
+            "Files from Mac: notes.txt, photo (2).jpg"
+        );
+        assert_eq!(
+            files_from("Mac", &names(NAMES_LISTED)),
+            "Files from Mac: f1.txt, f2.txt, f3.txt, f4.txt, f5.txt, f6.txt, f7.txt, f8.txt, \
+             f9.txt, f10.txt"
+        );
+        assert_eq!(
+            files_from("Mac", &names(1000)),
+            "Files from Mac: f1.txt, f2.txt, f3.txt, f4.txt, f5.txt, f6.txt, f7.txt, f8.txt, \
+             f9.txt, f10.txt and 990 more"
+        );
+        // A name cannot break the line or turn the text around.
+        assert_eq!(
+            files_from("Mac", &["a\nb\u{202E}txt.exe".to_owned()]),
+            "File from Mac: a\u{FFFD}b\u{FFFD}txt.exe"
         );
     }
 
