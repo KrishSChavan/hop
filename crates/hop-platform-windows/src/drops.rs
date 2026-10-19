@@ -5,26 +5,33 @@
 //!
 //! - The "hop-drop" thread, started with the first zones, is an OLE
 //!   single-threaded apartment (`OleInitialize`) that pumps messages. It
-//!   owns one window per zone (a topmost, never activated, layered tool
-//!   window, so it can be invisible and still be found under the cursor),
-//!   each registered with `RegisterDragDrop` and an `IDropTarget` of its
-//!   own, and a message-only window that takes jobs and the mouse hook's
-//!   arm and disarm messages. Drag and drop calls the targets on this
-//!   thread; they are not agile, so COM never calls them anywhere else.
+//!   owns two windows per zone, both topmost, never activated, layered tool
+//!   windows, and a message-only window that takes jobs and the mouse
+//!   hook's arm and disarm messages:
+//!   - **the band**, a thin strip at the very edge, invisible (alpha 1) but
+//!     still found under the cursor, registered with `RegisterDragDrop` and
+//!     an `IDropTarget` of its own. Drag and drop calls the targets on this
+//!     thread; they are not agile, so COM never calls them anywhere else.
+//!   - **the label**, deeper, with the tint and the words, painted with
+//!     GDI. It is `WS_EX_TRANSPARENT`, so drags and clicks pass through it
+//!     to whatever is under it, and it is never registered for drops.
 //! - The mouse hook, on Hop's input thread, follows the left button
-//!   (`logic::drop_zone::DragGesture`) and posts "arm" and "disarm" to that
-//!   window. It never waits: it only tries the lock in front of the zones,
-//!   and posting returns at once.
+//!   (`logic::drop_zone::DragGesture`) and posts "arm" and "disarm" (with
+//!   where the button went up) to that window. It never waits: it only
+//!   tries the lock in front of the zones, and posting returns at once.
 //! - `take_drops` takes the dropped paths from a queue that the drop thread
 //!   locks only to add one drop.
 //!
-//! The windows show only during a drag near their zone (the rules are in
-//! `logic::drop_zone`): armed, they are invisible (alpha 1) but there for
-//! drag and drop to find; with files over them they show the label; a drop
-//! is always taken as a copy, never a move. While any window shows, a
-//! timer hides it once no mouse button is held, so a missed button-up
-//! cannot leave one at the edge to catch clicks. File names are never
-//! logged.
+//! A band shows only during a drag near its zone (the rules are in
+//! `logic::drop_zone`), and only the band takes drops, so what lies near
+//! the edge keeps its own drops and clicks. With files over the band, the
+//! label shows too; a drop is always taken as a copy, never a move.
+//! Anything but files dragged onto a band (no `CF_HDROP`) makes it hide at
+//! once for the rest of that drag, so the window under it gets the drag.
+//! When the button goes up somewhere else, a band without files over it
+//! hides at once. While any band shows, a timer hides it once no mouse
+//! button is held, so a missed button-up cannot leave one at the edge to
+//! catch clicks. File names are never logged.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -61,27 +68,38 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SWP_SHOWWINDOW, SetLayeredWindowAttributes, SetTimer, SetWindowPos,
     WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_DPICHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONDOWN,
-    WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_TIMER, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 use windows::core::{PCWSTR, Ref, implement, w};
 
 use crate::logic::coords::{BASE_DPI, PhysPoint, PhysRect, scale_from_dpi};
 use crate::logic::drop_zone::{
-    ARMED_ALPHA, DragGesture, Effect, HIGHLIGHT_ALPHA, Look, MAX_DROPPED_FILES, MAX_ZONES, Signal,
-    TICK_MS, Target, ZoneSet, queue_drop, usable_zones, window_rect,
+    BAND_ALPHA, ButtonUp, DragGesture, Effect, LABEL_ALPHA, Look, MAX_DROPPED_FILES, MAX_ZONES,
+    Part, Placement, Signal, TICK_MS, Target, ZoneSet, pack_point, queue_drop, unpack_point,
+    usable_zones, window_steps,
 };
 use crate::os;
 use crate::worker::{self, WM_APP_WAKE, Worker};
 
 const CONTROL_CLASS: PCWSTR = w!("HopDropThread");
-const ZONE_CLASS: PCWSTR = w!("HopDropZone");
+const BAND_CLASS: PCWSTR = w!("HopDropBand");
+const LABEL_CLASS: PCWSTR = w!("HopDropLabel");
 
 /// Posted by the mouse hook: show the zones in `wParam` (one bit each) of
 /// the zone setting in `lParam`, armed.
 const WM_APP_ARM: u32 = WM_APP + 0x20;
-/// Posted by the mouse hook: the left button went up; `lParam` is the zone
-/// setting.
+/// Posted by the mouse hook: the left button went up at the point in
+/// `wParam` (see `pack_point`); `lParam` is the zone setting.
 const WM_APP_DISARM: u32 = WM_APP + 0x21;
+/// Posted by the mouse hook: a gesture ended without the hook seeing where
+/// the button went up (it missed the button-up, or capture stopped);
+/// `lParam` is the zone setting.
+const WM_APP_FORGET: u32 = WM_APP + 0x22;
+
+// The hook's posts carry 64-bit numbers (a zone bit set, a packed point, a
+// generation) in WPARAM and LPARAM, which are pointer-sized.
+const _: () = assert!(usize::BITS == u64::BITS);
 
 const TICK_TIMER: usize = 1;
 
@@ -127,14 +145,60 @@ struct DropState {
     generation: u64,
     /// The label, UTF-16 without a NUL.
     label: Vec<u16>,
-    /// One window per zone, in the order the hook numbers them.
+    /// One band and label per zone, in the order the hook numbers them.
     zones: Vec<ZoneWindow>,
 }
 
 struct ZoneWindow {
     zone: DropZone,
-    hwnd: HWND,
+    /// The thin strip at the edge that drag and drop finds: the
+    /// `IDropTarget`'s window.
+    band: HWND,
+    /// The tint and the words, which drags and clicks pass through.
+    label: HWND,
     target: Target,
+    /// Where the windows were put when the band was last shown.
+    placed: Option<Placement>,
+}
+
+impl ZoneWindow {
+    /// What the zone's look going from `before` to its look now does to
+    /// its windows.
+    fn change_from(&self, before: Look) -> Change {
+        Change {
+            band: self.band,
+            label: self.label,
+            placed: self.placed,
+            before,
+            after: self.target.look(),
+        }
+    }
+}
+
+/// A change of one zone's look, for its windows to follow once the state
+/// is no longer borrowed: showing and hiding windows sends messages to
+/// them, and their procedures borrow the state too.
+struct Change {
+    band: HWND,
+    label: HWND,
+    placed: Option<Placement>,
+    before: Look,
+    after: Look,
+}
+
+impl Change {
+    /// Shows the band while the look is shown and the label while it is
+    /// labelled, at the places they were given, and hides each otherwise
+    /// (see `window_steps`). Drop thread.
+    fn apply(&self) {
+        for (part, shown) in window_steps(self.before, self.after) {
+            let (hwnd, place) = match part {
+                Part::Band => (self.band, self.placed.map(|placed| placed.band)),
+                Part::Label => (self.label, self.placed.map(|placed| placed.label)),
+            };
+            show(hwnd, place.filter(|_| shown));
+        }
+    }
 }
 
 fn with_state<T>(f: impl FnOnce(&mut DropState) -> T) -> Option<T> {
@@ -263,7 +327,8 @@ fn create_control_window() -> Result<HWND> {
     // SAFETY: IDC_ARROW is a shared system cursor; no instance needed.
     let arrow = unsafe { LoadCursorW(None, IDC_ARROW) }
         .map_err(|error| os::os_error("LoadCursorW", &error))?;
-    os::register_class(ZONE_CLASS, Some(zone_procedure), arrow, HBRUSH::default())?;
+    os::register_class(BAND_CLASS, Some(band_procedure), arrow, HBRUSH::default())?;
+    os::register_class(LABEL_CLASS, Some(label_procedure), arrow, HBRUSH::default())?;
     os::register_class(
         CONTROL_CLASS,
         Some(control_procedure),
@@ -298,10 +363,10 @@ fn control_window() -> HWND {
     os::raw_to_hwnd(CONTROL.load(Ordering::Acquire))
 }
 
-/// Takes the old zone windows down and puts up one hidden window per zone
-/// of setting `generation`. All or nothing: if one window cannot be made,
-/// none is kept. The same zones and label again keep their windows, so a
-/// drag over one goes on. Drop thread.
+/// Takes the old zone windows down and puts up a hidden band and label per
+/// zone of setting `generation`. All or nothing: if one window cannot be
+/// made, none is kept. The same zones and label again keep their windows,
+/// so a drag over one goes on. Drop thread.
 fn replace_zones(generation: u64, zones: Vec<DropZone>, label: Vec<u16>) -> Result<()> {
     let old = with_state(|state| {
         let same = state.label == label
@@ -323,11 +388,13 @@ fn replace_zones(generation: u64, zones: Vec<DropZone>, label: Vec<u16>) -> Resu
     stop_timer();
     let mut windows: Vec<ZoneWindow> = Vec::with_capacity(zones.len());
     for zone in zones {
-        match create_zone_window() {
-            Ok(hwnd) => windows.push(ZoneWindow {
+        match create_zone_windows() {
+            Ok((band, label)) => windows.push(ZoneWindow {
                 zone,
-                hwnd,
+                band,
+                label,
                 target: Target::default(),
+                placed: None,
             }),
             Err(error) => {
                 windows.into_iter().for_each(destroy_zone_window);
@@ -344,21 +411,72 @@ fn replace_zones(generation: u64, zones: Vec<DropZone>, label: Vec<u16>) -> Resu
     Ok(())
 }
 
-/// One zone's window, hidden, registered for drag and drop. Drop thread.
-fn create_zone_window() -> Result<HWND> {
+/// One zone's band and label, hidden, the band registered for drag and
+/// drop. Drop thread.
+fn create_zone_windows() -> Result<(HWND, HWND)> {
+    let band = create_band()?;
+    match create_label() {
+        Ok(label) => Ok((band, label)),
+        Err(error) => {
+            destroy_band(band);
+            Err(error)
+        }
+    }
+}
+
+/// A zone's band, hidden, registered for drag and drop. Drop thread.
+fn create_band() -> Result<HWND> {
+    let band = create_layered(
+        // A tool window has no taskbar button; no-activate keeps the user's
+        // focus where it is, even when it is clicked; layered allows the
+        // transparency. Never WS_EX_TRANSPARENT: drag and drop must find the
+        // band under the cursor.
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        BAND_CLASS,
+        w!("Hop drop zone"),
+        BAND_ALPHA,
+    )?;
+    let target: IDropTarget = ZoneTarget {
+        hwnd: os::hwnd_to_raw(band),
+    }
+    .into();
+    // SAFETY: `band` is this thread's window, and this thread is an OLE
+    // apartment. OLE keeps its own reference to the target until
+    // RevokeDragDrop.
+    if let Err(error) = unsafe { RegisterDragDrop(band, &target) } {
+        // SAFETY: this thread's window, never shown or registered.
+        let _ = unsafe { DestroyWindow(band) };
+        return Err(os::os_error("RegisterDragDrop", &error));
+    }
+    Ok(band)
+}
+
+/// A zone's label, hidden. Never registered for drag and drop. Drop
+/// thread.
+fn create_label() -> Result<HWND> {
+    create_layered(
+        // As the band, plus WS_EX_TRANSPARENT: a layered window with it is
+        // never found under the cursor, so drags and clicks pass through it
+        // to the band, or to whatever else lies under it.
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        LABEL_CLASS,
+        w!("Hop drop label"),
+        LABEL_ALPHA,
+    )
+}
+
+/// A hidden, layered popup window of `class` with `style` and `alpha`.
+/// Drop thread.
+fn create_layered(style: WINDOW_EX_STYLE, class: PCWSTR, title: PCWSTR, alpha: u8) -> Result<HWND> {
     let instance = os::module_instance()?;
     // SAFETY: the class was registered when the thread started, with a
     // 'static procedure. The window has no parent, so it belongs to this
     // thread, whose message loop serves it. It is created hidden.
     let hwnd = unsafe {
         CreateWindowExW(
-            // A tool window has no taskbar button; no-activate keeps the
-            // user's focus where it is, even when it is clicked; layered
-            // allows the transparency. Never WS_EX_TRANSPARENT: drag and
-            // drop must find the window under the cursor.
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-            ZONE_CLASS,
-            w!("Hop drop zone"),
+            style,
+            class,
+            title,
             WS_POPUP,
             0,
             0,
@@ -371,155 +489,161 @@ fn create_zone_window() -> Result<HWND> {
         )
     }
     .map_err(|error| os::os_error("CreateWindowExW (drop zone)", &error))?;
-    let registered = (|| {
-        // SAFETY: `hwnd` is the layered window just created on this thread.
-        unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), ARMED_ALPHA, LWA_ALPHA) }
-            .map_err(|error| os::os_error("SetLayeredWindowAttributes (drop zone)", &error))?;
-        let target: IDropTarget = ZoneTarget {
-            hwnd: os::hwnd_to_raw(hwnd),
-        }
-        .into();
-        // SAFETY: `hwnd` is this thread's window, and this thread is an OLE
-        // apartment. OLE keeps its own reference to the target until
-        // RevokeDragDrop.
-        unsafe { RegisterDragDrop(hwnd, &target) }
-            .map_err(|error| os::os_error("RegisterDragDrop", &error))
-    })();
-    if let Err(error) = registered {
+    // SAFETY: `hwnd` is the layered window just created on this thread. Its
+    // alpha is set once, here, before it is first shown.
+    if let Err(error) = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA) } {
         // SAFETY: this thread's window, never shown.
         let _ = unsafe { DestroyWindow(hwnd) };
-        return Err(error);
+        return Err(os::os_error(
+            "SetLayeredWindowAttributes (drop zone)",
+            &error,
+        ));
     }
     Ok(hwnd)
 }
 
-/// Revokes a zone window's drop target, then destroys the window. Drop
-/// thread.
+/// Takes a zone's windows down: the band's drop target is revoked before
+/// the band is destroyed. Drop thread.
 fn destroy_zone_window(zone: ZoneWindow) {
-    // SAFETY: this thread's window; revoking one that is not registered
-    // just fails.
-    let _ = unsafe { RevokeDragDrop(zone.hwnd) };
-    // SAFETY: this thread's window.
-    let _ = unsafe { DestroyWindow(zone.hwnd) };
+    destroy_band(zone.band);
+    // SAFETY: this thread's window; it was never registered for drops.
+    let _ = unsafe { DestroyWindow(zone.label) };
 }
 
-/// Makes zone window `hwnd` show `look`: hidden, or with the look's alpha,
-/// and also put on top at `rect` when one is given (when it was hidden).
+/// Revokes a band's drop target, then destroys the band. Drop thread.
+fn destroy_band(band: HWND) {
+    // SAFETY: this thread's window; revoking one that is not registered
+    // just fails.
+    let _ = unsafe { RevokeDragDrop(band) };
+    // SAFETY: this thread's window.
+    let _ = unsafe { DestroyWindow(band) };
+}
+
+/// Puts zone window `hwnd` on top at `rect`, shown, or hides it (`None`).
 /// Drop thread.
-fn show(hwnd: HWND, look: Look, rect: Option<PhysRect>) {
-    let alpha = match look {
-        Look::Hidden => {
-            // SWP_HIDEWINDOW with SWP_NOACTIVATE, not ShowWindow(SW_HIDE),
-            // which may activate another window.
-            // SAFETY: this thread's window.
-            let _ = unsafe {
-                SetWindowPos(
-                    hwnd,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
-                )
-            };
-            return;
-        }
-        Look::Armed => ARMED_ALPHA,
-        Look::Highlighted => HIGHLIGHT_ALPHA,
-    };
-    // SAFETY: this thread's layered window.
-    let _ = unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA) };
-    if let Some(rect) = rect {
-        // SAFETY: this thread's window; it is never activated.
+fn show(hwnd: HWND, rect: Option<PhysRect>) {
+    let Some(rect) = rect else {
+        // SWP_HIDEWINDOW with SWP_NOACTIVATE, not ShowWindow(SW_HIDE),
+        // which may activate another window.
+        // SAFETY: this thread's window.
         let _ = unsafe {
             SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
-                rect.left,
-                rect.top,
-                rect.width(),
-                rect.height(),
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
             )
         };
-    }
+        return;
+    };
+    // SAFETY: this thread's window; it is never activated.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            rect.left,
+            rect.top,
+            rect.width(),
+            rect.height(),
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+    };
+    // Drawn afresh for the place and size it has now.
+    // SAFETY: this thread's window.
+    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
 }
 
-/// The hook's arm: show the zones in `zones` (one bit each), armed, where
-/// they are now (the primary scale may have changed since they were set).
-/// Drop thread.
+/// The hook's arm: show the bands of the zones in `zones` (one bit each),
+/// where they are now (the primary scale may have changed since they were
+/// set). Drop thread.
 fn arm(zones: u64, generation: u64) {
     let scale = os::primary_scale();
-    let shows = with_state(|state| {
+    let changes = with_state(|state| {
         if state.generation != generation {
             return Vec::new();
         }
-        let mut shows = Vec::new();
+        let mut changes = Vec::new();
         for (index, zone) in state.zones.iter_mut().enumerate().take(MAX_ZONES) {
             if zones & (1 << index) == 0 {
                 continue;
             }
-            let Some(rect) = window_rect(&zone.zone, scale) else {
+            let Some(placement) = Placement::of(&zone.zone, scale) else {
                 continue;
             };
-            let hidden = zone.target.look() == Look::Hidden;
+            let before = zone.target.look();
             zone.target.arm();
-            if hidden {
-                shows.push((zone.hwnd, rect));
+            // A band that stepped aside during this gesture stays hidden.
+            if !before.shown() && zone.target.look().shown() {
+                zone.placed = Some(placement);
+                changes.push(zone.change_from(before));
             }
         }
-        shows
+        changes
     })
     .unwrap_or_default();
-    for (hwnd, rect) in shows {
-        show(hwnd, Look::Armed, Some(rect));
-    }
-    if any_shown() {
+    changes.iter().for_each(Change::apply);
+    if any_busy() {
         start_timer();
     }
 }
 
-/// The hook's disarm: the left button went up, so the windows hide soon
-/// (see `Target::disarm`). Drop thread.
-fn disarm(generation: u64) {
+/// The hook's disarm: the gesture ended, with the left button going up at
+/// `at` (`None`: the hook did not see where). A band the button went up
+/// over hides soon, any other at once (see `Target::disarm`). Drop thread.
+fn disarm(generation: u64, at: Option<PhysPoint>) {
     let now = Instant::now();
-    with_state(|state| {
-        if state.generation == generation {
-            for zone in &mut state.zones {
-                zone.target.disarm(now);
+    let changes = with_state(|state| {
+        if state.generation != generation {
+            return Vec::new();
+        }
+        let mut changes = Vec::new();
+        for zone in &mut state.zones {
+            let before = zone.target.look();
+            // Only the band takes drops: the label lets them through.
+            let up = zone
+                .placed
+                .map_or(ButtonUp::Over, |placed| ButtonUp::locate(at, placed.band));
+            zone.target.disarm(now, up);
+            if zone.target.look() != before {
+                changes.push(zone.change_from(before));
             }
         }
-    });
+        changes
+    })
+    .unwrap_or_default();
+    changes.iter().for_each(Change::apply);
 }
 
-/// The timer, every `TICK_MS` while a window shows: hide the windows that
-/// are due (see `Target::tick`), and stop once none shows. Drop thread.
+/// The timer, every `TICK_MS` while a band shows or stands aside: hide the
+/// windows that are due (see `Target::tick`), and stop once no zone is
+/// busy. Drop thread.
 fn tick() {
     let now = Instant::now();
     let held = button_held();
-    let hides = with_state(|state| {
-        let mut hides = Vec::new();
+    let changes = with_state(|state| {
+        let mut changes = Vec::new();
         for zone in &mut state.zones {
-            let shown = zone.target.look().shown();
+            let before = zone.target.look();
             zone.target.tick(now, held);
-            if shown && !zone.target.look().shown() {
-                hides.push(zone.hwnd);
+            if zone.target.look() != before {
+                changes.push(zone.change_from(before));
             }
         }
-        hides
+        changes
     })
     .unwrap_or_default();
-    for hwnd in hides {
-        show(hwnd, Look::Hidden, None);
-    }
-    if !any_shown() {
+    changes.iter().for_each(Change::apply);
+    if !any_busy() {
         stop_timer();
     }
 }
 
-fn any_shown() -> bool {
-    with_state(|state| state.zones.iter().any(|zone| zone.target.look().shown())).unwrap_or(false)
+/// Whether any window needs the timer (see `Target::busy`).
+fn any_busy() -> bool {
+    with_state(|state| state.zones.iter().any(|zone| zone.target.busy())).unwrap_or(false)
 }
 
 fn start_timer() {
@@ -554,33 +678,32 @@ fn fail_open() {
             .iter_mut()
             .map(|zone| {
                 zone.target = Target::default();
-                zone.hwnd
+                (zone.band, zone.label)
             })
             .collect::<Vec<_>>()
     })
     .unwrap_or_default();
-    for hwnd in windows {
-        show(hwnd, Look::Hidden, None);
+    for (band, label) in windows {
+        show(label, None);
+        show(band, None);
     }
 }
 
-/// Runs `f` with the target of zone window `hwnd`, then makes the window
-/// show what the target shows now. `None` if the window is not (or no
-/// longer) a zone's. Drop thread.
-fn on_target<R>(hwnd: usize, f: impl FnOnce(&mut Target) -> R) -> Option<R> {
-    let (result, before, after, window) = with_state(|state| {
+/// Runs `f` with the target of the zone whose band is `band`, then makes
+/// the zone's windows show what the target shows now. `None` if the window
+/// is not (or no longer) a zone's band. Drop thread.
+fn on_target<R>(band: usize, f: impl FnOnce(&mut Target) -> R) -> Option<R> {
+    let (result, change) = with_state(|state| {
         let zone = state
             .zones
             .iter_mut()
-            .find(|zone| os::hwnd_to_raw(zone.hwnd) == hwnd)?;
+            .find(|zone| os::hwnd_to_raw(zone.band) == band)?;
         let before = zone.target.look();
         let result = f(&mut zone.target);
-        Some((result, before, zone.target.look(), zone.hwnd))
+        Some((result, zone.change_from(before)))
     })
     .flatten()?;
-    if before != after {
-        show(window, after, None);
-    }
+    change.apply();
     Some(result)
 }
 
@@ -602,7 +725,11 @@ unsafe extern "system" fn control_procedure(
             Some(LRESULT(0))
         }
         WM_APP_DISARM => {
-            disarm(lparam.0 as u64);
+            disarm(lparam.0 as u64, Some(unpack_point(wparam.0 as u64)));
+            Some(LRESULT(0))
+        }
+        WM_APP_FORGET => {
+            disarm(lparam.0 as u64, None);
             Some(LRESULT(0))
         }
         WM_TIMER if wparam.0 == TICK_TIMER => {
@@ -618,8 +745,8 @@ unsafe extern "system" fn control_procedure(
     }
 }
 
-/// A zone window's procedure: never activate; paint the label.
-unsafe extern "system" fn zone_procedure(
+/// A band's procedure: never activate; a click hides it; paint it.
+unsafe extern "system" fn band_procedure(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
@@ -629,7 +756,7 @@ unsafe extern "system" fn zone_procedure(
         // A click on it (one that lands within the hide delay) must not
         // take focus.
         WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
-        // That click is lost, but the window hides at once (see
+        // That click is lost, but the band hides at once (see
         // `Target::clicked`), so the next one goes through.
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             on_target(os::hwnd_to_raw(hwnd), Target::clicked);
@@ -638,7 +765,36 @@ unsafe extern "system" fn zone_procedure(
         // Everything is drawn in WM_PAINT.
         WM_ERASEBKGND => Some(LRESULT(1)),
         WM_PAINT => {
-            paint(hwnd);
+            paint(hwnd, false);
+            Some(LRESULT(0))
+        }
+        // Moved onto a display with another scale: keep the size Hop gave
+        // it.
+        WM_DPICHANGED => Some(LRESULT(0)),
+        _ => None,
+    });
+    match handled {
+        Some(result) => result,
+        // SAFETY: the arguments are passed on unchanged.
+        None => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+/// A label's procedure: never activate; paint the tint and the words.
+unsafe extern "system" fn label_procedure(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let handled = os::guarded(None, fail_open, || match message {
+        // Clicks pass through it (WS_EX_TRANSPARENT); should one land on it
+        // all the same, it must not take focus.
+        WM_MOUSEACTIVATE => Some(LRESULT(MA_NOACTIVATE as isize)),
+        // Everything is drawn in WM_PAINT.
+        WM_ERASEBKGND => Some(LRESULT(1)),
+        WM_PAINT => {
+            paint(hwnd, true);
             Some(LRESULT(0))
         }
         // Moved onto a display with another scale: keep the size Hop gave
@@ -657,30 +813,34 @@ unsafe extern "system" fn zone_procedure(
     }
 }
 
-/// Paints a zone window: the system's highlight colour with the label in
-/// the middle. An armed window's alpha makes it invisible all the same.
-fn paint(hwnd: HWND) {
+/// Paints a zone window: the system's highlight colour, with the label's
+/// words in the middle when `labelled` (the label window). The band's
+/// alpha makes it invisible all the same.
+fn paint(hwnd: HWND, labelled: bool) {
     let mut painting = PAINTSTRUCT::default();
     // SAFETY: `hwnd` is this thread's window, in its WM_PAINT; EndPaint
     // follows.
     let hdc = unsafe { BeginPaint(hwnd, &mut painting) };
     if !hdc.is_invalid() {
-        draw_label(hwnd, hdc);
+        draw(hwnd, hdc, labelled);
     }
     // SAFETY: pairs with BeginPaint above.
     let _ = unsafe { EndPaint(hwnd, &painting) };
 }
 
-fn draw_label(hwnd: HWND, hdc: HDC) {
+fn draw(hwnd: HWND, hdc: HDC, labelled: bool) {
     let mut area = RECT::default();
     // SAFETY: `area` is a valid out-pointer; the window is this thread's.
     if unsafe { GetClientRect(hwnd, &mut area) }.is_err() {
         return;
     }
-    // SAFETY: `hdc` is the paint context; system colours and brushes are
-    // never freed.
+    // SAFETY: `hdc` is the paint context; system brushes are never freed.
+    unsafe { FillRect(hdc, &area, GetSysColorBrush(COLOR_HIGHLIGHT)) };
+    if !labelled {
+        return;
+    }
+    // SAFETY: `hdc` is the paint context; system colours are constants.
     unsafe {
-        FillRect(hdc, &area, GetSysColorBrush(COLOR_HIGHLIGHT));
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, COLORREF(GetSysColor(COLOR_HIGHLIGHTTEXT)));
     }
@@ -751,11 +911,11 @@ fn label_font(dpi: u32) -> Option<HFONT> {
     (!font.is_invalid()).then_some(font)
 }
 
-/// What a zone window answers drag and drop. Not agile, so COM calls it
-/// only on the drop thread, where the window and its state live.
+/// What a zone's band answers drag and drop. Not agile, so COM calls it
+/// only on the drop thread, where the band and its state live.
 #[implement(IDropTarget, Agile = false)]
 struct ZoneTarget {
-    /// The zone's window, as a number (see `os::hwnd_to_raw`).
+    /// The zone's band, as a number (see `os::hwnd_to_raw`).
     hwnd: usize,
 }
 
@@ -929,7 +1089,7 @@ pub(crate) fn follow_mouse(message: u32, at: PhysPoint, scale: f64, threshold: (
             let mut gesture = gesture.try_borrow_mut().ok()?;
             match message {
                 WM_LBUTTONDOWN => gesture.press(at),
-                WM_LBUTTONUP => gesture.release(),
+                WM_LBUTTONUP => gesture.release(at),
                 WM_MOUSEMOVE if gesture.held() => {
                     let zones = match ZONES.try_lock() {
                         Ok(zones) => zones,
@@ -953,7 +1113,7 @@ pub(crate) fn follow_mouse(message: u32, at: PhysPoint, scale: f64, threshold: (
 /// a drag armed are disarmed now. Input thread.
 pub(crate) fn forget_gesture() {
     let signal = GESTURE
-        .try_with(|gesture| gesture.try_borrow_mut().ok()?.release())
+        .try_with(|gesture| gesture.try_borrow_mut().ok()?.forget())
         .ok()
         .flatten();
     if let Some(signal) = signal {
@@ -969,9 +1129,16 @@ fn post(signal: Signal) {
     }
     // Both numbers fit in a pointer-sized word on 64-bit Windows; the drop
     // thread reads them back the same way.
-    let (message, zones, generation) = match signal {
+    let (message, word, generation) = match signal {
         Signal::Arm { zones, generation } => (WM_APP_ARM, zones, generation),
-        Signal::Disarm { generation } => (WM_APP_DISARM, 0, generation),
+        Signal::Disarm {
+            generation,
+            at: Some(at),
+        } => (WM_APP_DISARM, pack_point(at), generation),
+        Signal::Disarm {
+            generation,
+            at: None,
+        } => (WM_APP_FORGET, 0, generation),
     };
     // SAFETY: posting never waits, and a window that is gone only makes
     // the call fail.
@@ -979,7 +1146,7 @@ fn post(signal: Signal) {
         PostMessageW(
             Some(os::raw_to_hwnd(control)),
             message,
-            WPARAM(zones as usize),
+            WPARAM(word as usize),
             LPARAM(generation as isize),
         )
     };

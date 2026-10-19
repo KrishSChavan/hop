@@ -30,10 +30,13 @@
 //!   thread of its own with a message-only owner window, so no call waits
 //!   longer than `CLIPBOARD_TIMEOUT` on the app that copied; items a
 //!   password manager marks private are never read.
-//! - **Drop zones** (`drops`): one topmost, never activated, layered window
-//!   per zone on an OLE thread of its own, each a `RegisterDragDrop`
-//!   target. The mouse hook arms them only while the left button drags
-//!   near one, so they never get in the way of clicks at the edge.
+//! - **Drop zones** (`drops`): per zone, on an OLE thread of their own, a
+//!   thin, invisible band at the very edge that is the `RegisterDragDrop`
+//!   target, and a deeper label that drags and clicks pass through, shown
+//!   only while files are over the band. The mouse hook arms a band only
+//!   while the left button drags near it; anything but files makes it step
+//!   aside, and it goes as soon as the button goes up elsewhere, so it
+//!   never gets in the way of other drags or of clicks at the edge.
 //! - **Test window** (`test_window`): a small Win32 window on its own thread
 //!   for `hop selftest`.
 //!
