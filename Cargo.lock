@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "hop"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "hop-agent",
@@ -1379,7 +1379,7 @@ dependencies = [
 
 [[package]]
 name = "hop-agent"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "hop-app"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "eframe",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "hop-config"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "getrandom 0.4.3",
  "hop-types",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "hop-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hop-types",
  "proptest",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "hop-keymap"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hop-types",
  "keycode",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "hop-net"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "getrandom 0.4.3",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "hop-platform"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hop-types",
  "thiserror 2.0.21",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "hop-platform-macos"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "dispatch2",
  "hop-keymap",
@@ -1490,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "hop-platform-windows"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hop-keymap",
  "hop-platform",
@@ -1501,7 +1501,7 @@ dependencies = [
 
 [[package]]
 name = "hop-proto"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hop-types",
  "proptest",
@@ -1512,7 +1512,7 @@ dependencies = [
 
 [[package]]
 name = "hop-selftest"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "hop-core",
  "hop-keymap",
@@ -1523,7 +1523,7 @@ dependencies = [
 
 [[package]]
 name = "hop-transfer"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "sha2",
  "thiserror 2.0.21",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "hop-types"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
