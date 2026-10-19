@@ -3,8 +3,9 @@
 //!
 //! Nothing touches the OS. Each simulated machine has a cursor that its "OS"
 //! moves and clamps to the screen, and the network delivers messages after a
-//! short delay. The script crosses to the PC, types Cmd+C, clicks, comes
-//! back, is taken back from the PC's own trackpad, and survives a Wi-Fi drop.
+//! short delay. The script crosses to the PC, types Cmd+C (with the Cmd/Ctrl
+//! swap setting on, so it arrives as Ctrl+C), clicks, comes back, is taken
+//! back from the PC's own trackpad, and survives a Wi-Fi drop.
 
 use std::collections::BTreeSet;
 
@@ -18,6 +19,10 @@ use hop_types::{
 const LATENCY: Millis = 4;
 /// Time between simulated input events, like a 125 Hz mouse.
 const STEP: Millis = 8;
+/// The demo shows the Cmd/Ctrl swap, a setting that is off by default.
+const POLICY: ModifierPolicy = ModifierPolicy {
+    swap_cmd_ctrl: true,
+};
 /// How often each core gets a `Tick` so its timers can fire.
 const TICK: Millis = 10;
 
@@ -244,6 +249,14 @@ impl Sim {
                     format!("shows its cursor again at ({:.0}, {:.0})", at.x, at.y),
                 );
             }
+            Action::ConcealCursor => self.say(
+                side,
+                "hides its cursor, which the other machine's mouse left at its edge",
+            ),
+            Action::RevealCursor => self.say(side, "shows its cursor again"),
+            // A nudge only wakes the other machine's Wi-Fi radio, and the
+            // simulated network never sleeps.
+            Action::Nudge { .. } => {}
             Action::MoveCursorTo { to } => self.machine(side).cursor = to,
             Action::Inject { event, source_os } => self.inject(side, event, source_os),
             Action::ReleaseAllInjected => {
@@ -276,9 +289,9 @@ impl Sim {
         let os = machine.os;
         match event {
             InputEvent::Key { code, pressed, .. } => {
-                let keys = machine.keys.get_or_insert_with(|| {
-                    Translator::new(ModifierPolicy::default(), source_os, os)
-                });
+                let keys = machine
+                    .keys
+                    .get_or_insert_with(|| Translator::new(POLICY, source_os, os));
                 let injected = if pressed {
                     keys.press(code)
                 } else {
@@ -453,6 +466,10 @@ pub fn run(print: bool) -> Summary {
         println!("Hop simulation: a Mac (1512 x 982) with a Windows PC (1536 x 864) to its right.");
         println!(
             "Nothing here touches this computer: input, cursors and the network are simulated."
+        );
+        println!(
+            "The Cmd/Ctrl swap setting is on, so Cmd+C typed on the Mac arrives on the PC as \
+             Ctrl+C."
         );
     }
 

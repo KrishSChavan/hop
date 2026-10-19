@@ -34,10 +34,21 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "emergency_chord",
         ],
     ),
-    ("keymap", &["swap_cmd_ctrl"]),
+    ("keymap", &["cmd_ctrl"]),
     ("clipboard", &["enabled", "max_text_bytes"]),
-    ("transfer", &["received_dir"]),
+    ("transfer", &["enabled", "received_dir"]),
     ("network", &["port"]),
+];
+
+/// Keys earlier versions of Hop wrote and this one no longer uses, by
+/// section. A file that still has one loads without a warning, the value is
+/// ignored, and the next save leaves the key out.
+const RETIRED_KEYS: &[(&str, &[&str])] = &[
+    // Replaced by `cmd_ctrl` (docs/M4-M5-DESIGN.md, "Shortcuts"). Every file
+    // saved before then says `swap_cmd_ctrl = true`, since the app never
+    // offered the choice, so dropping the key is what moves those computers
+    // to the new default: no swap.
+    ("keymap", &["swap_cmd_ctrl"]),
 ];
 
 /// How many temporary names a save tries before giving up.
@@ -191,8 +202,9 @@ fn invalid_at(path: &Path, config: &Config) -> Result<(), ConfigError> {
     }
 }
 
-/// A warning for every key in `file` that is not in [`KNOWN_KEYS`], sorted.
-/// An unknown section gives one warning, not one per key inside it.
+/// A warning for every key in `file` that is neither in [`KNOWN_KEYS`] nor
+/// in [`RETIRED_KEYS`], sorted. An unknown section gives one warning, not
+/// one per key inside it.
 fn unknown_keys(file: &Table) -> Vec<Warning> {
     let mut warnings = Vec::new();
     for (section, value) in file {
@@ -200,13 +212,19 @@ fn unknown_keys(file: &Table) -> Vec<Warning> {
             warnings.push(unknown(display_key(section).into_owned()));
             continue;
         };
+        let retired = RETIRED_KEYS
+            .iter()
+            .find(|(name, _)| name == section)
+            .map_or(&[][..], |&(_, keys)| keys);
+        let expected = |key: &str| known.contains(&key) || retired.contains(&key);
         let section = display_key(section);
         match value {
-            Value::Table(table) => unknown_in(table, known, &section, &mut warnings),
+            Value::Table(table) => unknown_in(table, expected, &section, &mut warnings),
             Value::Array(entries) => {
                 for (index, entry) in entries.iter().enumerate() {
                     if let Value::Table(table) = entry {
-                        unknown_in(table, known, &format!("{section}[{index}]"), &mut warnings);
+                        let prefix = format!("{section}[{index}]");
+                        unknown_in(table, expected, &prefix, &mut warnings);
                     }
                 }
             }
@@ -220,9 +238,14 @@ fn unknown_keys(file: &Table) -> Vec<Warning> {
     warnings
 }
 
-fn unknown_in(table: &Table, known: &[&str], prefix: &str, warnings: &mut Vec<Warning>) {
+fn unknown_in(
+    table: &Table,
+    expected: impl Fn(&str) -> bool,
+    prefix: &str,
+    warnings: &mut Vec<Warning>,
+) {
     for key in table.keys() {
-        if !known.contains(&key.as_str()) {
+        if !expected(key) {
             warnings.push(unknown(format!("{prefix}.{}", display_key(key))));
         }
     }
@@ -308,7 +331,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::{PeerConfig, Side, TransferConfig};
+    use crate::{CmdCtrl, PeerConfig, Side, TransferConfig};
 
     fn unknown_key(key: &str) -> Warning {
         unknown(key.to_owned())
@@ -591,6 +614,7 @@ anything = 1
             peers: vec![windows_pc()],
             transfer: TransferConfig {
                 received_dir: Some(std::env::temp_dir()),
+                ..TransferConfig::default()
             },
             ..Config::default()
         };
@@ -625,6 +649,38 @@ anything = 1
             }
         }
         assert_eq!(listed, from_types);
+        // A retired key is never written again.
+        for (section, retired) in RETIRED_KEYS {
+            let (_, written) = from_types
+                .iter()
+                .find(|(name, _)| name == section)
+                .unwrap_or_else(|| panic!("no [{section}] in {from_types:?}"));
+            for key in *retired {
+                assert!(!written.iter().any(|w| w == key), "{section}.{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_retired_key_loads_without_a_warning_and_is_ignored() {
+        let (config, warnings) = parse("[keymap]\nswap_cmd_ctrl = true\n").unwrap();
+        assert_eq!(warnings, []);
+        assert_eq!(config, Config::default());
+        // Elsewhere it is an unknown key like any other.
+        let (_, warnings) = parse("[input]\nswap_cmd_ctrl = true\n").unwrap();
+        assert_eq!(warnings, [unknown_key("input.swap_cmd_ctrl")]);
+    }
+
+    #[test]
+    fn a_shortcuts_choice_hop_does_not_know_names_the_line() {
+        let error = parse("[keymap]\ncmd_ctrl = \"sideways\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("line 2"), "{error}");
+        assert!(
+            error.contains("unknown variant `sideways`, expected `keep` or `swap`"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -721,13 +777,14 @@ anything = 1
             pointer_speed in 0.1f64..=5.0,
             takeback_threshold in 0.0f64..=100.0,
             emergency_chord in proptest::collection::vec(non_blank(), 1..6),
-            swap_cmd_ctrl in any::<bool>(),
+            cmd_ctrl in prop_oneof![Just(CmdCtrl::Keep), Just(CmdCtrl::Swap)],
             clipboard in (any::<bool>(), 1usize..=1_048_576),
-            received_dir in proptest::option::of("[A-Za-z0-9 _.-]{1,12}"),
+            transfer in (any::<bool>(), proptest::option::of("[A-Za-z0-9 _.-]{1,12}")),
             port in 1024u16..=65535,
         ) -> Config {
             let (name, id) = device;
             let (enabled, max_text_bytes) = clipboard;
+            let (receive_files, received_dir) = transfer;
             Config {
                 device: crate::DeviceConfig {
                     name,
@@ -741,12 +798,13 @@ anything = 1
                     takeback_threshold,
                     emergency_chord,
                 },
-                keymap: crate::KeymapConfig { swap_cmd_ctrl },
+                keymap: crate::KeymapConfig { cmd_ctrl },
                 clipboard: crate::ClipboardConfig {
                     enabled,
                     max_text_bytes,
                 },
                 transfer: TransferConfig {
+                    enabled: receive_files,
                     received_dir: received_dir.map(|dir| std::env::temp_dir().join(dir)),
                 },
                 network: crate::NetworkConfig { port },
@@ -775,7 +833,8 @@ anything = 1
         fn config_like_text_is_handled_without_panicking(
             text in "((\\[(device|input|keymap|clipboard|transfer|network|extra)\\]|\\[\\[peers\\]\\]|\
                 (name|id|os|side|address|fingerprint|port|pointer_speed|corner_dead_zone|\
-                edge_delay_ms|emergency_chord|enabled|max_text_bytes|received_dir|other) = \
+                edge_delay_ms|emergency_chord|cmd_ctrl|swap_cmd_ctrl|enabled|max_text_bytes|\
+                received_dir|other) = \
                 (\"[a-z ]{0,6}\"|\"[0-9a-f]{64}\"|-?[0-9]{1,6}(\\.[0-9]{1,3})?|true|false|nan|inf|\
                 \\[\\]|\\[\"[A-Za-z]{0,8}\"\\]))\n){0,16}"
         ) {

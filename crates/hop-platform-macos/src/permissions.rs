@@ -76,15 +76,15 @@ impl SystemState for MacSystem {
 pub(crate) struct MacClipboard;
 
 impl TextClipboard for MacClipboard {
-    fn change_count(&self) -> u64 {
-        0
-    }
-
-    fn read_text(&self) -> Result<Option<String>> {
+    fn change_count(&self) -> Result<u64> {
         Err(PlatformError::Unsupported)
     }
 
-    fn write_text(&mut self, _text: &str) -> Result<()> {
+    fn read_text(&self, _max_bytes: usize) -> Result<Option<String>> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn write_text(&mut self, _text: &str) -> Result<u64> {
         Err(PlatformError::Unsupported)
     }
 }
@@ -108,9 +108,12 @@ mod tests {
     #[test]
     fn the_clipboard_is_not_there_yet() {
         let mut clipboard = MacClipboard;
-        assert_eq!(clipboard.change_count(), 0);
         assert!(matches!(
-            clipboard.read_text(),
+            clipboard.change_count(),
+            Err(PlatformError::Unsupported)
+        ));
+        assert!(matches!(
+            clipboard.read_text(1_048_576),
             Err(PlatformError::Unsupported)
         ));
         assert!(matches!(

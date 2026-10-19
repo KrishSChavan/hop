@@ -14,8 +14,9 @@
 //!   and the cursor is put back where it was parked from and shown again.
 //! - **Injection:** events from one private event source, tagged with
 //!   `hop_platform::INJECTED_TAG`, posted at the HID level.
-//! - **Cursor:** parking warps the cursor to the middle of the main display,
-//!   disconnects it from the mouse and hides it. Hiding from the background
+//! - **Cursor:** parking leaves the cursor where it crossed, disconnects it
+//!   from the mouse and hides it (no warp: macOS would add the warp to the
+//!   next mouse delta). Hiding from the background
 //!   needs a private WindowServer switch; without it the cursor is still
 //!   parked, just not hidden.
 //! - **Displays:** Quartz display bounds, which are already Hop's
@@ -60,7 +61,7 @@ mod ui;
 pub use activity::AppNapExemption;
 pub use ui::{open_test_window, run_with_ui};
 
-use hop_platform::{Platform, Result};
+use hop_platform::{NoDrops, Platform, Result};
 use objc2::rc::autoreleasepool;
 use objc2_foundation::{NSProcessInfo, NSString};
 
@@ -86,6 +87,7 @@ pub fn native() -> Result<Platform> {
         cursor: Box::new(cursor::MacCursor::new(shared)),
         displays: Box::new(displays::MacDisplays),
         clipboard: Box::new(permissions::MacClipboard),
+        drops: Box::new(NoDrops),
         permissions: Box::new(permissions::MacPermissions),
         system: Box::new(permissions::MacSystem),
     })

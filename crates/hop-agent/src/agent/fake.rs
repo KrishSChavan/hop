@@ -3,12 +3,14 @@
 //! captured events are whatever the test hands in.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hop_net::{NetEvent, SendError};
 use hop_platform::{
-    CaptureMode, CapturedEvent, CursorControl, Displays, InputCapture, InputInjector, Permission,
-    PermissionState, Permissions, Platform, PlatformError, Result, SystemState, TextClipboard,
+    CaptureMode, CapturedEvent, CursorControl, Displays, DropCatcher, DropZone, InputCapture,
+    InputInjector, Permission, PermissionState, Permissions, Platform, PlatformError, Result,
+    SystemState, TextClipboard,
 };
 use hop_types::{
     CoreMessage, DeviceId, DisplayInfo, InputEvent, KeyCode, MouseButton, Point, Rect,
@@ -24,6 +26,8 @@ pub(crate) enum Call {
     SetMode(CaptureMode),
     Park,
     Restore(Point),
+    Conceal,
+    Reveal,
     Move(Point),
     Inject(InputEvent),
     ReleaseAll,
@@ -41,6 +45,8 @@ pub(crate) struct FakeState {
     pub(crate) mode: CaptureMode,
     pub(crate) cursor: Point,
     pub(crate) parked: bool,
+    /// Whether the cursor is hidden where a session left it.
+    pub(crate) concealed: bool,
     /// Keys and buttons injected and not yet released.
     pub(crate) keys_down: BTreeSet<KeyCode>,
     pub(crate) buttons_down: BTreeSet<MouseButton>,
@@ -48,6 +54,16 @@ pub(crate) struct FakeState {
     pub(crate) fail_inject: bool,
     pub(crate) fail_suppress: bool,
     pub(crate) fail_park: bool,
+    /// Hiding the cursor and showing it again fail.
+    pub(crate) fail_conceal: bool,
+    /// The clipboard's text, if it holds any, and its change count.
+    pub(crate) clipboard: Option<String>,
+    pub(crate) clipboard_count: u64,
+    /// The drop zones the agent set last, and the label it gave them.
+    pub(crate) zones: Vec<DropZone>,
+    pub(crate) label: String,
+    /// Drops waiting for the agent, oldest first.
+    pub(crate) drops: VecDeque<Vec<PathBuf>>,
 }
 
 impl FakeState {
@@ -85,12 +101,19 @@ impl Fake {
             mode: CaptureMode::Passive,
             cursor: display.frame.center(),
             parked: false,
+            concealed: false,
             keys_down: BTreeSet::new(),
             buttons_down: BTreeSet::new(),
             displays: vec![display],
             fail_inject: false,
             fail_suppress: false,
             fail_park: false,
+            fail_conceal: false,
+            clipboard: None,
+            clipboard_count: 0,
+            zones: Vec::new(),
+            label: String::new(),
+            drops: VecDeque::new(),
         }));
         let part = || Part(state.clone());
         let platform = Platform {
@@ -99,6 +122,7 @@ impl Fake {
             cursor: Box::new(part()),
             displays: Box::new(part()),
             clipboard: Box::new(part()),
+            drops: Box::new(part()),
             permissions: Box::new(part()),
             system: Box::new(part()),
         };
@@ -253,6 +277,8 @@ impl CursorControl for Part {
             return Err(refused("park the cursor"));
         }
         state.parked = true;
+        // Parking ends a conceal, as the contract says.
+        state.concealed = false;
         state.calls.push(Call::Park);
         Ok(())
     }
@@ -260,8 +286,29 @@ impl CursorControl for Part {
     fn restore(&mut self, at: Point) -> Result<()> {
         let mut state = self.state();
         state.parked = false;
+        state.concealed = false;
         state.cursor = at;
         state.calls.push(Call::Restore(at));
+        Ok(())
+    }
+
+    fn conceal(&mut self) -> Result<()> {
+        let mut state = self.state();
+        if state.fail_conceal {
+            return Err(refused("hide the cursor"));
+        }
+        state.concealed = true;
+        state.calls.push(Call::Conceal);
+        Ok(())
+    }
+
+    fn reveal(&mut self) -> Result<()> {
+        let mut state = self.state();
+        if state.fail_conceal {
+            return Err(refused("show the cursor"));
+        }
+        state.concealed = false;
+        state.calls.push(Call::Reveal);
         Ok(())
     }
 }
@@ -272,17 +319,38 @@ impl Displays for Part {
     }
 }
 
+/// A clipboard in memory; no test reads or writes the real one.
 impl TextClipboard for Part {
-    fn change_count(&self) -> u64 {
-        0
+    fn change_count(&self) -> Result<u64> {
+        Ok(self.state().clipboard_count)
     }
 
-    fn read_text(&self) -> Result<Option<String>> {
-        Err(PlatformError::Unsupported)
+    fn read_text(&self, max_bytes: usize) -> Result<Option<String>> {
+        let state = self.state();
+        Ok(state
+            .clipboard
+            .clone()
+            .filter(|text| text.len() <= max_bytes))
     }
 
-    fn write_text(&mut self, _: &str) -> Result<()> {
-        Err(PlatformError::Unsupported)
+    fn write_text(&mut self, text: &str) -> Result<u64> {
+        let mut state = self.state();
+        state.clipboard = Some(text.to_owned());
+        state.clipboard_count += 1;
+        Ok(state.clipboard_count)
+    }
+}
+
+impl DropCatcher for Part {
+    fn set_zones(&mut self, zones: Vec<DropZone>, label: &str) -> Result<()> {
+        let mut state = self.state();
+        state.zones = zones;
+        state.label = label.to_owned();
+        Ok(())
+    }
+
+    fn take_drops(&mut self) -> Vec<Vec<PathBuf>> {
+        self.state().drops.drain(..).collect()
     }
 }
 
@@ -311,6 +379,10 @@ pub(crate) struct FakeNet {
     pub(crate) incoming: VecDeque<NetEvent>,
     /// The displays the agent last announced, if it changed them.
     pub(crate) announced: Option<Vec<DisplayInfo>>,
+    /// Every set of files the agent sent, in order, with the recipient.
+    pub(crate) files: Vec<(DeviceId, Vec<PathBuf>)>,
+    /// Every peer the agent nudged, in order.
+    pub(crate) nudges: Vec<DeviceId>,
 }
 
 /// A fake network: sends are recorded, events are whatever the test queues.
@@ -332,12 +404,37 @@ impl FakeLink {
     pub(crate) fn sent(&self) -> Vec<CoreMessage> {
         self.net().sent.iter().map(|(_, msg)| msg.clone()).collect()
     }
+
+    /// Every set of files sent so far, with the recipient.
+    pub(crate) fn sent_files(&self) -> Vec<(DeviceId, Vec<PathBuf>)> {
+        self.net().files.clone()
+    }
+
+    /// Every peer nudged so far, in order.
+    pub(crate) fn nudges(&self) -> Vec<DeviceId> {
+        self.net().nudges.clone()
+    }
 }
 
 impl Link for FakeLink {
     fn send(&self, to: &DeviceId, msg: CoreMessage) -> std::result::Result<(), SendError> {
         self.net().sent.push((to.clone(), msg));
         Ok(())
+    }
+
+    /// Records the files; transfers are numbered from 1, in order.
+    fn send_files(
+        &self,
+        to: &DeviceId,
+        paths: Vec<PathBuf>,
+    ) -> std::result::Result<u64, SendError> {
+        let mut net = self.net();
+        net.files.push((to.clone(), paths));
+        Ok(u64::try_from(net.files.len()).unwrap_or(u64::MAX))
+    }
+
+    fn nudge(&self, to: &DeviceId) {
+        self.net().nudges.push(to.clone());
     }
 
     fn try_recv(&self) -> Option<NetEvent> {

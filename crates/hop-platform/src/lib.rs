@@ -13,6 +13,12 @@
 //!   back to passive capture and shows and frees the cursor by itself, so a
 //!   hang anywhere in Hop can never leave the user without a mouse or
 //!   keyboard. Dropping an injector releases every key and button it holds.
+//!   A cursor hidden with [`CursorControl::conceal`] comes back by itself
+//!   at the first physical mouse event and when the cursor control is
+//!   dropped.
+//! - **Never wait on the clipboard.** Every [`TextClipboard`] call returns
+//!   within [`CLIPBOARD_TIMEOUT`] or fails, whatever the app that copied
+//!   is doing.
 //! - **Tag what Hop injects.** Every injected event carries [`INJECTED_TAG`]
 //!   (macOS: `kCGEventSourceUserData`; Windows: `dwExtraInfo`), and capture
 //!   reports tagged events with `physical: false`. Suppression never
@@ -33,10 +39,12 @@
 //! Windows uses physical pixels divided by the primary display's scale, so
 //! the whole desktop scales uniformly and adjacent monitors stay adjacent.
 
+use std::borrow::Cow;
 use std::fmt;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use hop_types::{DisplayInfo, InputEvent, Point};
+use hop_types::{DisplayInfo, Edge, InputEvent, Point, Rect};
 
 pub type Result<T> = std::result::Result<T, PlatformError>;
 
@@ -56,6 +64,12 @@ pub const INJECTED_TAG: i64 = 0x484F_5021;
 
 /// How long [`CaptureMode::Suppress`] lasts unless it is renewed.
 pub const SUPPRESS_LEASE: Duration = Duration::from_millis(1000);
+
+/// The longest a [`TextClipboard`] call may take. Reading the clipboard can
+/// wait on the app that copied (macOS asks lazy providers for their data,
+/// Windows asks the owner to render delayed formats, for up to 30 seconds),
+/// so backends do the work on a thread of their own and give up after this.
+pub const CLIPBOARD_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// OS permissions Hop may need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -142,7 +156,8 @@ pub trait InputInjector: Send {
     fn release_all(&mut self) -> Result<()>;
 }
 
-/// Hides and restores the local cursor while we control a peer.
+/// Hides and restores the local cursor while we control a peer, and hides
+/// the cursor a peer's session left behind.
 pub trait CursorControl: Send {
     fn position(&self) -> Result<Point>;
     /// Hide the cursor and pin it so it can't drift toward an edge, whatever
@@ -155,6 +170,25 @@ pub trait CursorControl: Send {
     fn park(&mut self) -> Result<()>;
     /// Show the cursor again at `at`.
     fn restore(&mut self, at: Point) -> Result<()>;
+    /// Hide the cursor where it is: the cursor of a peer's session left this
+    /// computer through an edge, and would otherwise stay visible there.
+    ///
+    /// Nothing is frozen, moved or suppressed. The backend shows the cursor
+    /// again by itself at the first physical mouse event (motion, a button
+    /// or the wheel; keys do not count) and when the cursor control is
+    /// dropped, so a stalled runtime never leaves an invisible cursor.
+    /// Parking and restoring end a conceal.
+    ///
+    /// The default returns [`PlatformError::Unsupported`]: the cursor then
+    /// simply stays visible.
+    fn conceal(&mut self) -> Result<()> {
+        Err(PlatformError::Unsupported)
+    }
+    /// Show a cursor hidden by [`CursorControl::conceal`] again. Does nothing
+    /// when it is not hidden, which is all the default does.
+    fn reveal(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait Displays: Send {
@@ -163,13 +197,103 @@ pub trait Displays: Send {
 
 /// Plain-text clipboard access (milestone M4; backends may return
 /// [`PlatformError::Unsupported`] until then).
+///
+/// Every method returns within [`CLIPBOARD_TIMEOUT`] or fails. Text has LF
+/// line endings both ways: backends convert from and to the OS's own (see
+/// [`to_lf`] and [`to_crlf`]).
 pub trait TextClipboard: Send {
-    /// Changes whenever the clipboard contents change; cheap to call.
-    fn change_count(&self) -> u64;
-    /// The clipboard text, or `None` if it holds no text or the item is
-    /// marked as concealed (password managers).
-    fn read_text(&self) -> Result<Option<String>>;
-    fn write_text(&mut self, text: &str) -> Result<()>;
+    /// A number that changes whenever the clipboard's contents change,
+    /// [`TextClipboard::write_text`] included. Cheap to call.
+    fn change_count(&self) -> Result<u64>;
+    /// The clipboard's text. `None` when the clipboard holds no text, when
+    /// the text is longer than `max_bytes` of UTF-8 (it is never cut short),
+    /// or when the item comes from a password manager (marked concealed,
+    /// transient or auto-generated), whose text is never read.
+    fn read_text(&self, max_bytes: usize) -> Result<Option<String>>;
+    /// Puts `text` on the clipboard and returns the change count right after
+    /// the write, so the caller can tell its own write from the next copy.
+    fn write_text(&mut self, text: &str) -> Result<u64>;
+}
+
+/// `text` with every CRLF and every lone CR made LF, the line ending
+/// clipboard text has inside Hop. Borrowed when nothing changes.
+pub fn to_lf(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    let mut lf = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            // CRLF is one line ending, not two.
+            chars.next_if_eq(&'\n');
+            lf.push('\n');
+        } else {
+            lf.push(c);
+        }
+    }
+    Cow::Owned(lf)
+}
+
+/// `text` with CRLF line endings, as Windows expects on its clipboard. Line
+/// endings are made LF first, so a CRLF already there is never doubled.
+pub fn to_crlf(text: &str) -> String {
+    to_lf(text).replace('\n', "\r\n")
+}
+
+/// The part of one display's edge that leads to the other computer, where
+/// files dragged there can be dropped (milestone M5).
+///
+/// In logical coordinates. `start..end` runs along the edge: y for a left or
+/// right edge, x for a top or bottom edge.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DropZone {
+    /// The display's frame.
+    pub display: Rect,
+    /// The edge of `display` the zone lies along.
+    pub edge: Edge,
+    /// Where the zone starts along the edge.
+    pub start: f64,
+    /// Where the zone ends along the edge, after `start`.
+    pub end: f64,
+}
+
+/// Catches files dropped on the edge that leads to the other computer
+/// (milestone M5).
+///
+/// The drop target shows only while files are dragged near a zone, so it
+/// never gets in the way of ordinary clicks or of window snapping at the
+/// edge. It always accepts a drop as a copy, never a move: the files stay
+/// where they were. Drops wait here until [`DropCatcher::take_drops`]
+/// collects them.
+pub trait DropCatcher: Send {
+    /// Catch drops on `zones` from now on, in place of any zones set before,
+    /// with `label` on the target (such as "Drop to send to Windows PC"). An
+    /// empty list stops catching.
+    fn set_zones(&mut self, zones: Vec<DropZone>, label: &str) -> Result<()>;
+    /// The files dropped since the last call: one list of paths per drop,
+    /// oldest drop first.
+    fn take_drops(&mut self) -> Vec<Vec<PathBuf>>;
+}
+
+/// The [`DropCatcher`] of backends and fakes without a drop target:
+/// clearing the zones works, setting any fails with
+/// [`PlatformError::Unsupported`], and nothing is ever dropped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoDrops;
+
+impl DropCatcher for NoDrops {
+    fn set_zones(&mut self, zones: Vec<DropZone>, _label: &str) -> Result<()> {
+        if zones.is_empty() {
+            Ok(())
+        } else {
+            Err(PlatformError::Unsupported)
+        }
+    }
+
+    fn take_drops(&mut self) -> Vec<Vec<PathBuf>> {
+        Vec::new()
+    }
 }
 
 pub trait Permissions: Send {
@@ -208,6 +332,8 @@ pub struct Platform {
     pub cursor: Box<dyn CursorControl>,
     pub displays: Box<dyn Displays>,
     pub clipboard: Box<dyn TextClipboard>,
+    /// Files dropped on the edge that leads to the other computer.
+    pub drops: Box<dyn DropCatcher>,
     pub permissions: Box<dyn Permissions>,
     pub system: Box<dyn SystemState>,
 }
@@ -262,5 +388,76 @@ mod tests {
     #[test]
     fn the_tag_spells_hop() {
         assert_eq!(&INJECTED_TAG.to_be_bytes()[4..], b"HOP!");
+    }
+
+    #[test]
+    fn line_endings_become_lf() {
+        assert!(matches!(to_lf(""), Cow::Borrowed("")));
+        assert!(matches!(to_lf("no line break"), Cow::Borrowed(_)));
+        assert!(matches!(to_lf("one\ntwo\n"), Cow::Borrowed(_)));
+        assert_eq!(to_lf("one\r\ntwo\r\n"), "one\ntwo\n");
+        // A lone CR, as old Mac apps wrote it.
+        assert_eq!(to_lf("one\rtwo\r"), "one\ntwo\n");
+        // Mixed, including a lone CR right before a CRLF.
+        assert_eq!(to_lf("a\r\nb\nc\rd\r\r\ne"), "a\nb\nc\nd\n\ne");
+    }
+
+    #[test]
+    fn line_endings_become_crlf_and_are_never_doubled() {
+        assert_eq!(to_crlf(""), "");
+        assert_eq!(to_crlf("no line break"), "no line break");
+        assert_eq!(to_crlf("one\ntwo\n"), "one\r\ntwo\r\n");
+        assert_eq!(to_crlf("one\rtwo"), "one\r\ntwo");
+        assert_eq!(to_crlf("a\r\nb\nc\rd"), "a\r\nb\r\nc\r\nd");
+        // Text that already has CRLF keeps it, there and back again.
+        let windows = "first line\r\nsecond line\r\n";
+        assert_eq!(to_crlf(windows), windows);
+        assert_eq!(to_crlf(&to_lf(windows)), windows);
+        assert_eq!(to_lf(&to_crlf("first\nsecond")), "first\nsecond");
+    }
+
+    /// A cursor control with only the methods every backend must write.
+    struct PlainCursor;
+
+    impl CursorControl for PlainCursor {
+        fn position(&self) -> Result<Point> {
+            Ok(Point::default())
+        }
+
+        fn park(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn restore(&mut self, _at: Point) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_backend_that_cannot_conceal_the_cursor_says_so() {
+        let mut cursor = PlainCursor;
+        assert!(matches!(cursor.conceal(), Err(PlatformError::Unsupported)));
+        assert!(cursor.reveal().is_ok(), "nothing to show again");
+    }
+
+    #[test]
+    fn without_a_drop_target_only_clearing_the_zones_works() {
+        let mut drops = NoDrops;
+        assert!(
+            drops
+                .set_zones(Vec::new(), "Drop to send to Windows PC")
+                .is_ok()
+        );
+        let zone = DropZone {
+            display: Rect::new(0.0, 0.0, 1512.0, 982.0),
+            edge: Edge::Right,
+            start: 59.0,
+            end: 923.0,
+        };
+        assert!(matches!(
+            drops.set_zones(vec![zone], "Drop to send to Windows PC"),
+            Err(PlatformError::Unsupported)
+        ));
+        assert!(drops.take_drops().is_empty());
     }
 }

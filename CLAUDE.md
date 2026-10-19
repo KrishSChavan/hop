@@ -1,6 +1,6 @@
 # Hop
 
-Hop is the user's personal software KVM: one keyboard and mouse shared between their Mac and their Windows 11 laptop over home Wi-Fi, with two-way control, a Cmd↔Ctrl swap, text clipboard sync, and files dropped into a "Received" folder. The user does not read code; Claude writes and maintains all of it, so explain changes in plain language.
+Hop is the user's personal software KVM: one keyboard and mouse shared between their Mac and their Windows 11 laptop over home Wi-Fi, with two-way control, keys as labelled (an optional Cmd↔Ctrl swap), text clipboard sync, and files dropped into a "Received" folder. The user does not read code; Claude writes and maintains all of it, so explain changes in plain language.
 
 ## Where things are
 
@@ -8,6 +8,7 @@ Hop is the user's personal software KVM: one keyboard and mouse shared between t
 - `docs/ARCHITECTURE.md`: the spec, including the hand-off state machine.
 - `docs/ROADMAP.md`: milestones, plus open questions tagged by milestone.
 - `docs/M6-APP.md`: the spec for the app.
+- `docs/M4-M5-DESIGN.md`: the design for the first-test fixes, the clipboard (M4) and files (M5).
 - `docs/INSTALL.md`: the user's guide to installing and using the app. It quotes the app's labels from `docs/M6-APP.md`, so change the two together.
 - `docs/WINDOWS-SETUP.md`: preparing the PC for building and testing.
 - `docs/releases/`: release notes, one file per tag (`vX.Y.Z.md`).

@@ -104,6 +104,7 @@ fn a_core_thread_drives_the_link_without_blocking() {
                         replies += 1;
                     }
                     NetEvent::PeerDown { .. } => panic!("unexpected disconnect"),
+                    NetEvent::Transfer(_) => panic!("unexpected transfer"),
                 }
             }
         }

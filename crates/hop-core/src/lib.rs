@@ -19,7 +19,7 @@ mod motion;
 
 pub use chord::Chord;
 pub use config::CoreConfig;
-pub use layout::{Crossing, DeviceLayout, Layout, LayoutError};
+pub use layout::{Crossing, DeviceLayout, Layout, LayoutError, SharedEdge};
 pub use machine::{Action, CaptureMode, Core, EndReason, Event, Notice, State};
 
 /// Milliseconds on a monotonic clock chosen by the runtime. Only differences

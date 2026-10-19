@@ -19,10 +19,20 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct Shared {
     lease: Mutex<SuppressLease>,
     cursor: Mutex<CursorState>,
-    /// Where a warp last put the cursor. Warps produce no event, so capture
+    /// The warp capture has not seen yet. Warps produce no event, so capture
     /// would otherwise report the pre-warp position as the "previous
-    /// position" of the next event.
-    warped_to: Mutex<Option<Point>>,
+    /// position" of the next event, and macOS adds a warp's distance to the
+    /// delta of the next mouse event (see `convert`).
+    warp: Mutex<Option<Warp>>,
+}
+
+/// A warp of the cursor from `from` to `to`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Warp {
+    /// Where the cursor was just before the warp.
+    pub(crate) from: Point,
+    /// Where the warp put it.
+    pub(crate) to: Point,
 }
 
 /// What the cursor control has done to the cursor, so it can be undone
@@ -96,14 +106,21 @@ impl Shared {
         }
     }
 
-    /// Records that a warp just put the cursor at `to`.
-    pub(crate) fn note_warp(&self, to: Point) {
-        *lock(&self.warped_to) = Some(to);
+    /// Records a warp from `from` to `to`, just before it happens: the next
+    /// event can carry the warp's distance as soon as the warp is done.
+    /// Warps that capture has not seen yet add up, so `from` stays the
+    /// first one's. A warp that then fails is cancelled by noting the
+    /// reverse move, which works whether or not capture has already taken
+    /// the record (the converter adds up what it takes the same way).
+    pub(crate) fn note_warp(&self, from: Point, to: Point) {
+        let mut warp = lock(&self.warp);
+        let from = warp.map_or(from, |w| w.from);
+        *warp = Some(Warp { from, to });
     }
 
-    /// The position of the last warp that capture has not seen yet.
-    pub(crate) fn take_warp(&self) -> Option<Point> {
-        lock(&self.warped_to).take()
+    /// The warp that capture has not seen yet.
+    pub(crate) fn take_warp(&self) -> Option<Warp> {
+        lock(&self.warp).take()
     }
 }
 
@@ -154,9 +171,44 @@ mod tests {
     fn a_warp_is_reported_once() {
         let shared = Shared::new();
         assert_eq!(shared.take_warp(), None);
-        shared.note_warp(Point::new(1.0, 2.0));
-        shared.note_warp(Point::new(3.0, 4.0));
-        assert_eq!(shared.take_warp(), Some(Point::new(3.0, 4.0)));
+        shared.note_warp(Point::new(0.0, 0.0), Point::new(3.0, 4.0));
+        let warp = Some(Warp {
+            from: Point::new(0.0, 0.0),
+            to: Point::new(3.0, 4.0),
+        });
+        assert_eq!(shared.take_warp(), warp);
         assert_eq!(shared.take_warp(), None);
+    }
+
+    #[test]
+    fn warps_capture_has_not_seen_add_up() {
+        let shared = Shared::new();
+        shared.note_warp(Point::new(1511.0, 300.0), Point::new(756.0, 491.0));
+        shared.note_warp(Point::new(756.0, 491.0), Point::new(1511.0, 420.0));
+        // macOS adds both distances to the next event, so the first warp's
+        // starting point counts.
+        assert_eq!(
+            shared.take_warp(),
+            Some(Warp {
+                from: Point::new(1511.0, 300.0),
+                to: Point::new(1511.0, 420.0),
+            })
+        );
+    }
+
+    #[test]
+    fn noting_the_reverse_move_cancels_a_failed_warp() {
+        let shared = Shared::new();
+        shared.note_warp(Point::new(0.0, 0.0), Point::new(10.0, 0.0));
+        shared.note_warp(Point::new(10.0, 0.0), Point::new(10.0, 50.0));
+        // The second warp failed: only the first one happened.
+        shared.note_warp(Point::new(10.0, 50.0), Point::new(10.0, 0.0));
+        assert_eq!(
+            shared.take_warp(),
+            Some(Warp {
+                from: Point::new(0.0, 0.0),
+                to: Point::new(10.0, 0.0),
+            })
+        );
     }
 }

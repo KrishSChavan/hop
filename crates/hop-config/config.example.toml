@@ -38,7 +38,9 @@ takeback_threshold = 4   # how far to move this Mac's own mouse to take control 
 emergency_chord = ["ControlLeft", "AltLeft", "ShiftLeft", "Escape"]
 
 [keymap]
-swap_cmd_ctrl = true  # Cmd+C typed here arrives on the PC as Ctrl+C, and the other way round
+# Keys typed on the other computer's keyboard: "keep" means Ctrl stays Ctrl and
+# Cmd is the Windows key; "swap" means Cmd and Ctrl trade places.
+cmd_ctrl = "keep"
 
 [clipboard]
 enabled = true
@@ -46,6 +48,7 @@ max_text_bytes = 1048576  # 1 MiB, the most the protocol carries (1 to 1048576)
 # Passwords copied from a password manager are never sent. There is no setting for that.
 
 [transfer]
+enabled = true  # receive files from the PC, and offer this Mac's drop zone
 # When unset, files from the PC go to ~/Downloads/Hop Received.
 # received_dir = "/Users/krish/Documents/From the PC"
 

@@ -211,6 +211,9 @@ fn run_tap(
     ready: mpsc::SyncSender<Result<RunLoopHandle>>,
 ) {
     ffi::make_current_thread_interactive();
+    // A warp noted while no tap ran (failing open after an earlier capture
+    // stopped, say) belongs to no event this tap will see.
+    let _ = shared.take_warp();
     let start_cursor = cursor::current_position().ok();
     // The callbacks reach the context through this raw pointer. It is freed
     // below, only after the tap and the timer are gone.
@@ -399,8 +402,8 @@ impl TapContext {
         // borrowed; its event is then passed on unreported.
         if let Ok(mut state) = self.state.try_borrow_mut() {
             let state = &mut *state;
-            if let Some(warped_to) = self.shared.take_warp() {
-                state.converter.set_cursor(warped_to);
+            if let Some(warp) = self.shared.take_warp() {
+                state.converter.note_warp(warp);
             }
             let converted = state.converter.convert(ty, event);
             for event in converted.events() {

@@ -17,7 +17,7 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use hop_config::{Config, Side};
+use hop_config::{CmdCtrl, Config, Side};
 use hop_core::{Chord, CoreConfig};
 use hop_keymap::ModifierPolicy;
 use hop_net::{Fingerprint, NetConfig, NetError, PinnedPeer};
@@ -109,9 +109,7 @@ pub(crate) fn run(
         me: startup.identity.device_id(),
         os: Os::current(),
         core,
-        policy: ModifierPolicy {
-            swap_cmd_ctrl: config.keymap.swap_cmd_ctrl,
-        },
+        policy: modifier_policy(config),
         peer: PeerPlacement {
             id: chosen.pin.id.clone(),
             name: chosen.pin.name.clone(),
@@ -402,6 +400,16 @@ fn core_config(config: &Config) -> CoreConfig {
         takeback_threshold: input.takeback_threshold,
         emergency_chord: chord(&input.emergency_chord),
         ..CoreConfig::default()
+    }
+}
+
+/// The key mapping from the Shortcuts setting, `keymap.cmd_ctrl`.
+fn modifier_policy(config: &Config) -> ModifierPolicy {
+    ModifierPolicy {
+        swap_cmd_ctrl: match config.keymap.cmd_ctrl {
+            CmdCtrl::Keep => false,
+            CmdCtrl::Swap => true,
+        },
     }
 }
 
@@ -868,5 +876,17 @@ mod tests {
         assert_eq!(core.takeback_threshold, 8.0);
         assert_eq!(core.emergency_chord, Chord::default());
         assert_eq!(core.peer_timeout_ms, CoreConfig::default().peer_timeout_ms);
+    }
+
+    #[test]
+    fn the_shortcuts_setting_reaches_the_key_mapping() {
+        let mut config = Config::default();
+        assert_eq!(modifier_policy(&config), ModifierPolicy::default());
+        assert!(
+            !modifier_policy(&config).swap_cmd_ctrl,
+            "keys stay as labelled"
+        );
+        config.keymap.cmd_ctrl = CmdCtrl::Swap;
+        assert!(modifier_policy(&config).swap_cmd_ctrl);
     }
 }

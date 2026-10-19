@@ -978,6 +978,9 @@ impl Sim {
                     }
                 }
                 Action::Notify(notice) => self.dev[d].notices.push(notice.clone()),
+                // Recorded in `log` above; nothing simulated depends on
+                // them yet.
+                Action::ConcealCursor | Action::RevealCursor | Action::Nudge { .. } => {}
             }
         }
     }

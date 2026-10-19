@@ -62,8 +62,8 @@ mod paths;
 mod validate;
 
 pub use config::{
-    ClipboardConfig, Config, DeviceConfig, InputConfig, KeymapConfig, NetworkConfig, PeerConfig,
-    Side, TransferConfig,
+    ClipboardConfig, CmdCtrl, Config, DeviceConfig, InputConfig, KeymapConfig, NetworkConfig,
+    PeerConfig, Side, TransferConfig,
 };
 pub use error::ConfigError;
 pub use file::Warning;

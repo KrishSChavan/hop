@@ -14,9 +14,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use hop_platform::{
-    CaptureMode, CapturedEvent, CursorControl, Displays, InputCapture, InputInjector, Permission,
-    PermissionState, Permissions, Platform, PlatformError, Result, SystemState, TestWindow,
-    TextClipboard,
+    CaptureMode, CapturedEvent, CursorControl, Displays, InputCapture, InputInjector, NoDrops,
+    Permission, PermissionState, Permissions, Platform, PlatformError, Result, SystemState,
+    TestWindow, TextClipboard,
 };
 use hop_types::{DisplayInfo, InputEvent, KeyCode, MouseButton, Os, Point, Rect, ScrollUnit};
 
@@ -436,22 +436,24 @@ impl Displays for Screens {
     }
 }
 
+/// A clipboard the self-test must never touch: every call is logged, so the
+/// tests can check that none was made.
 struct Clipboard(Shared);
 
 impl TextClipboard for Clipboard {
-    fn change_count(&self) -> u64 {
+    fn change_count(&self) -> Result<u64> {
         lock(&self.0).log.push("clipboard".to_string());
-        0
+        Err(PlatformError::Unsupported)
     }
 
-    fn read_text(&self) -> Result<Option<String>> {
+    fn read_text(&self, _max_bytes: usize) -> Result<Option<String>> {
         lock(&self.0).log.push("clipboard".to_string());
-        Ok(None)
+        Err(PlatformError::Unsupported)
     }
 
-    fn write_text(&mut self, _text: &str) -> Result<()> {
+    fn write_text(&mut self, _text: &str) -> Result<u64> {
         lock(&self.0).log.push("clipboard".to_string());
-        Ok(())
+        Err(PlatformError::Unsupported)
     }
 }
 
@@ -588,6 +590,7 @@ impl Fake {
             cursor: Box::new(Cursor(Arc::clone(&world))),
             displays: Box::new(Screens(Arc::clone(&world))),
             clipboard: Box::new(Clipboard(Arc::clone(&world))),
+            drops: Box::new(NoDrops),
             permissions: Box::new(Access(Arc::clone(&world))),
             system: Box::new(System(Arc::clone(&world))),
         };

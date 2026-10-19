@@ -33,7 +33,8 @@
 //!    capture sink. After each wake-up it drains [`NetEvents::try_recv`]
 //!    and feeds the core: [`NetEvent::PeerUp`] → `PeerConnected`,
 //!    [`NetEvent::PeerDown`] → `PeerDisconnected`, [`NetEvent::Message`] →
-//!    `PeerMessage`. `PeerUp::os` is what the Cmd/Ctrl swap keys on.
+//!    `PeerMessage`. [`NetEvent::Transfer`] (files sent or received) stays
+//!    with the agent. `PeerUp::os` is what the Cmd/Ctrl swap keys on.
 //! 5. **Sending.** Carry out `Action::Send { to, msg }` with
 //!    [`NetHandle::send`]. It never blocks and never drops a reliable
 //!    message: a full queue closes that connection with `OVERLOADED`, and
@@ -109,6 +110,7 @@
 //!         NetEvent::PeerUp(up) => { /* core: PeerConnected { up.peer, up.os, up.displays } */ }
 //!         NetEvent::PeerDown { peer, .. } => { /* core: PeerDisconnected { peer } */ }
 //!         NetEvent::Message { from, msg } => { /* core: PeerMessage { from, msg } */ }
+//!         NetEvent::Transfer(transfer) => { /* the agent's own: files sent or received */ }
 //!     }
 //! }
 //! // When quitting, after giving input back:
@@ -142,6 +144,7 @@ mod pairing;
 mod ratelimit;
 mod sanitize;
 mod tls;
+mod transfer;
 mod transport;
 
 pub use address::resolve_address;
@@ -150,8 +153,11 @@ pub use discovery::{DiscoveryError, FoundDevice, SERVICE_TYPE, find_pairing_host
 pub use events::{DownReason, NetEvent, NetEvents, PeerUp};
 pub use fingerprint::{Fingerprint, FingerprintError};
 pub use identity::{Identity, IdentityError, LoadedIdentity};
-pub use link::{Limits, NetConfig, NetError, NetHandle, PinnedPeer, SendError, Timing, start};
+pub use link::{
+    FilesConfig, Limits, NetConfig, NetError, NetHandle, PinnedPeer, SendError, Timing, start,
+};
 pub use pairing::{
     DEFAULT_PAIRING_PORT, PairError, PairInfo, PairedPeer, PairingCode, PairingHost, PairingTiming,
     PendingPairing, pair_join,
 };
+pub use transfer::{Refusal, TransferEvent, TransferFailure};

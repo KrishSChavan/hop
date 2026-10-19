@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -156,6 +157,15 @@ pub struct NetConfig {
     pub displays: Vec<DisplayInfo>,
     /// The paired peers.
     pub peers: Vec<PinnedPeer>,
+    /// Advertise the `clipboard.text` capability and accept `ClipboardText`
+    /// from peers that negotiated it (milestone M4). [`NetConfig::new`]
+    /// leaves it off; the agent sets it from `clipboard.enabled`.
+    pub clipboard: bool,
+    /// Receive files into this folder and advertise the `files` capability
+    /// (milestone M5). `None`, which [`NetConfig::new`] sets, means off;
+    /// since both sides must advertise `files`, no files then travel either
+    /// way.
+    pub files: Option<FilesConfig>,
     /// Advertise this device and look for peers with mDNS. Tests turn it
     /// off: multicast would trigger macOS's Local Network prompt.
     pub discovery: bool,
@@ -171,7 +181,8 @@ pub struct NetConfig {
 
 impl NetConfig {
     /// A config listening on `0.0.0.0:port`, with discovery on, no peers,
-    /// no displays and the default timing and limits.
+    /// no displays, clipboard and files off, and the default timing and
+    /// limits.
     pub fn new(port: u16, device_name: impl Into<String>, app_version: impl Into<String>) -> Self {
         NetConfig {
             bind: SocketAddr::from(([0, 0, 0, 0], port)),
@@ -180,6 +191,8 @@ impl NetConfig {
             os: Os::current(),
             displays: Vec::new(),
             peers: Vec::new(),
+            clipboard: false,
+            files: None,
             discovery: true,
             timing: Timing::default(),
             limits: Limits::default(),
@@ -197,12 +210,22 @@ impl fmt::Debug for NetConfig {
             .field("os", &self.os)
             .field("displays", &self.displays)
             .field("peers", &self.peers)
+            .field("clipboard", &self.clipboard)
+            .field("files", &self.files)
             .field("discovery", &self.discovery)
             .field("timing", &self.timing)
             .field("limits", &self.limits)
             .field("on_event", &self.on_event.is_some())
             .finish()
     }
+}
+
+/// Receiving files, for [`NetConfig::files`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilesConfig {
+    /// The folder received files are saved in: `transfer.received_dir`, or
+    /// Downloads › Hop Received. It is created when the first files arrive.
+    pub received_dir: PathBuf,
 }
 
 /// Why the link could not start.
@@ -521,6 +544,38 @@ impl NetHandle {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(SendError::NotConnected),
         }
+    }
+
+    /// Sends the files at `paths` to `to` and returns the transfer's id at
+    /// once, without blocking. The outcome arrives later as a
+    /// [`NetEvent::Transfer`](crate::NetEvent::Transfer) with that id:
+    /// [`TransferEvent::Sent`](crate::TransferEvent::Sent) or
+    /// [`TransferEvent::Failed`](crate::TransferEvent::Failed).
+    ///
+    /// Only regular files are sent, read on a thread of their own; folders
+    /// and files that cannot be read are skipped and counted. The files are
+    /// copied: nothing here moves or changes them.
+    ///
+    /// This is a stub until work package T4 replaces it: it always returns
+    /// [`SendError::NotNegotiated`].
+    ///
+    /// # Errors
+    ///
+    /// [`SendError::NotConnected`] if `to` has no current connection, and
+    /// [`SendError::NotNegotiated`] if the two did not negotiate `files`.
+    pub fn send_files(&self, to: &DeviceId, paths: Vec<PathBuf>) -> Result<u64, SendError> {
+        let _ = (to, paths);
+        Err(SendError::NotNegotiated)
+    }
+
+    /// Sends `to` a tiny datagram that every build ignores, so that its
+    /// Wi-Fi radio is awake when the cursor crosses to it (carries out
+    /// `Action::Nudge`). Best effort: it never blocks and never fails
+    /// loudly, and a peer that is not connected is skipped.
+    ///
+    /// This is a stub until work package T4 replaces it: it does nothing.
+    pub fn nudge(&self, to: &DeviceId) {
+        let _ = to;
     }
 
     /// Replaces the displays sent in `Hello`. Connections made from now on

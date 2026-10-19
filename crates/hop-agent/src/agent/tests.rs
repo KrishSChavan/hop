@@ -4,6 +4,7 @@
 //! the network tests bind 127.0.0.1 only, with discovery off (no multicast).
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 use hop_core::{Action, CaptureMode as CoreMode, Chord, CoreConfig, State};
 use hop_keymap::ModifierPolicy;
 use hop_net::{DownReason, Identity, NetConfig, NetEvent, PeerUp, PinnedPeer};
-use hop_platform::CaptureMode;
+use hop_platform::{CaptureMode, DropZone};
 use hop_proto::{Capability, Negotiated, PROTO_MAJOR, caps};
 use hop_types::{
     CoreMessage, DeviceId, DisplayInfo, Edge, EntryPoint, InputEvent, KeyCode, MotionMark,
@@ -21,7 +22,7 @@ use hop_types::{
 
 use super::exec::Executor;
 use super::fake::{Call, Fake, FakeLink};
-use super::link::NetLink;
+use super::link::{Link, NetLink};
 use super::start::Host;
 use super::{Agent, INPUT_QUEUE, PeerPlacement, Settings, Signals};
 use crate::agent::start::chord;
@@ -49,12 +50,16 @@ fn display(width: f64, height: f64) -> DisplayInfo {
     }
 }
 
+/// Settings for a test agent. The Cmd/Ctrl swap is on (it is off by
+/// default), so the tests show keys being mapped on their way.
 fn settings(me: DeviceId, os: Os, peer: DeviceId, peer_name: &str, side: Edge) -> Settings {
     Settings {
         me,
         os,
         core: CoreConfig::default(),
-        policy: ModifierPolicy::default(),
+        policy: ModifierPolicy {
+            swap_cmd_ctrl: true,
+        },
         peer: PeerPlacement {
             id: peer,
             name: peer_name.to_owned(),
@@ -209,6 +214,39 @@ fn executor(os: Os, swap_cmd_ctrl: bool) -> (Executor<FakeLink>, Fake, FakeLink)
 }
 
 // ----- the action executor -------------------------------------------------
+
+#[test]
+fn a_session_start_logs_how_long_the_other_computer_took_to_answer() {
+    let _ = logging::tests::capture();
+    let (mut exec, _fake, _link) = executor(Os::MacOs, false);
+    // A peer id of its own, so the line found is this test's.
+    let peer = DeviceId::new("a".repeat(32));
+    let enter = CoreMessage::Enter {
+        seq: 1,
+        entry: EntryPoint {
+            display_id: 1,
+            edge: Edge::Left,
+            position: Point::new(1.0, 400.0),
+        },
+        held_keys: Vec::new(),
+        source_os: Os::MacOs,
+    };
+    let _ = exec.execute(vec![
+        Action::Send {
+            to: peer.clone(),
+            msg: enter,
+        },
+        Action::Notify(hop_core::Notice::ControlStarted { peer: peer.clone() }),
+    ]);
+    let log = logging::tests::captured_text();
+    assert!(
+        log.lines()
+            .any(|line| line.contains("session started: controlling")
+                && line.contains(peer.as_str())
+                && line.contains("answered_in_ms=")),
+        "{log}"
+    );
+}
 
 #[test]
 fn cmd_c_from_a_mac_keyboard_is_injected_on_windows_as_ctrl_c() {
@@ -374,11 +412,14 @@ fn each_session_starts_with_a_fresh_translator() {
 #[test]
 fn failed_session_calls_report_a_stall_and_fail_open_calls_do_not() {
     let (mut exec, fake, _) = executor(Os::Windows, true);
+    // Hidden before the failures start, so showing it again fails too.
+    let _ = exec.execute(vec![Action::ConcealCursor]);
     {
         let mut state = fake.state();
         state.fail_inject = true;
         state.fail_park = true;
         state.fail_suppress = true;
+        state.fail_conceal = true;
     }
     for (action, stalls) in [
         (inject_from_mac(C, true), true),
@@ -388,6 +429,11 @@ fn failed_session_calls_report_a_stall_and_fail_open_calls_do_not() {
             },
             true,
         ),
+        // Cosmetic: the cursor merely stays visible, or hidden until this
+        // computer's mouse is used. Before parking and restoring, which end
+        // a conceal, so the failing reveal does reach the platform.
+        (Action::ConcealCursor, false),
+        (Action::RevealCursor, false),
         (Action::ParkCursor, true),
         (Action::SetCaptureMode(CoreMode::Suppress), true),
         (Action::SetCaptureMode(CoreMode::Passive), false),
@@ -398,10 +444,55 @@ fn failed_session_calls_report_a_stall_and_fail_open_calls_do_not() {
             false,
         ),
         (Action::ReleaseAllInjected, false),
+        (Action::Nudge { to: pc_id() }, false),
     ] {
         let label = format!("{action:?}");
         assert_eq!(exec.execute(vec![action]).stalled, stalls, "{label}");
     }
+}
+
+#[test]
+fn a_failed_reveal_is_only_warned_about_and_not_tried_again() {
+    let (mut exec, fake, _) = executor(Os::Windows, false);
+    let _ = exec.execute(vec![Action::ConcealCursor]);
+    fake.state().fail_conceal = true;
+    assert!(!exec.execute(vec![Action::RevealCursor]).stalled);
+    assert!(fake.state().concealed, "the fake refused to show it");
+    // Hop counts the cursor as shown all the same (the platform shows it by
+    // itself when this computer's mouse is used), so it asks only once.
+    fake.state().fail_conceal = false;
+    let _ = exec.execute(vec![Action::RevealCursor]);
+    exec.fail_open();
+    let state = fake.state();
+    assert!(!state.calls.contains(&Call::Reveal), "{:?}", state.calls);
+    assert_eq!(state.calls.first(), Some(&Call::Conceal));
+}
+
+#[test]
+fn the_cursor_a_session_left_behind_is_hidden_until_shown_again() {
+    let (mut exec, fake, _) = executor(Os::Windows, false);
+    assert!(!exec.execute(vec![Action::ConcealCursor]).stalled);
+    assert!(fake.state().concealed);
+    assert!(!exec.execute(vec![Action::RevealCursor]).stalled);
+    assert!(!fake.state().concealed);
+    // Showing a cursor that is not hidden asks the platform for nothing.
+    let _ = exec.execute(vec![Action::RevealCursor]);
+    assert_eq!(fake.state().calls, [Call::Conceal, Call::Reveal]);
+
+    // Failing open shows a hidden cursor again too.
+    let _ = exec.execute(vec![Action::ConcealCursor]);
+    exec.fail_open();
+    let state = fake.state();
+    assert!(!state.concealed);
+    assert_eq!(state.calls.last(), Some(&Call::Reveal));
+}
+
+#[test]
+fn nudges_go_to_the_network() {
+    let (mut exec, _, link) = executor(Os::MacOs, false);
+    let _ = exec.execute(vec![Action::Nudge { to: pc_id() }]);
+    assert_eq!(link.nudges(), [pc_id()]);
+    assert!(link.sent().is_empty(), "a nudge is not a message");
 }
 
 #[test]
@@ -453,6 +544,46 @@ fn the_emergency_chord_comes_from_its_key_names() {
     // A name Hop does not know keeps the default, so there is always a way
     // out of a session.
     assert_eq!(chord(&names(&["ControlLeft", "Hyper"])), Chord::default());
+}
+
+/// The fakes keep the contracts that tests of the clipboard, drop zones and
+/// file transfers rely on.
+#[test]
+fn the_fakes_keep_the_clipboard_drop_and_transfer_contracts() {
+    let (mut platform, fake) = Fake::new(1512.0, 982.0);
+    // The clipboard counts every write and never cuts text short.
+    let count = platform.clipboard.write_text("one\ntwo").expect("write");
+    assert_eq!(platform.clipboard.change_count().ok(), Some(count));
+    assert_eq!(
+        platform.clipboard.read_text(7).ok().flatten().as_deref(),
+        Some("one\ntwo")
+    );
+    assert_eq!(platform.clipboard.read_text(6).ok(), Some(None));
+    assert!(platform.clipboard.write_text("three").expect("write") > count);
+
+    // The drop target remembers its zones and hands out drops oldest first.
+    let zone = DropZone {
+        display: Rect::new(0.0, 0.0, 1512.0, 982.0),
+        edge: Edge::Right,
+        start: 59.0,
+        end: 923.0,
+    };
+    platform
+        .drops
+        .set_zones(vec![zone.clone()], "Drop to send to PC")
+        .expect("zones");
+    assert_eq!(fake.state().zones, [zone]);
+    assert_eq!(fake.state().label, "Drop to send to PC");
+    let (first, second) = (vec![PathBuf::from("a.txt")], vec![PathBuf::from("b.txt")]);
+    fake.state().drops.extend([first.clone(), second.clone()]);
+    assert_eq!(platform.drops.take_drops(), [first.clone(), second.clone()]);
+    assert!(platform.drops.take_drops().is_empty());
+
+    // The network numbers transfers from 1.
+    let link = FakeLink::default();
+    assert_eq!(link.send_files(&pc_id(), first.clone()).ok(), Some(1));
+    assert_eq!(link.send_files(&pc_id(), second.clone()).ok(), Some(2));
+    assert_eq!(link.sent_files(), [(pc_id(), first), (pc_id(), second)]);
 }
 
 // ----- the core loop ---------------------------------------------------------

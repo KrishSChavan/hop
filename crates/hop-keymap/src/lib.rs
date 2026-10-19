@@ -11,7 +11,8 @@
 //!   scancodes with the extended (E0) flag;
 //! - names keys the way the W3C UI Events spec does (`"KeyA"`, `"MetaLeft"`,
 //!   `"Escape"`), for the config file: [`name`] and [`from_name`];
-//! - swaps Command and Control between a Mac and a PC: [`ModifierPolicy`];
+//! - swaps Command and Control between a Mac and a PC, when that setting is
+//!   on (it is off by default): [`ModifierPolicy`];
 //! - remembers which key it injected for each held key, so every key-up
 //!   matches its key-down and a session can end with nothing stuck down:
 //!   [`Translator`], and [`ButtonTracker`] for mouse buttons.
@@ -20,23 +21,36 @@
 //!
 //! # Example
 //!
-//! Cmd+C typed on a Mac and injected on Windows:
+//! Cmd+C typed on a Mac and injected on Windows, first as it is by default,
+//! then with the Cmd/Ctrl swap on:
 //!
 //! ```
 //! use hop_keymap::{ModifierPolicy, Translator, from_mac, to_windows_scancode};
 //! use hop_types::Os;
 //!
 //! // The Mac turns its keycodes (kVK_Command, kVK_ANSI_C) into HID usages...
-//! let keys_typed = [from_mac(0x37), from_mac(0x08)];
-//!
-//! // ...and Windows swaps Command for Control, then looks up scancodes.
-//! let mut keys = Translator::new(ModifierPolicy::default(), Os::MacOs, Os::Windows);
-//! let injected: Vec<_> = keys_typed
+//! let keys_typed: Vec<_> = [from_mac(0x37), from_mac(0x08)]
 //!     .into_iter()
 //!     .flatten()
-//!     .map(|key| to_windows_scancode(keys.press(key)))
 //!     .collect();
-//! // Left Control and C, neither of them an extended key.
+//!
+//! // ...and Windows looks up scancodes. By default the keys arrive as
+//! // labelled: the Windows key (an extended key, E0 5B) and C.
+//! let mut keys = Translator::new(ModifierPolicy::default(), Os::MacOs, Os::Windows);
+//! let injected: Vec<_> = keys_typed
+//!     .iter()
+//!     .map(|&key| to_windows_scancode(keys.press(key)))
+//!     .collect();
+//! assert_eq!(injected, [Some((0x5B, true)), Some((0x2E, false))]);
+//!
+//! // With the swap on, Windows swaps Command for Control first: Left
+//! // Control and C, neither of them an extended key.
+//! let swap = ModifierPolicy { swap_cmd_ctrl: true };
+//! let mut keys = Translator::new(swap, Os::MacOs, Os::Windows);
+//! let injected: Vec<_> = keys_typed
+//!     .iter()
+//!     .map(|&key| to_windows_scancode(keys.press(key)))
+//!     .collect();
 //! assert_eq!(injected, [Some((0x1D, false)), Some((0x2E, false))]);
 //! ```
 //!

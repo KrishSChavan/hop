@@ -100,7 +100,7 @@ The examples here are what the Mac shows when the PC is on its right.
 1. Click **Start sharing** on both computers. The status line, next to the coloured dot, says "Looking for Windows PC…" and then "Connected to Windows PC."
 2. Push the cursor past the edge Hop names: "Push the cursor past the right edge of this screen to move to Windows PC." The cursor carries on onto the other computer, and the keyboard follows. Hop says "Using Windows PC: this keyboard and mouse control it now."
 3. To come back, move the cursor back the way it came, across the border between the two screens. Or just use the other computer's own trackpad, mouse or keyboard: that takes control back.
-4. Your shortcuts follow you. Cmd+C typed on the Mac arrives on the PC as Ctrl+C, and Ctrl+C typed on the PC arrives on the Mac as Cmd+C.
+4. Keys stay as labelled. With the Mac's keyboard on the PC, use the PC's shortcuts: Ctrl+C copies and Ctrl+V pastes, and the Mac's Cmd key acts as the Windows key. With the PC's keyboard on the Mac, the Windows key acts as Cmd, so Windows key + C copies.
 
 **The emergency keys.** If the keyboard and mouse ever seem stuck on the other computer, press these keys together on the computer you are typing on. Use the keys on the left side of the keyboard. Control comes back at once.
 - On the Mac: **Control + Option + Shift + Escape**.

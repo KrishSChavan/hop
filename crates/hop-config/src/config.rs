@@ -267,21 +267,36 @@ impl Default for InputConfig {
 }
 
 /// Shortcut translation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The `swap_cmd_ctrl` key of earlier versions is retired: a file that still
+/// has it loads without a warning, its value is ignored, and the next save
+/// leaves it out.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeymapConfig {
-    /// Between a Mac and a PC, swap Command (or the Windows key) with
-    /// Control, so Cmd+C typed on the Mac arrives on Windows as Ctrl+C and
-    /// Ctrl+C typed on the PC arrives on the Mac as Cmd+C. Default true.
-    pub swap_cmd_ctrl: bool,
+    /// What happens to the Command and Control keys of the other computer's
+    /// keyboard when one computer is a Mac and the other a PC: `keep` (the
+    /// default) or `swap`.
+    pub cmd_ctrl: CmdCtrl,
 }
 
-impl Default for KeymapConfig {
-    fn default() -> Self {
-        Self {
-            swap_cmd_ctrl: true,
-        }
-    }
+/// What happens to the Command (or Windows) and Control keys of the other
+/// computer's keyboard, between a Mac and a PC. The computer the keys
+/// arrive on applies it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CmdCtrl {
+    /// Keys from the other computer's keyboard arrive as themselves, as
+    /// labelled (`keep` in the file; the default). With the Mac's keyboard
+    /// on the PC, Ctrl+V pastes, and the Mac's Command key is the Windows
+    /// key.
+    #[default]
+    Keep,
+    /// Meta (Command or the Windows key) and Control trade places between a
+    /// Mac and a PC (`swap` in the file): Cmd+C typed on the Mac arrives on
+    /// the PC as Ctrl+C, and Ctrl+C typed on the PC arrives on the Mac as
+    /// Cmd+C.
+    Swap,
 }
 
 /// Text clipboard sync.
@@ -312,15 +327,27 @@ impl Default for ClipboardConfig {
 }
 
 /// Files sent from other computers.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TransferConfig {
+    /// Receive files from the other computer, and offer this computer's drop
+    /// zone. Default true.
+    pub enabled: bool,
     /// The folder received files are saved in. It must be a full path ("~"
     /// is not expanded). When unset (the default), files go to "Hop
     /// Received" in the Downloads folder; see
     /// [`TransferConfig::received_dir_or_default`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub received_dir: Option<PathBuf>,
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            received_dir: None,
+        }
+    }
 }
 
 /// Networking.
@@ -365,9 +392,10 @@ mod tests {
             config.input.emergency_chord,
             ["ControlLeft", "AltLeft", "ShiftLeft", "Escape"]
         );
-        assert!(config.keymap.swap_cmd_ctrl);
+        assert_eq!(config.keymap.cmd_ctrl, CmdCtrl::Keep);
         assert!(config.clipboard.enabled);
         assert_eq!(config.clipboard.max_text_bytes, 1_048_576);
+        assert!(config.transfer.enabled);
         assert_eq!(config.transfer.received_dir, None);
         assert_eq!(config.network.port, 47800);
     }

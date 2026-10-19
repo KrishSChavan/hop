@@ -12,10 +12,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use hop_proto::Negotiated;
+use hop_proto::{Negotiated, caps};
 use hop_types::{CoreMessage, DeviceId, DisplayInfo, Os};
 
-use crate::CloseCode;
+use crate::{CloseCode, TransferEvent};
 
 /// Something the network layer tells the agent. Feed them to the core in
 /// the order they arrive:
@@ -25,13 +25,14 @@ use crate::CloseCode;
 /// | [`NetEvent::PeerUp`] | `Event::PeerConnected { peer, os, displays }` |
 /// | [`NetEvent::PeerDown`] | `Event::PeerDisconnected { peer }` |
 /// | [`NetEvent::Message`] | `Event::PeerMessage { from, msg }` |
+/// | [`NetEvent::Transfer`] | none: the agent handles it |
 ///
-/// For each peer the events form clean runs: `PeerUp`, its messages, then
-/// either `PeerDown` or another `PeerUp`. A second `PeerUp` without a
-/// `PeerDown` between means the connection was replaced (a duplicate was
-/// resolved); the core treats it as "the old connection is gone". Nothing
-/// from a replaced or closed connection follows its replacement or its
-/// `PeerDown`.
+/// For each peer the events form clean runs: `PeerUp`, its messages and
+/// transfer events, then either `PeerDown` or another `PeerUp`. A second
+/// `PeerUp` without a `PeerDown` between means the connection was replaced
+/// (a duplicate was resolved); the core treats it as "the old connection is
+/// gone". Nothing from a replaced or closed connection follows its
+/// replacement or its `PeerDown`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NetEvent {
     /// A paired peer finished its `Hello` exchange on a connection that is
@@ -52,6 +53,9 @@ pub enum NetEvent {
         /// The message.
         msg: CoreMessage,
     },
+    /// What happened to a file transfer with a peer's current connection.
+    /// This one is for the agent, not the core: the core never sees files.
+    Transfer(TransferEvent),
 }
 
 /// A peer that just connected.
@@ -77,6 +81,22 @@ pub struct PeerUp {
     /// Whether this device dialled the connection (rather than accepting
     /// it).
     pub dialled_by_us: bool,
+}
+
+impl PeerUp {
+    /// Whether both computers negotiated `clipboard.text` on this
+    /// connection, so clipboard text travels between them.
+    pub fn supports_clipboard(&self) -> bool {
+        self.negotiated
+            .capability_version(caps::CLIPBOARD_TEXT)
+            .is_some()
+    }
+
+    /// Whether both computers negotiated `files` on this connection, so
+    /// files can be sent between them and the drop zone shown.
+    pub fn supports_files(&self) -> bool {
+        self.negotiated.capability_version(caps::FILES).is_some()
+    }
 }
 
 /// Why a peer's connection went down.
@@ -246,6 +266,8 @@ impl QueueState {
             NetEvent::PeerUp(_) | NetEvent::PeerDown { .. } => {
                 self.states = self.states.saturating_sub(1);
             }
+            // Not queued yet: work package T4 queues them, and bounds them.
+            NetEvent::Transfer(_) => {}
         }
         Some(event)
     }
@@ -353,7 +375,7 @@ impl EventQueue {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use hop_proto::PROTO_MAJOR;
+    use hop_proto::{Capability, PROTO_MAJOR};
 
     use super::*;
 
@@ -400,6 +422,7 @@ mod tests {
                 NetEvent::PeerUp(_) => "up".to_owned(),
                 NetEvent::PeerDown { .. } => "down".to_owned(),
                 NetEvent::Message { msg, .. } => format!("{:?}", msg.seq()),
+                NetEvent::Transfer(_) => "transfer".to_owned(),
             })
             .collect();
         assert_eq!(kinds, ["up", "Some(1)", "up", "Some(3)", "down"]);
@@ -456,6 +479,22 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         queue.close();
         assert_eq!(events.recv_timeout(Duration::from_secs(10)), None);
+    }
+
+    #[test]
+    fn a_peer_supports_what_both_computers_negotiated() {
+        let mut peer = up("p");
+        assert!(!peer.supports_clipboard());
+        assert!(!peer.supports_files());
+        peer.negotiated.capabilities = vec![Capability::new(caps::CLIPBOARD_TEXT, 1)];
+        assert!(peer.supports_clipboard());
+        assert!(!peer.supports_files());
+        peer.negotiated.capabilities = vec![
+            Capability::new(caps::FILES, 1),
+            Capability::new(caps::INPUT, 1),
+        ];
+        assert!(!peer.supports_clipboard());
+        assert!(peer.supports_files());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The Mac's displays, in Quartz global coordinates.
 
 use hop_platform::{Displays, PlatformError, Result};
-use hop_types::{DisplayInfo, Point, Rect};
+use hop_types::{DisplayInfo, Rect};
 use objc2_core_graphics::{
     CGDirectDisplayID, CGDisplayBounds, CGDisplayCopyDisplayMode, CGDisplayMirrorsDisplay,
     CGDisplayMode, CGError, CGGetActiveDisplayList, CGMainDisplayID, kCGNullDirectDisplay,
@@ -62,12 +62,6 @@ pub(crate) fn main_display_frame() -> Rect {
     bounds(CGMainDisplayID())
 }
 
-/// The middle of the main display, which is away from the menu bar, the
-/// Dock and every hot corner.
-pub(crate) fn main_display_center() -> Point {
-    main_display_frame().center()
-}
-
 /// Physical pixels per point for display `id` (2.0 on Retina).
 fn scale(id: CGDirectDisplayID, point_width: f64) -> f64 {
     let Some(mode) = CGDisplayCopyDisplayMode(id) else {
@@ -99,6 +93,8 @@ pub(crate) fn check(error: CGError, call: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use hop_types::Point;
+
     use super::*;
 
     #[test]
@@ -136,6 +132,5 @@ mod tests {
         assert!(main.frame.size.width > 0.0 && main.frame.size.height > 0.0);
         assert!(main.scale >= 1.0, "{main:?}");
         assert_eq!(main_display_frame(), main.frame);
-        assert!(main.frame.contains(main_display_center()));
     }
 }

@@ -458,6 +458,9 @@ impl<L: Link> Agent<L> {
                 self.feed(Event::PeerDisconnected { peer });
             }
             NetEvent::Message { from, msg } => self.feed(Event::PeerMessage { from, msg }),
+            // Files sent or received: the agent's own, from work package T5
+            // on. The core never sees files.
+            NetEvent::Transfer(_) => {}
         }
     }
 

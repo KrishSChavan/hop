@@ -2,7 +2,7 @@
 
 One keyboard and mouse across a Mac and a Windows PC. Push the cursor past the screen edge and it continues on the other computer, and the keyboard follows. Copy text on one machine and paste it on the other with that machine's own shortcut. Drag files across to a Received folder.
 
-**Status:** Hop has an app on each computer. It pairs the two computers, knows which side each one sits on, and shares one keyboard and mouse both ways, with Cmd and Ctrl swapped. The text clipboard (M4) and files (M5) come later. See [docs/ROADMAP.md](docs/ROADMAP.md).
+**Status:** Hop has an app on each computer. It pairs the two computers, knows which side each one sits on, and shares one keyboard and mouse both ways. Keys stay as labelled, so with the Mac's keyboard on the PC, Ctrl+V pastes. The text clipboard (M4) and files (M5) come later. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Install
 
@@ -32,7 +32,7 @@ Rust 1.99.1 is pinned in `rust-toolchain.toml`. Rustup installs it automatically
 crates/
   hop-types     shared vocabulary: ids, geometry, input events, session messages
   hop-proto     wire format: framing, encoding, Hello and capability negotiation
-  hop-keymap    key tables, the Cmd/Ctrl swap, pressed-key tracking
+  hop-keymap    key tables, the optional Cmd/Ctrl swap, pressed-key tracking
   hop-core      hand-off state machine, screen layout and edge mapping (no OS access)
   hop-config    TOML configuration
   hop-net       the encrypted link: identity, pairing, discovery

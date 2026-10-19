@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hop_config::{
-    Config, ConfigError, PeerConfig, Side, ValidationError, Warning, device_id_from_fingerprint,
+    CmdCtrl, Config, ConfigError, PeerConfig, Side, ValidationError, Warning,
+    device_id_from_fingerprint,
 };
 use hop_types::{DeviceId, Os};
 
@@ -87,9 +88,10 @@ fn every_setting_round_trips() {
     config.input.pointer_speed = 0.1;
     config.input.takeback_threshold = 0.0;
     config.input.emergency_chord = vec!["MetaLeft".to_owned(), "KeyH".to_owned()];
-    config.keymap.swap_cmd_ctrl = false;
+    config.keymap.cmd_ctrl = CmdCtrl::Swap;
     config.clipboard.enabled = false;
     config.clipboard.max_text_bytes = 4096;
+    config.transfer.enabled = false;
     config.transfer.received_dir = Some(dir.join("Hop Received"));
     config.network.port = 50000;
 
@@ -143,6 +145,65 @@ fn the_first_m2_start_replaces_the_random_id_with_the_one_from_the_key() {
     assert_eq!(config.peers.len(), 1, "the peers are kept");
     // The next start finds the id already right and has nothing to save.
     assert!(!config.set_device_id(id));
+}
+
+/// A file saved before the Shortcuts setting existed. Every such file says
+/// `swap_cmd_ctrl = true`: the app never offered the choice.
+const SWAP_FILE: &str = "\
+[device]
+name = \"Krish's MacBook\"
+id = \"5f0c9a1e7b3d4c2a8e6f1b9d0a7c3e52\"
+
+[keymap]
+swap_cmd_ctrl = true
+
+[network]
+port = 50000
+";
+
+#[test]
+fn the_retired_swap_setting_is_ignored_and_left_out_of_the_next_save() {
+    let path = scratch("retired-swap").join("config.toml");
+    fs::write(&path, SWAP_FILE).unwrap();
+    let (config, warnings) = Config::load(&path).unwrap();
+    assert_eq!(warnings, [], "no warning about a key Hop wrote itself");
+    assert_eq!(
+        config.keymap.cmd_ctrl,
+        CmdCtrl::Keep,
+        "the old value is ignored"
+    );
+    assert_eq!(config.network.port, 50000, "the rest still loads");
+
+    config.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[keymap]\ncmd_ctrl = \"keep\"\n"), "{text}");
+    assert!(!text.contains("swap_cmd_ctrl"), "{text}");
+    assert_eq!(Config::load(&path).unwrap(), (config, vec![]));
+}
+
+#[test]
+fn the_shortcuts_setting_round_trips() {
+    let path = scratch("cmd-ctrl").join("config.toml");
+    fs::write(&path, "[keymap]\ncmd_ctrl = \"swap\"\n").unwrap();
+    let (config, warnings) = Config::load(&path).unwrap();
+    assert_eq!(warnings, []);
+    assert_eq!(config.keymap.cmd_ctrl, CmdCtrl::Swap);
+
+    config.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[keymap]\ncmd_ctrl = \"swap\"\n"), "{text}");
+    assert_eq!(Config::load(&path).unwrap(), (config, vec![]));
+}
+
+#[test]
+fn receiving_files_can_be_turned_off() {
+    let path = scratch("transfer-off").join("config.toml");
+    let mut config = Config::default();
+    config.transfer.enabled = false;
+    config.save(&path).unwrap();
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[transfer]\nenabled = false\n"), "{text}");
+    assert_eq!(Config::load(&path).unwrap(), (config, vec![]));
 }
 
 #[test]

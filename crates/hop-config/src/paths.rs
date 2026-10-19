@@ -209,6 +209,7 @@ mod tests {
         let chosen = full("Volumes/Shared/Inbox");
         let transfer = TransferConfig {
             received_dir: Some(chosen.clone()),
+            ..TransferConfig::default()
         };
         for os in [Os::MacOs, Os::Windows, Os::Linux] {
             assert_eq!(received_dir(&transfer, os, env(&[])), Some(chosen.clone()));

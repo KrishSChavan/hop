@@ -2,6 +2,8 @@
 //! `hop-net`, behind a small trait so the core loop can be tested with a
 //! fake network.
 
+use std::path::PathBuf;
+
 use hop_net::{NetEvent, NetEvents, NetHandle, SendError};
 use hop_types::{CoreMessage, DeviceId, DisplayInfo};
 
@@ -12,6 +14,18 @@ pub(crate) trait Link {
     /// cannot be queued the connection closes and `PeerDown` follows, so
     /// errors only need logging.
     fn send(&self, to: &DeviceId, msg: CoreMessage) -> Result<(), SendError>;
+    /// Sends the files at `paths` to `to` and returns the transfer's id at
+    /// once; the outcome arrives later as `NetEvent::Transfer`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the agent sends dropped files from work package T5 on"
+        )
+    )]
+    fn send_files(&self, to: &DeviceId, paths: Vec<PathBuf>) -> Result<u64, SendError>;
+    /// Wakes `to`'s Wi-Fi radio with a tiny datagram, best effort.
+    fn nudge(&self, to: &DeviceId);
     /// The next network event, if one is waiting.
     fn try_recv(&self) -> Option<NetEvent>;
     /// The displays to announce on connections made from now on.
@@ -36,6 +50,14 @@ impl NetLink {
 impl Link for NetLink {
     fn send(&self, to: &DeviceId, msg: CoreMessage) -> Result<(), SendError> {
         self.handle.send(to, msg)
+    }
+
+    fn send_files(&self, to: &DeviceId, paths: Vec<PathBuf>) -> Result<u64, SendError> {
+        self.handle.send_files(to, paths)
+    }
+
+    fn nudge(&self, to: &DeviceId) {
+        self.handle.nudge(to);
     }
 
     fn try_recv(&self) -> Option<NetEvent> {

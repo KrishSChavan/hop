@@ -16,7 +16,7 @@ use hop_types::{
 
 use crate::layout::{self, Exit, Layout, LayoutError, Travel};
 use crate::motion::{MarkReceiver, MarkSender};
-use crate::{CoreConfig, Crossing, Millis};
+use crate::{CoreConfig, Crossing, Millis, SharedEdge};
 
 /// Whether the platform layer lets this device's physical input reach the OS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,6 +121,15 @@ pub enum Action {
         /// The message.
         msg: CoreMessage,
     },
+    /// Send `to` a tiny unreliable packet so its Wi-Fi radio is awake when
+    /// the cursor crosses. Emitted while idle, at most every
+    /// `nudge_interval_ms`, when this device's own pointer moves toward an
+    /// edge that leads to the connected peer `to` and is within
+    /// `nudge_distance` of it. Best effort: a lost nudge changes nothing.
+    Nudge {
+        /// The device the cursor is heading for.
+        to: DeviceId,
+    },
     /// Start or stop swallowing physical input.
     SetCaptureMode(CaptureMode),
     /// Freeze and hide the local cursor while another device is driven.
@@ -130,6 +139,20 @@ pub enum Action {
         /// Where the cursor reappears.
         at: Point,
     },
+    /// Hide the local cursor where it is. Emitted only when a session in
+    /// which this device was controlled ends because the cursor left
+    /// through an edge ([`EndReason::CursorLeft`]), after
+    /// [`Action::ReleaseAllInjected`], so the cursor the controller drove
+    /// here does not stay visible at that edge. Nothing is frozen, moved or
+    /// suppressed, and the platform shows the cursor again by itself when
+    /// this device's own mouse is used.
+    ConcealCursor,
+    /// Show a cursor hidden by [`Action::ConcealCursor`] again. Emitted,
+    /// while it is hidden, before anything else in the same list: on
+    /// physical pointer input here (motion, a button, scrolling; keys do
+    /// not count), when a peer enters this device again, and on
+    /// [`Event::LocalStall`].
+    RevealCursor,
     /// Move the local cursor to `to` while controlled; drag if injected
     /// buttons are held.
     MoveCursorTo {
@@ -537,6 +560,25 @@ impl Core {
     /// The layout in use, including the displays connected peers reported.
     pub fn layout(&self) -> &Layout {
         &self.layout
+    }
+
+    /// The parts of this device's display edges from which the cursor
+    /// crosses to `peer`, in this device's own coordinates, for drop zones:
+    /// [`Layout::edges_toward`] with this core's adjacency tolerance and
+    /// corner dead zone, in the layout as it stands. Empty while `peer` is
+    /// not connected, since the cursor never crosses to it then: ask after
+    /// the core has handled the peer's [`Event::PeerConnected`], and again
+    /// after each [`Event::LayoutChanged`].
+    pub fn edges_toward(&self, peer: &DeviceId) -> Vec<SharedEdge> {
+        if !self.peers.contains_key(peer) {
+            return Vec::new();
+        }
+        self.layout.edges_toward(
+            &self.me,
+            peer,
+            self.config.adjacency_tolerance,
+            self.config.corner_dead_zone,
+        )
     }
 
     // ----- timers -------------------------------------------------------
@@ -1898,6 +1940,114 @@ mod tests {
             ]
         );
         assert_eq!(core.state(), State::Idle);
+    }
+
+    #[test]
+    fn edges_lead_to_a_peer_only_while_it_is_connected() {
+        let (mac, pc) = (DeviceId::new("mac"), DeviceId::new("pc"));
+        let display = |w: f64, h: f64| DisplayInfo {
+            id: 1,
+            frame: Rect::new(0.0, 0.0, w, h),
+            scale: 1.0,
+            primary: true,
+        };
+        let laptop = display(1512.0, 982.0);
+        let layout = Layout::two_devices(
+            mac.clone(),
+            vec![laptop.clone()],
+            pc.clone(),
+            Edge::Right,
+            vec![],
+        )
+        .unwrap();
+        let config = CoreConfig {
+            corner_dead_zone: 100.0,
+            ..CoreConfig::default()
+        };
+        let mut core = Core::new(mac, Os::MacOs, config, layout);
+        assert_eq!(core.edges_toward(&pc), []);
+        core.handle(
+            0,
+            Event::PeerConnected {
+                peer: pc.clone(),
+                os: Os::Windows,
+                displays: vec![display(1536.0, 864.0)],
+            },
+        );
+        // The whole of the Mac's right edge leads to the PC, also above and
+        // below the shorter PC (beside y 59 to 923); the core's own corner
+        // dead zone trims it.
+        assert_eq!(
+            core.edges_toward(&pc),
+            [SharedEdge {
+                display: 1,
+                frame: laptop.frame,
+                edge: Edge::Right,
+                start: 100.0,
+                end: 882.0,
+            }]
+        );
+        core.handle(10, Event::PeerDisconnected { peer: pc.clone() });
+        assert_eq!(core.edges_toward(&pc), []);
+    }
+
+    /// On the user's own laptops (the PC on the Mac's right), the cursor
+    /// pushed against the Mac's right edge crosses to the PC exactly where
+    /// that edge leads to the PC: drop zones cover all of it and no more.
+    #[test]
+    fn the_cursor_crosses_exactly_where_the_edges_lead() {
+        let (mac, pc) = (DeviceId::new("mac"), DeviceId::new("pc"));
+        let display = |w: f64, h: f64| DisplayInfo {
+            id: 1,
+            frame: Rect::new(0.0, 0.0, w, h),
+            scale: 1.0,
+            primary: true,
+        };
+        let connected = || {
+            let layout = Layout::two_devices(
+                mac.clone(),
+                vec![display(1512.0, 982.0)],
+                pc.clone(),
+                Edge::Right,
+                vec![],
+            )
+            .unwrap();
+            let mut core = Core::new(mac.clone(), Os::MacOs, CoreConfig::default(), layout);
+            core.handle(
+                0,
+                Event::PeerConnected {
+                    peer: pc.clone(),
+                    os: Os::Windows,
+                    displays: vec![display(1536.0, 864.0)],
+                },
+            );
+            core
+        };
+        let edges = connected().edges_toward(&pc);
+        assert_eq!(
+            edges,
+            [SharedEdge {
+                display: 1,
+                frame: Rect::new(0.0, 0.0, 1512.0, 982.0),
+                edge: Edge::Right,
+                start: 10.0,
+                end: 972.0,
+            }]
+        );
+        for y in (0..982).map(|y| f64::from(y) + 0.5) {
+            let mut core = connected();
+            core.handle(
+                10,
+                Event::LocalInput {
+                    event: motion(20.0, 0.0),
+                    cursor: Point::new(1505.0, y),
+                    physical: true,
+                },
+            );
+            let crossed = matches!(core.state(), State::Entering { .. });
+            let leads = edges.iter().any(|e| e.start <= y && y <= e.end);
+            assert_eq!(crossed, leads, "at y = {y}");
+        }
     }
 
     #[test]

@@ -1,12 +1,23 @@
 //! Parking, hiding and restoring the cursor.
 //!
-//! Parking moves the cursor to the middle of the main display, disconnects
-//! it from the mouse so it cannot drift toward an edge (the mouse's motion
-//! still reaches the event tap as deltas), and hides it. Restoring undoes
-//! all three. Every step is recorded in [`CursorState`], so each hide is
-//! balanced by exactly one show however parking ends: a restore, a lapsed
-//! suppression lease, capture stopping, or the cursor control being
-//! dropped.
+//! Parking leaves the cursor where it is (at the edge it just crossed),
+//! disconnects it from the mouse so it cannot move (the mouse's motion still
+//! reaches the event tap as deltas), and hides it. It does not warp: macOS
+//! adds a warp's distance to the delta of the next mouse event, and when
+//! parking warped the cursor from the edge to the middle of the screen,
+//! that jump went to the other computer as one big move back across the
+//! edge (the "bounce" of the first two-laptop test). The cursor rests where
+//! macOS stopped it at the edge, which is where the user's own motion took
+//! it anyway; an auto-hidden Dock or menu bar on that edge therefore stays
+//! shown while the other computer is used.
+//!
+//! Restoring reconnects the mouse, warps the cursor to where it comes back
+//! and shows it. That warp's distance still reaches the next event, so it
+//! is recorded first and capture takes it back out (see `convert`).
+//!
+//! Every step is recorded in [`CursorState`], so each hide is balanced by
+//! exactly one show however parking ends: a restore, a lapsed suppression
+//! lease, capture stopping, or the cursor control being dropped.
 
 use std::sync::Arc;
 
@@ -18,7 +29,7 @@ use objc2_core_graphics::{
     CGEvent, CGMainDisplayID, CGWarpMouseCursorPosition,
 };
 
-use crate::displays::{check, main_display_center};
+use crate::displays::check;
 use crate::ffi;
 use crate::shared::{CursorState, Shared};
 
@@ -66,21 +77,17 @@ pub(crate) fn current_position() -> Result<Point> {
     Ok(Point::new(location.x, location.y))
 }
 
-/// Parks and hides the cursor. Parking twice is the same as parking once:
-/// the position remembered is the one from before the first park.
+/// Parks and hides the cursor where it is. Parking twice is the same as
+/// parking once: the position remembered is the one from before the first
+/// park.
 fn park(shared: &Shared) -> Result<()> {
     let mut state = shared.cursor();
     if state.parked_from.is_some() {
         return Ok(());
     }
     let from = current_position()?;
-    warp(shared, main_display_center())?;
-    if let Err(error) = attach(false) {
-        // Without the disconnect the cursor would drift; give it back to
-        // the user where it was rather than half-parked.
-        let _ = warp(shared, from);
-        return Err(error);
-    }
+    // Without the disconnect the cursor would drift; then nothing is parked.
+    attach(false)?;
     state.detached = true;
     state.parked_from = Some(from);
     // Hiding is best effort: a visible but pinned cursor still works.
@@ -171,15 +178,23 @@ fn hide() -> bool {
     CGDisplayHideCursor(CGMainDisplayID()) == CGError::Success
 }
 
-/// Moves the cursor without generating an event, and tells capture.
+/// Moves the cursor without generating an event, and tells capture. It is
+/// noted first: the next mouse event can carry the warp's distance as soon
+/// as the warp happens, before this thread could note it afterwards.
 fn warp(shared: &Shared, to: Point) -> Result<()> {
     ffi::allow_input_right_after_warps();
-    check(
+    // Unknown, the warp counts as no move: capture then compensates nothing.
+    let from = current_position().unwrap_or(to);
+    shared.note_warp(from, to);
+    let warped = check(
         CGWarpMouseCursorPosition(CGPoint::new(to.x, to.y)),
         "CGWarpMouseCursorPosition",
-    )?;
-    shared.note_warp(to);
-    Ok(())
+    );
+    if warped.is_err() {
+        // It moved nothing: the reverse move cancels the note.
+        shared.note_warp(to, from);
+    }
+    warped
 }
 
 /// Connects or disconnects mouse motion and the cursor position.

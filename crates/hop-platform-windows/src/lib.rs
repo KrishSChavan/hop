@@ -44,7 +44,7 @@ mod simple;
 mod test_window;
 mod worker;
 
-use hop_platform::{Platform, TestWindow};
+use hop_platform::{NoDrops, Platform, TestWindow};
 
 /// The Windows backend, ready to use.
 ///
@@ -63,6 +63,7 @@ pub fn native() -> hop_platform::Result<Platform> {
         cursor: Box::new(cursor::WinCursor::default()),
         displays: Box::new(simple::WinDisplays),
         clipboard: Box::new(simple::NoClipboard),
+        drops: Box::new(NoDrops),
         permissions: Box::new(simple::WinPermissions),
         system: Box::new(simple::WinSystemState),
     })

@@ -24,6 +24,8 @@ pub mod caps {
     pub const KEYMAP: &str = "keymap";
     /// Syncing plain-text clipboard contents.
     pub const CLIPBOARD_TEXT: &str = "clipboard.text";
+    /// Sending files to the other computer's Received folder.
+    pub const FILES: &str = "files";
 }
 
 /// A named feature and the highest version of it a device supports.

@@ -61,6 +61,13 @@ pub(crate) struct Executor<L: Link> {
     /// Where the cursor was when it was parked, while it is parked: a
     /// fail-open restore puts it back there.
     parked_from: Option<Point>,
+    /// Whether the cursor is hidden where a session left it
+    /// (`Action::ConcealCursor`) and not shown again yet.
+    concealed: bool,
+    /// When the last `Enter` went out, until its session starts: the log
+    /// says how long the other computer took to answer, which shows whether
+    /// its Wi-Fi was asleep (docs/M4-M5-DESIGN.md, section 1).
+    entered_at: Option<Instant>,
     /// The cursor position capture last reported, in case the platform
     /// cannot say where the cursor is when it is parked.
     pub(crate) last_cursor: Point,
@@ -82,6 +89,8 @@ impl<L: Link> Executor<L> {
             translators: Vec::new(),
             buttons: ButtonTracker::new(),
             parked_from: None,
+            concealed: false,
+            entered_at: None,
             last_cursor: Point::default(),
             names: HashMap::new(),
             role: Role::None,
@@ -121,6 +130,7 @@ impl<L: Link> Executor<L> {
         for action in actions {
             match action {
                 Action::Send { to, msg } => self.send(&to, msg),
+                Action::Nudge { to } => self.link.nudge(&to),
                 Action::SetCaptureMode(mode) => {
                     if !self.set_capture_mode(mode) && mode == CaptureMode::Suppress {
                         outcome.stalled = true;
@@ -132,6 +142,10 @@ impl<L: Link> Executor<L> {
                     }
                 }
                 Action::RestoreCursor { at } => self.restore(at),
+                // Hiding the cursor is cosmetic: a failure is only logged,
+                // never a stall.
+                Action::ConcealCursor => self.conceal(),
+                Action::RevealCursor => self.reveal(),
                 Action::MoveCursorTo { to } => {
                     if let Err(error) = self.platform.injector.move_cursor_to(to) {
                         self.warn("move", "could not move the cursor", &error);
@@ -153,7 +167,8 @@ impl<L: Link> Executor<L> {
 
     /// Gives input back, whatever the core believes: capture passive,
     /// every injected key and button released, a parked cursor shown again
-    /// where it was. Safe to call any number of times.
+    /// where it was, a hidden cursor shown again where it is. Safe to call
+    /// any number of times.
     pub(crate) fn fail_open(&mut self) {
         if let Err(error) = self.platform.capture.set_mode(PlatformMode::Passive) {
             self.warn(
@@ -168,9 +183,13 @@ impl<L: Link> Executor<L> {
         {
             self.warn("restore", "could not show the cursor again", &error);
         }
+        self.reveal();
     }
 
     fn send(&mut self, to: &DeviceId, msg: CoreMessage) {
+        if matches!(msg, CoreMessage::Enter { .. }) {
+            self.entered_at = Some(Instant::now());
+        }
         // Only the error is logged, never the message: it may carry keys.
         if let Err(error) = self.link.send(to, msg)
             && let Some(suppressed) = self.limiter.allow("send")
@@ -204,6 +223,8 @@ impl<L: Link> Executor<L> {
         // Recorded before parking: a park that fails halfway still gets a
         // restore when Hop fails open.
         self.parked_from = Some(from);
+        // Parking ends a conceal (the platform contract).
+        self.concealed = false;
         match self.platform.cursor.park() {
             Ok(()) => true,
             Err(error) => {
@@ -215,8 +236,30 @@ impl<L: Link> Executor<L> {
 
     fn restore(&mut self, at: Point) {
         self.parked_from = None;
+        // Restoring ends a conceal too.
+        self.concealed = false;
         if let Err(error) = self.platform.cursor.restore(at) {
             self.warn("restore", "could not show the cursor again", &error);
+        }
+    }
+
+    /// Hides the cursor a session left at this computer's edge. A backend
+    /// that cannot leaves it visible, which is only logged.
+    fn conceal(&mut self) {
+        match self.platform.cursor.conceal() {
+            Ok(()) => self.concealed = true,
+            Err(error) => self.warn("conceal", "could not hide the cursor", &error),
+        }
+    }
+
+    /// Shows a cursor hidden by [`Executor::conceal`] again, if it is
+    /// hidden. The platform also shows it by itself when this computer's
+    /// mouse is used, so a failure is only logged.
+    fn reveal(&mut self) {
+        if std::mem::take(&mut self.concealed)
+            && let Err(error) = self.platform.cursor.reveal()
+        {
+            self.warn("reveal", "could not show the cursor again", &error);
         }
     }
 
@@ -305,7 +348,11 @@ impl<L: Link> Executor<L> {
         match notice {
             Notice::ControlStarted { peer } => {
                 self.role = Role::Controlling;
-                tracing::info!(peer = %peer, "session started: controlling");
+                let answered_in_ms = self
+                    .entered_at
+                    .take()
+                    .map_or(0, |sent| sent.elapsed().as_millis());
+                tracing::info!(peer = %peer, answered_in_ms, "session started: controlling");
                 status!("Controlling {}.", self.name_of(&peer));
             }
             Notice::ControlledBy { peer } => {

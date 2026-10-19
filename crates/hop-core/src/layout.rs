@@ -109,6 +109,24 @@ pub struct Crossing {
     pub entry: EntryPoint,
 }
 
+/// A part of one display's edge from which the cursor crosses to another
+/// device, in the display's own device's coordinates
+/// ([`Layout::edges_toward`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedEdge {
+    /// The display's id.
+    pub display: u32,
+    /// The display's frame.
+    pub frame: Rect,
+    /// The edge of `frame` the part lies on.
+    pub edge: Edge,
+    /// Where the part starts along the edge: y for a left or right edge, x
+    /// for a top or bottom edge.
+    pub start: f64,
+    /// Where it ends along the edge, after `start`.
+    pub end: f64,
+}
+
 /// A device placed by [`Layout::two_devices`]: flush against `side` of the
 /// device `of`, and re-placed whenever either one's displays change.
 #[derive(Clone, Debug, PartialEq)]
@@ -227,37 +245,7 @@ impl Layout {
         }
         let source = self.devices.get(from)?;
         let display = source.displays.iter().find(|d| d.id == display_id)?;
-        let exit = source.global(&display.frame);
-        let line = exit.edge_line(edge);
-        let (start, end) = exit.edge_span(edge);
-
-        // (overlap, gap, device, display); strict comparisons keep the first
-        // of equal candidates, and devices iterate in id order.
-        let mut best: Option<(f64, f64, &DeviceLayout, &DisplayInfo)> = None;
-        for device in self.devices.values().filter(|d| d.id != *from) {
-            for candidate in &device.displays {
-                let frame = device.global(&candidate.frame);
-                let gap = (frame.edge_line(edge.opposite()) - line).abs();
-                let (c_start, c_end) = frame.edge_span(edge);
-                let overlap = end.min(c_end) - start.max(c_start);
-                // Both comparisons are false for NaN, so broken geometry can
-                // never become a candidate.
-                let faces = gap <= tolerance && overlap > 0.0;
-                if !faces {
-                    continue;
-                }
-                let better = match best {
-                    None => true,
-                    Some((best_overlap, best_gap, _, _)) => {
-                        overlap > best_overlap || (overlap == best_overlap && gap < best_gap)
-                    }
-                };
-                if better {
-                    best = Some((overlap, gap, device, candidate));
-                }
-            }
-        }
-        let (_, _, device, target) = best?;
+        let (device, target) = self.facing(source, display, edge, tolerance)?;
 
         let (d_start, d_end) = display.frame.edge_span(edge);
         let along = if edge.is_vertical() { at.y } else { at.x };
@@ -282,6 +270,120 @@ impl Layout {
                 position: frame.clamp(inside, 1.0),
             },
         })
+    }
+
+    /// The display of another device that faces `edge` of `display` (one of
+    /// `source`'s), with its device: where the cursor goes when it leaves
+    /// through that edge, by the rule of [`Layout::exit_target`]. The choice
+    /// is the same wherever along the edge the cursor leaves; only the entry
+    /// point depends on that. `None` when nothing faces the edge.
+    fn facing(
+        &self,
+        source: &DeviceLayout,
+        display: &DisplayInfo,
+        edge: Edge,
+        tolerance: f64,
+    ) -> Option<(&DeviceLayout, &DisplayInfo)> {
+        let exit = source.global(&display.frame);
+        let line = exit.edge_line(edge);
+        let (start, end) = exit.edge_span(edge);
+
+        // (overlap, gap, device, display); strict comparisons keep the first
+        // of equal candidates, and devices iterate in id order.
+        let mut best: Option<(f64, f64, &DeviceLayout, &DisplayInfo)> = None;
+        for device in self.devices.values().filter(|d| d.id != source.id) {
+            for candidate in &device.displays {
+                let frame = device.global(&candidate.frame);
+                let gap = (frame.edge_line(edge.opposite()) - line).abs();
+                let (c_start, c_end) = frame.edge_span(edge);
+                let overlap = end.min(c_end) - start.max(c_start);
+                // Both comparisons are false for NaN, so broken geometry can
+                // never become a candidate.
+                let faces = gap <= tolerance && overlap > 0.0;
+                if !faces {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some((best_overlap, best_gap, _, _)) => {
+                        overlap > best_overlap || (overlap == best_overlap && gap < best_gap)
+                    }
+                };
+                if better {
+                    best = Some((overlap, gap, device, candidate));
+                }
+            }
+        }
+        best.map(|(_, _, device, target)| (device, target))
+    }
+
+    /// The parts of `me`'s display edges from which the cursor crosses to
+    /// `peer`, in `me`'s own coordinates: where files dragged to the edge
+    /// can be dropped to send them to `peer` (docs/M4-M5-DESIGN.md, "The
+    /// drop zone").
+    ///
+    /// An edge leads to `peer` when [`Layout::exit_target`] sends the cursor
+    /// that leaves through it to a display of `peer`. Where along the edge
+    /// the cursor leaves changes only where it enters, so the whole edge
+    /// counts, also beside no display of `peer` (where `peer` is shorter,
+    /// say), except:
+    /// - where another display of `me` continues past the edge, since the
+    ///   cursor moves onto that display there instead of crossing;
+    /// - within `dead_zone` of either end of the edge, where the core never
+    ///   crosses (the corner dead zone).
+    ///
+    /// Empty parts are left out. The parts come in the order `me` lists its
+    /// displays, then by edge (left, right, top, bottom), then along the
+    /// edge. An edge that leads to a third device leads nowhere else. Empty
+    /// for a device that is not in the layout, for `peer` equal to `me`, and
+    /// for a peer without displays.
+    pub fn edges_toward(
+        &self,
+        me: &DeviceId,
+        peer: &DeviceId,
+        tolerance: f64,
+        dead_zone: f64,
+    ) -> Vec<SharedEdge> {
+        let Some(mine) = self.devices.get(me) else {
+            return Vec::new();
+        };
+        let mut shared = Vec::new();
+        for display in &mine.displays {
+            let frame = display.frame;
+            for edge in Edge::ALL {
+                // Never true for `peer` equal to `me`: the cursor only ever
+                // crosses to another device.
+                let leads = self
+                    .facing(mine, display, edge, tolerance)
+                    .is_some_and(|(device, _)| device.id == *peer);
+                if !leads {
+                    continue;
+                }
+                let line = frame.edge_line(edge);
+                let (start, end) = frame.edge_span(edge);
+                let mut parts = vec![(start, end)];
+                for other in mine.displays.iter().filter(|d| d.id != display.id) {
+                    if (other.frame.edge_line(edge.opposite()) - line).abs() <= LOCAL_TOUCH {
+                        parts = cut_span(parts, other.frame.edge_span(edge));
+                    }
+                }
+                let corners = (start + dead_zone, end - dead_zone);
+                shared.extend(
+                    parts
+                        .into_iter()
+                        .map(|(from, to)| (from.max(corners.0), to.min(corners.1)))
+                        .filter(|&(from, to)| to - from > 0.0)
+                        .map(|(from, to)| SharedEdge {
+                            display: display.id,
+                            frame,
+                            edge,
+                            start: from,
+                            end: to,
+                        }),
+                );
+            }
+        }
+        shared
     }
 
     fn place_anchored(&mut self) {
@@ -322,6 +424,15 @@ fn bounds(displays: &[DisplayInfo]) -> Option<Rect> {
     let mut frames = displays.iter().map(|d| d.frame);
     let first = frames.next()?;
     Some(frames.fold(first, |acc, f| acc.union(&f)))
+}
+
+/// Sorted, separate intervals with `cut` taken out of them; still sorted.
+fn cut_span(spans: Vec<(f64, f64)>, cut: (f64, f64)) -> Vec<(f64, f64)> {
+    spans
+        .into_iter()
+        .flat_map(|(start, end)| [(start, end.min(cut.0)), (start.max(cut.1), end)])
+        .filter(|&(start, end)| end - start > 0.0)
+        .collect()
 }
 
 fn is_usable_point(p: Point) -> bool {
@@ -555,6 +666,8 @@ fn nearest_display(displays: &[DisplayInfo], p: Point) -> Option<&DisplayInfo> {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn display(id: u32, x: f64, y: f64, w: f64, h: f64, scale: f64) -> DisplayInfo {
@@ -829,6 +942,365 @@ mod tests {
 
     fn laptop() -> DisplayInfo {
         mac_displays()[0].clone()
+    }
+
+    fn shared(display: &DisplayInfo, edge: Edge, start: f64, end: f64) -> SharedEdge {
+        SharedEdge {
+            display: display.id,
+            frame: display.frame,
+            edge,
+            start,
+            end,
+        }
+    }
+
+    #[test]
+    fn the_edge_that_leads_to_the_peer_on_each_side() {
+        // The whole edge on the PC's side leads to it, minus the corner dead
+        // zones: on the left or right also above and below the shorter PC,
+        // since the cursor crosses there too.
+        let expected = [
+            (Edge::Right, 10.0, 972.0),
+            (Edge::Left, 10.0, 972.0),
+            (Edge::Bottom, 10.0, 1502.0),
+            (Edge::Top, 10.0, 1502.0),
+        ];
+        for (side, start, end) in expected {
+            let layout =
+                Layout::two_devices(mac(), mac_displays(), pc(), side, pc_displays()).unwrap();
+            assert_eq!(
+                layout.edges_toward(&mac(), &pc(), 1.0, 10.0),
+                [shared(&laptop(), side, start, end)],
+                "{side:?}"
+            );
+        }
+        // The PC's own view: all of its left edge leads to the Mac.
+        assert_eq!(
+            pc_view().edges_toward(&pc(), &mac(), 1.0, 10.0),
+            [shared(&pc_displays()[0], Edge::Left, 10.0, 854.0)]
+        );
+    }
+
+    #[test]
+    fn the_whole_edge_leads_to_a_shorter_peer() {
+        let tall = display(1, 0.0, 0.0, 1000.0, 1000.0, 1.0);
+        let short = display(1, 0.0, 0.0, 1000.0, 400.0, 1.0);
+        let layout = Layout::two_devices(
+            mac(),
+            vec![tall.clone()],
+            pc(),
+            Edge::Right,
+            vec![short.clone()],
+        )
+        .unwrap();
+        // The peer is beside only y 300 to 700, but the cursor crosses from
+        // anywhere on the edge, corners mapping to corners.
+        assert_eq!(
+            layout.edges_toward(&mac(), &pc(), 1.0, 10.0),
+            [shared(&tall, Edge::Right, 10.0, 990.0)]
+        );
+        let near_the_top = Point::new(1000.0, 100.0);
+        let crossing = layout
+            .exit_target(&mac(), 1, Edge::Right, near_the_top, 1.0)
+            .unwrap();
+        assert_eq!(crossing.to, pc());
+        // From the peer, in its own coordinates, its whole edge leads to the
+        // taller display too.
+        assert_eq!(
+            layout.edges_toward(&pc(), &mac(), 1.0, 10.0),
+            [shared(&short, Edge::Left, 10.0, 390.0)]
+        );
+    }
+
+    #[test]
+    fn the_whole_edge_leads_to_a_peer_with_several_displays() {
+        let beside = |displays| {
+            Layout::new([
+                DeviceLayout::new(mac(), Point::new(0.0, 0.0), mac_displays()),
+                DeviceLayout::new(pc(), Point::new(1512.0, 0.0), displays),
+            ])
+            .unwrap()
+        };
+        let whole = [shared(&laptop(), Edge::Right, 10.0, 972.0)];
+        // Stacked, meeting at y = 491; the upper one sits 0.5 units out,
+        // within the tolerance.
+        let stacked = beside(vec![
+            display(1, 0.5, 0.0, 800.0, 491.0, 1.0),
+            display(2, 0.0, 491.0, 800.0, 491.0, 1.0),
+        ]);
+        assert_eq!(stacked.edges_toward(&mac(), &pc(), 1.0, 10.0), whole);
+        // Mirrored: two displays with the same frame.
+        let mirrored = vec![
+            pc_displays()[0].clone(),
+            DisplayInfo {
+                id: 8,
+                ..pc_displays()[0].clone()
+            },
+        ];
+        let layout =
+            Layout::two_devices(mac(), mac_displays(), pc(), Edge::Right, mirrored).unwrap();
+        assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 10.0), whole);
+        // Apart: the cursor crosses from the gap between them too, to the
+        // display beside more of the edge.
+        let apart = beside(vec![
+            display(1, 0.0, 600.0, 800.0, 382.0, 1.0),
+            display(2, 0.0, 0.0, 800.0, 300.0, 1.0),
+        ]);
+        assert_eq!(apart.edges_toward(&mac(), &pc(), 1.0, 10.0), whole);
+        let in_the_gap = Point::new(1512.0, 450.0);
+        let crossing = apart
+            .exit_target(&mac(), 1, Edge::Right, in_the_gap, 1.0)
+            .unwrap();
+        assert_eq!((crossing.to, crossing.entry.display_id), (pc(), 1));
+    }
+
+    #[test]
+    fn an_edge_that_leads_to_a_third_device_does_not_lead_to_the_peer() {
+        // The PC is beside the top of the Mac's right edge, but "zed" is
+        // beside more of it, so the cursor crosses to zed from all of it.
+        let zed = DeviceId::new("zed");
+        let layout = Layout::new([
+            DeviceLayout::new(mac(), Point::new(0.0, 0.0), mac_displays()),
+            DeviceLayout::new(
+                pc(),
+                Point::new(1512.0, 0.0),
+                vec![display(1, 0.0, 0.0, 800.0, 300.0, 1.0)],
+            ),
+            DeviceLayout::new(
+                zed.clone(),
+                Point::new(1512.0, 300.0),
+                vec![display(1, 0.0, 0.0, 800.0, 682.0, 1.0)],
+            ),
+        ])
+        .unwrap();
+        let beside_the_pc = Point::new(1512.0, 100.0);
+        let crossing = layout
+            .exit_target(&mac(), 1, Edge::Right, beside_the_pc, 1.0)
+            .unwrap();
+        assert_eq!(crossing.to, zed);
+        assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 10.0), []);
+        assert_eq!(
+            layout.edges_toward(&mac(), &zed, 1.0, 10.0),
+            [shared(&laptop(), Edge::Right, 10.0, 972.0)]
+        );
+    }
+
+    #[test]
+    fn where_another_display_of_mine_continues_past_the_edge_does_not_count() {
+        // A monitor continues past the upper half of the laptop's right
+        // edge: there the cursor moves onto the monitor instead of crossing.
+        // The PC is placed by hand to face the whole edge.
+        let monitor = display(2, 1512.0, 0.0, 800.0, 491.0, 1.0);
+        let layout = Layout::new([
+            DeviceLayout::new(mac(), Point::new(0.0, 0.0), vec![laptop(), monitor]),
+            DeviceLayout::new(
+                pc(),
+                Point::new(1512.0, 0.0),
+                vec![display(1, 0.0, 0.0, 1536.0, 982.0, 1.0)],
+            ),
+        ])
+        .unwrap();
+        // The dead zone trims the end of the laptop's edge, not the place
+        // where the monitor stops.
+        assert_eq!(
+            layout.edges_toward(&mac(), &pc(), 1.0, 10.0),
+            [shared(&laptop(), Edge::Right, 491.0, 972.0)]
+        );
+    }
+
+    #[test]
+    fn the_corner_dead_zone_trims_both_ends_of_the_edge() {
+        let same = display(1, 0.0, 0.0, 1000.0, 800.0, 1.0);
+        let layout = Layout::two_devices(
+            mac(),
+            vec![same.clone()],
+            pc(),
+            Edge::Right,
+            vec![same.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            layout.edges_toward(&mac(), &pc(), 1.0, 0.0),
+            [shared(&same, Edge::Right, 0.0, 800.0)]
+        );
+        assert_eq!(
+            layout.edges_toward(&mac(), &pc(), 1.0, 10.0),
+            [shared(&same, Edge::Right, 10.0, 790.0)]
+        );
+        // A dead zone that covers the whole edge leaves nothing.
+        assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 400.0), []);
+        assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 500.0), []);
+    }
+
+    #[test]
+    fn edges_respect_the_adjacency_tolerance() {
+        let layout = Layout::new([
+            DeviceLayout::new(mac(), Point::new(0.0, 0.0), mac_displays()),
+            DeviceLayout::new(pc(), Point::new(1514.0, 0.0), pc_displays()),
+        ])
+        .unwrap();
+        assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 10.0), []);
+        assert_eq!(
+            layout.edges_toward(&mac(), &pc(), 2.0, 10.0),
+            [shared(&laptop(), Edge::Right, 10.0, 972.0)]
+        );
+    }
+
+    #[test]
+    fn no_edges_lead_to_a_device_that_is_not_in_the_layout() {
+        let layout = mac_view();
+        let other = DeviceId::new("other");
+        assert_eq!(layout.edges_toward(&mac(), &other, 1.0, 10.0), []);
+        assert_eq!(layout.edges_toward(&other, &pc(), 1.0, 10.0), []);
+        assert_eq!(layout.edges_toward(&mac(), &mac(), 1.0, 10.0), []);
+    }
+
+    #[test]
+    fn no_edges_lead_to_a_peer_without_displays() {
+        let layout = Layout::two_devices(mac(), mac_displays(), pc(), Edge::Right, vec![]).unwrap();
+        assert_eq!(layout.edges_toward(&mac(), &pc(), 1.0, 10.0), []);
+        assert_eq!(layout.edges_toward(&pc(), &mac(), 1.0, 10.0), []);
+    }
+
+    /// `count` displays on a grid of 100 units, so that they often meet,
+    /// line up or overlap. Some are moved by a quarter unit, which still
+    /// counts as meeting a neighbor.
+    fn any_displays(
+        count: std::ops::RangeInclusive<usize>,
+    ) -> impl Strategy<Value = Vec<DisplayInfo>> {
+        proptest::collection::vec((0..8u8, 0..8u8, 1..6u8, 1..6u8, any::<bool>()), count).prop_map(
+            |frames| {
+                frames
+                    .into_iter()
+                    .zip(1..)
+                    .map(|((x, y, w, h, moved), id)| {
+                        let shift = if moved { 0.25 } else { 0.0 };
+                        let (x, y) = (f64::from(x) * 100.0 + shift, f64::from(y) * 100.0 + shift);
+                        let (w, h) = (f64::from(w) * 100.0, f64::from(h) * 100.0);
+                        display(id, x, y, w, h, 1.0)
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// Where another device goes: usually flush against one side of `me`'s
+    /// displays (`side` 0 to 3, in the order of [`Edge::ALL`]), slid along
+    /// it by `a` hundred units and moved out by a fraction of a unit (`out`),
+    /// so that edges often lead to it; otherwise (`side` 4) anywhere, at
+    /// `a`, `b` hundred units.
+    fn place(
+        me: &DeviceLayout,
+        displays: &[DisplayInfo],
+        (side, a, b, out): (usize, i8, i8, usize),
+    ) -> Point {
+        let out = [0.0, 0.5, 1.5][out];
+        let (a, b) = (f64::from(a) * 100.0, f64::from(b) * 100.0);
+        let Some(&side) = Edge::ALL.get(side) else {
+            return Point::new(a + out, b + out);
+        };
+        let flush = beside_origin(me, displays, side);
+        match side {
+            Edge::Left => Point::new(flush.x - out, flush.y + a),
+            Edge::Right => Point::new(flush.x + out, flush.y + a),
+            Edge::Top => Point::new(flush.x + a, flush.y - out),
+            Edge::Bottom => Point::new(flush.x + a, flush.y + out),
+        }
+    }
+
+    proptest! {
+        /// A point on one of this device's edges lies in a part that leads
+        /// to the peer exactly when the cursor crosses to the peer there:
+        /// outside the corner dead zone, where no other display of this
+        /// device continues past the edge, and where `exit_target` picks a
+        /// display of the peer (not of a third device, nor nothing).
+        #[test]
+        fn edges_lead_to_the_peer_exactly_where_the_cursor_crosses_to_it(
+            mine in any_displays(1..=3),
+            theirs in any_displays(1..=3),
+            third in any_displays(0..=3),
+            third_sorts_first in any::<bool>(),
+            places in proptest::array::uniform2((0..5usize, -4..=4i8, -4..=4i8, 0..3usize)),
+            tolerance in prop::sample::select(vec![0.0, 0.5, 1.0, 2.0]),
+            dead_zone in 0..=120u8,
+        ) {
+            let me = DeviceLayout::new(mac(), Point::new(0.0, 0.0), mine.clone());
+            let third_id = DeviceId::new(if third_sorts_first { "aaa" } else { "zed" });
+            let layout = Layout::new([
+                DeviceLayout::new(pc(), place(&me, &theirs, places[0]), theirs),
+                DeviceLayout::new(third_id, place(&me, &third, places[1]), third),
+                me,
+            ])
+            .unwrap();
+            let dead_zone = f64::from(dead_zone);
+            let parts = layout.edges_toward(&mac(), &pc(), tolerance, dead_zone);
+
+            // In order, each on its display's own edge, separate and not
+            // empty.
+            let rank = |part: &SharedEdge| {
+                let display = mine.iter().position(|d| d.id == part.display);
+                let edge = Edge::ALL.iter().position(|&e| e == part.edge);
+                (display.expect("a display of mine"), edge.expect("an edge"))
+            };
+            for pair in parts.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                prop_assert!(rank(a) < rank(b) || (rank(a) == rank(b) && a.end < b.start));
+            }
+            for part in &parts {
+                let frame = mine[rank(part).0].frame;
+                let (start, end) = frame.edge_span(part.edge);
+                prop_assert_eq!(part.frame, frame);
+                prop_assert!(start <= part.start && part.start < part.end && part.end <= end);
+            }
+
+            for display in &mine {
+                let frame = display.frame;
+                for edge in Edge::ALL {
+                    let (start, end) = frame.edge_span(edge);
+                    let line = frame.edge_line(edge);
+                    for i in 0..64u8 {
+                        // Never within 1/64 of where a part starts or ends,
+                        // which all lie on quarter units here.
+                        let along = start + (end - start) * (f64::from(i) + 0.37) / 64.0;
+                        let at = if edge.is_vertical() {
+                            Point::new(line, along)
+                        } else {
+                            Point::new(along, line)
+                        };
+                        let exit = Exit {
+                            display: display.id,
+                            frame,
+                            edge,
+                            at,
+                            clamped: at,
+                        };
+                        let continued = mine.iter().any(|other| {
+                            other.id != display.id && continues(&frame, edge, at, &other.frame)
+                        });
+                        let crosses = !exit.in_corner_dead_zone(dead_zone)
+                            && !continued
+                            && layout
+                                .exit_target(&mac(), display.id, edge, at, tolerance)
+                                .is_some_and(|crossing| crossing.to == pc());
+                        let in_a_part = parts.iter().any(|part| {
+                            part.display == display.id
+                                && part.edge == edge
+                                && part.start <= along
+                                && along <= part.end
+                        });
+                        prop_assert_eq!(
+                            in_a_part,
+                            crosses,
+                            "display {} {:?} at {}: {:?}",
+                            display.id,
+                            edge,
+                            along,
+                            parts
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

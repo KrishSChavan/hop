@@ -52,15 +52,15 @@ impl SystemState for WinSystemState {
 pub(crate) struct NoClipboard;
 
 impl TextClipboard for NoClipboard {
-    fn change_count(&self) -> u64 {
-        0
-    }
-
-    fn read_text(&self) -> Result<Option<String>> {
+    fn change_count(&self) -> Result<u64> {
         Err(PlatformError::Unsupported)
     }
 
-    fn write_text(&mut self, _text: &str) -> Result<()> {
+    fn read_text(&self, _max_bytes: usize) -> Result<Option<String>> {
+        Err(PlatformError::Unsupported)
+    }
+
+    fn write_text(&mut self, _text: &str) -> Result<u64> {
         Err(PlatformError::Unsupported)
     }
 }
