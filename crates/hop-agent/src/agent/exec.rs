@@ -6,14 +6,29 @@
 //! the core thread unwinds from a panic.
 //!
 //! It also knows what each peer's current connection negotiated
-//! ([`Features`]), because it sends: the clipboard goes out right after the
-//! `Enter` or `Leave` the cursor leaves with (docs/M4-M5-DESIGN.md,
-//! section 4), and only to a peer that takes clipboard text. Reading the
-//! clipboard can take a while ([`hop_platform::CLIPBOARD_TIMEOUT`]), so it
-//! waits for the end of the batch, where it holds up nothing (the `Leave`
-//! comes before releasing what was injected), unless another message comes
-//! first: then it goes just before that one, so the text still follows the
-//! `Enter` or `Leave` on the control stream.
+//! ([`Features`]), because it sends the clipboard as the cursor leaves
+//! (docs/M4-M5-DESIGN.md, section 4), and only to a peer that takes
+//! clipboard text. Reading the clipboard can take a while
+//! ([`hop_platform::CLIPBOARD_TIMEOUT`]), and where the read goes differs
+//! by side:
+//!
+//! - **The controller** sends its clipboard right after its `Enter`: at the
+//!   end of the batch, where the read holds up nothing, or just before the
+//!   next message if one comes first, so the text still follows the
+//!   `Enter` on the control stream and arrives before any key.
+//! - **The controlled side** sends its clipboard right *before* its
+//!   `Leave`. The controller takes its own keyboard back as it handles the
+//!   `Leave`, so text that came after it could lose the race with the
+//!   user's paste key, which would paste the old text there. Sent first, it
+//!   is on the controller's clipboard before its keyboard is back. The
+//!   price: the controller gets its keyboard back later, by the time the
+//!   read takes here and the write takes there (normally a few
+//!   milliseconds each, at most `CLIPBOARD_TIMEOUT` each), and keys typed
+//!   on it meanwhile reach this computer after its session ended, so they
+//!   are dropped, as keys typed while the `Leave` travels always were. A
+//!   paste key that does nothing is better than one that pastes the wrong
+//!   text. Releasing what was injected waits for the read too; nothing
+//!   here is in use by then, since the cursor has moved on.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -24,7 +39,7 @@ use hop_net::SendError;
 use hop_platform::{CaptureMode as PlatformMode, Platform};
 use hop_types::{CoreMessage, DeviceId, InputEvent, Os, Point, RejectReason};
 
-use super::clipboard::{ClipboardSettings, ClipboardSync, Offer};
+use super::clipboard::{ClipboardSettings, ClipboardSync, Offer, Retried};
 use super::link::Link;
 use crate::status;
 
@@ -101,9 +116,12 @@ pub(crate) struct Executor<L: Link> {
     connected: HashMap<DeviceId, Features>,
     /// Clipboard sync: whether it is on, and what both computers last had.
     clipboard: ClipboardSync,
-    /// The computer the cursor just left for with an `Enter` or a `Leave`,
-    /// until it has been offered the clipboard.
+    /// The computer the cursor just left for with an `Enter`, until it has
+    /// been offered the clipboard. (A `Leave` offers it at once, first.)
     clipboard_for: Option<DeviceId>,
+    /// Whether Activity already says, this run, that the clipboard could
+    /// not be read.
+    told_unreadable_clipboard: bool,
     role: Role,
     quitting: bool,
     limiter: RateLimit,
@@ -127,6 +145,7 @@ impl<L: Link> Executor<L> {
             connected: HashMap::new(),
             clipboard: ClipboardSync::new(ClipboardSettings::OFF),
             clipboard_for: None,
+            told_unreadable_clipboard: false,
             role: Role::None,
             quitting: false,
             limiter: RateLimit::default(),
@@ -157,6 +176,13 @@ impl<L: Link> Executor<L> {
     /// Whether clipboard sync is on here.
     pub(crate) fn clipboard_enabled(&self) -> bool {
         self.clipboard.enabled()
+    }
+
+    /// Tries again to read the clipboard's change count sharing started
+    /// at, if it could not be read then ([`ClipboardSync::learn_start`]).
+    /// Only the count is read, never the text.
+    pub(crate) fn learn_clipboard_start(&mut self) {
+        self.clipboard.learn_start(self.platform.clipboard.as_ref());
     }
 
     /// `peer` has a new current connection, which carries `features`.
@@ -257,17 +283,18 @@ impl<L: Link> Executor<L> {
 
     fn send(&mut self, to: &DeviceId, msg: CoreMessage) {
         // A clipboard still waiting goes first, so it directly follows the
-        // `Enter` or `Leave` it goes with.
+        // `Enter` it goes with.
         self.offer_clipboard();
-        // The cursor leaves this computer with an `Enter` (for the computer
-        // entered) or a `Leave` (for the computer it goes on to, normally the
-        // one it came from): that computer is offered the clipboard next.
-        let leaving_for = match &msg {
-            CoreMessage::Enter { .. } => Some(to.clone()),
-            CoreMessage::Leave { to: next, .. } => Some(next.clone()),
-            _ => None,
-        };
-        if matches!(msg, CoreMessage::Enter { .. }) {
+        let entering = matches!(msg, CoreMessage::Enter { .. });
+        // The cursor leaves this computer's session with a `Leave`: the
+        // computer it goes on to (normally the controller it came from)
+        // gets the clipboard first, so the text is on its clipboard before
+        // it takes its keyboard back (see the module docs).
+        if let CoreMessage::Leave { to: next, .. } = &msg {
+            self.clipboard_for = Some(next.clone());
+            self.offer_clipboard();
+        }
+        if entering {
             self.entered_at = Some(Instant::now());
         }
         // Only the error is logged, never the message: it may carry keys.
@@ -276,14 +303,20 @@ impl<L: Link> Executor<L> {
         {
             tracing::info!(peer = %to, error = %error, suppressed, "could not send to the other computer");
         }
-        self.clipboard_for = leaving_for;
+        // The cursor leaves this computer with an `Enter`: the computer
+        // entered gets the clipboard right after it, once the batch is done
+        // or before the next message.
+        if entering {
+            self.clipboard_for = Some(to.clone());
+        }
     }
 
-    /// Sends this computer's clipboard text to the computer the cursor just
-    /// left for, if there is one, when the two computers take clipboard text
-    /// and the clipboard changed since they last had the same content. On
-    /// the control stream right after the `Enter` or `Leave`, so it arrives
-    /// before any later key. The text is never logged.
+    /// Sends this computer's clipboard text to the computer the cursor is
+    /// leaving for, if there is one, when the two computers take clipboard
+    /// text and the clipboard changed since they last had the same content:
+    /// on the control stream right after an `Enter` (so it arrives before
+    /// any later key) or right before a `Leave` (so it is written before the
+    /// controller has its keyboard back). The text is never logged.
     fn offer_clipboard(&mut self) {
         let Some(to) = self.clipboard_for.take() else {
             return;
@@ -309,32 +342,70 @@ impl<L: Link> Executor<L> {
                     }
                 }
             },
-            Err(error) => self.warn(
-                "clipboard read",
-                "could not read the clipboard; the next crossing tries again",
-                &error,
-            ),
+            Err(error) => {
+                self.warn(
+                    "clipboard read",
+                    "could not read the clipboard; the next crossing tries again",
+                    &error,
+                );
+                // Once a run in Activity too, with the platform's reason
+                // (never any text): on a Mac where macOS does not let Hop
+                // read the clipboard, it names the setting to change, and
+                // nothing would say so otherwise.
+                if !std::mem::replace(&mut self.told_unreadable_clipboard, true) {
+                    status!(
+                        "{}",
+                        super::clipboard::unreadable(&self.name_of(&to), &error)
+                    );
+                }
+            }
         }
     }
 
     /// Puts clipboard text from `from` on this computer's clipboard, before
     /// the next event is handled (so its next key pastes it), if the two
     /// computers take clipboard text. A failure is only logged, without the
-    /// text.
+    /// text, and the text is tried again for a while
+    /// ([`Executor::retry_clipboard_write`]).
     pub(crate) fn receive_clipboard(&mut self, from: &DeviceId, text: &str) {
         if !self.features(from).clipboard {
             tracing::debug!(peer = %from, "ignored clipboard text from a computer that does not sync the clipboard");
             return;
         }
-        if let Err(error) = self
-            .clipboard
-            .receive(self.platform.clipboard.as_mut(), text)
+        if let Err(error) =
+            self.clipboard
+                .receive(self.platform.clipboard.as_mut(), text, Instant::now())
         {
             self.warn(
                 "clipboard write",
                 "could not put the other computer's clipboard text on this computer's clipboard",
                 &error,
             );
+        }
+    }
+
+    /// Tries again to put clipboard text from the other computer that could
+    /// not be written on this computer's clipboard, when a try is due
+    /// (`ClipboardSync::retry`). Called every tick; between tries, and with
+    /// nothing waiting, it touches nothing. The text is never logged.
+    pub(crate) fn retry_clipboard_write(&mut self, now: Instant) {
+        match self.clipboard.retry(self.platform.clipboard.as_mut(), now) {
+            Retried::Nothing => {}
+            Retried::Written => tracing::info!(
+                "put the other computer's clipboard text on this computer's clipboard after all"
+            ),
+            Retried::Failed(error) => self.warn(
+                "clipboard write",
+                "could not put the other computer's clipboard text on this computer's clipboard",
+                &error,
+            ),
+            Retried::Superseded => tracing::debug!(
+                "dropped the other computer's clipboard text: something was copied here since"
+            ),
+            Retried::GaveUp => tracing::warn!(
+                "gave up putting the other computer's clipboard text on this computer's \
+                 clipboard; it comes again once it is copied there again"
+            ),
         }
     }
 

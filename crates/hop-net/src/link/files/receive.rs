@@ -11,14 +11,23 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::split::{Piece, Splitter};
-use super::{CALLED_OFF, ConnFiles, Offered, Receiving, check_offer, failure};
-use crate::{TransferEvent, ratelimit};
+use super::{CALLED_OFF, ConnFiles, Offered, Receiving, check_offer, receiving_failure};
+use crate::{Refusal, TransferEvent, TransferFailure, ratelimit};
 
 /// How much the stream reader takes from quinn at a time.
 const READ_CHUNK: usize = 64 * 1024;
 
 /// Pieces waiting for the disk thread, at most `READ_CHUNK` bytes each.
 const WRITE_AHEAD: usize = 8;
+
+/// Why an offer was not accepted.
+enum Declined {
+    /// Turned down, with the reason the sender is told.
+    Refused(FileRefusal),
+    /// Ready only after the sender stopped waiting for the answer (the
+    /// folder waited for the user, say): nothing is answered.
+    Late,
+}
 
 /// How a data stream ended.
 enum Received {
@@ -33,9 +42,10 @@ enum Received {
 impl ConnFiles {
     /// Answers each offer in turn.
     pub(super) async fn answer_offers(&self, mut offers: mpsc::Receiver<Offered>) -> Infallible {
-        while let Some(Offered { id, files }) = offers.recv().await {
-            let count = files.len();
-            match self.accept(id, files).await {
+        while let Some(offered) = offers.recv().await {
+            let id = offered.id;
+            let count = offered.files.len();
+            match self.accept(offered).await {
                 Ok(()) => {
                     tracing::debug!(id = %self.peer, files = count, "accepted files");
                     let _ = self.send_control(FileMessage::Answer {
@@ -44,7 +54,23 @@ impl ConnFiles {
                         refusal: None,
                     });
                 }
-                Err(refused) => self.refuse(id, refused),
+                Err(Declined::Refused(refused)) => {
+                    self.refuse(id, refused);
+                    // The cause is here, where it can be fixed (on a Mac,
+                    // the Downloads folder permission): say so here too.
+                    if refused == FileRefusal::Off {
+                        self.report_declined(id, TransferFailure::Refused(Refusal::Off));
+                    }
+                }
+                Err(Declined::Late) => {
+                    tracing::info!(
+                        id = %self.peer,
+                        files = count,
+                        "the Received folder was ready only after the other device stopped \
+                         waiting for an answer"
+                    );
+                    self.report_declined(id, TransferFailure::NoAnswer);
+                }
             }
         }
         // `self` holds the sender, so the queue never closes.
@@ -52,17 +78,29 @@ impl ConnFiles {
     }
 
     /// Checks an offer and, if it passes, records it as accepted.
-    async fn accept(&self, id: u64, files: Vec<FileEntry>) -> Result<(), FileRefusal> {
-        check_offer(&files, &self.limits)?;
-        let place = self.inbox.reserve().ok_or(FileRefusal::Busy)?;
+    async fn accept(&self, offered: Offered) -> Result<(), Declined> {
+        let Offered { id, files, arrived } = offered;
+        check_offer(&files, &self.limits).map_err(Declined::Refused)?;
+        let place = self
+            .inbox
+            .reserve()
+            .ok_or(Declined::Refused(FileRefusal::Busy))?;
         if !self.inbox.prepare().await {
-            return Err(FileRefusal::Off);
+            return Err(Declined::Refused(FileRefusal::Off));
+        }
+        // Getting the folder ready may have waited for the user (on a Mac,
+        // to allow the Downloads folder). Past `answer_timeout` (the same
+        // on both computers, which run the same build), the sender has
+        // stopped waiting: an answer now would only be dropped, and the
+        // data would never come.
+        if arrived.elapsed() >= self.limits.answer_timeout {
+            return Err(Declined::Late);
         }
         {
             let mut state = self.lock_state();
             // A reused id is the peer's mistake; the first transfer keeps it.
             if state.ended || state.receiving.contains_key(&id) {
-                return Err(FileRefusal::Busy);
+                return Err(Declined::Refused(FileRefusal::Busy));
             }
             state.receiving.insert(
                 id,
@@ -120,6 +158,10 @@ impl ConnFiles {
     }
 
     /// Fails the accepted transfers whose data stream did not start in time.
+    /// The sender is told they timed out. The agent hears that the offer
+    /// went unanswered, as for one this side was ready for too late: nothing
+    /// arrived, and most likely the answer came after the sender stopped
+    /// waiting for it.
     fn expire_waiting(&self) {
         let now = Instant::now();
         let queued = {
@@ -134,7 +176,16 @@ impl ConnFiles {
             let mut queued = false;
             for id in expired {
                 state.receiving.remove(&id);
-                queued |= self.settle(id, Err((0, FileFailure::TimedOut)));
+                tracing::info!(
+                    id = %self.peer,
+                    "the other device did not send the files it offered"
+                );
+                let _ = self.send_control(FileMessage::Outcome {
+                    id,
+                    saved: 0,
+                    failure: Some(FileFailure::TimedOut),
+                });
+                queued |= self.report_failure(id, false, TransferFailure::NoAnswer);
             }
             queued
         };
@@ -194,6 +245,18 @@ impl ConnFiles {
         Some(std::mem::take(&mut transfer.files))
     }
 
+    /// Tells this side's agent about offer `id`, which it did not take,
+    /// unless the connection ended meanwhile.
+    fn report_declined(&self, id: u64, reason: TransferFailure) {
+        let queued = {
+            let state = self.lock_state();
+            !state.ended && self.report_failure(id, false, reason)
+        };
+        if queued {
+            self.queue.wake();
+        }
+    }
+
     /// Sends the outcome of received transfer `id`, already taken out of
     /// the state, and reports it to the agent: the saved files, or how many
     /// were saved before it failed and why. Called with the state lock held;
@@ -226,7 +289,7 @@ impl ConnFiles {
                     saved,
                     failure: Some(failed),
                 });
-                self.report_failure(id, false, failure(failed))
+                self.report_failure(id, false, receiving_failure(failed))
             }
         }
     }
@@ -311,10 +374,22 @@ async fn receive_files(
         Ok(written) => written,
         Err(_) => Written {
             saved: Vec::new(),
+            unmarked: 0,
             failure: Some(FileFailure::Disk),
             complete: false,
         },
     };
+    if written.unmarked > 0
+        && let Some(suppressed) = ratelimit::allow("received files unmarked")
+    {
+        tracing::warn!(
+            files = written.unmarked,
+            suppressed,
+            "saved received files without the mark that they came from another computer (the \
+             Received folder's drive cannot keep it), so Windows does not check them as it \
+             checks downloads"
+        );
+    }
     let saved = u32::try_from(written.saved.len()).unwrap_or(u32::MAX);
     match (stopped, written.failure) {
         (Some(failure), _) | (None, Some(failure)) => Received::Failed { saved, failure },
@@ -345,6 +420,9 @@ async fn send_piece(
 struct Written {
     /// The files saved, in order.
     saved: Vec<PathBuf>,
+    /// How many of them were saved without the mark that they came from
+    /// another computer ([`hop_transfer::Saved::unmarked`]).
+    unmarked: u32,
     /// Why it stopped early, if it did.
     failure: Option<FileFailure>,
     /// Whether every file was saved.
@@ -356,9 +434,11 @@ struct Written {
 /// complete by then is deleted when its writer is dropped.
 fn write_files(dir: &Path, files: &[FileEntry], mut pieces: mpsc::Receiver<Piece>) -> Written {
     let mut saved = Vec::new();
+    let mut unmarked: u32 = 0;
     let mut current: Option<IncomingFile> = None;
-    let fail = |saved: Vec<PathBuf>, error: ReceiveError| Written {
+    let fail = |saved: Vec<PathBuf>, unmarked: u32, error: ReceiveError| Written {
         saved,
+        unmarked,
         failure: Some(match error {
             ReceiveError::Corrupt | ReceiveError::TooLong | ReceiveError::TooShort { .. } => {
                 FileFailure::Corrupt
@@ -370,32 +450,36 @@ fn write_files(dir: &Path, files: &[FileEntry], mut pieces: mpsc::Receiver<Piece
     while let Some(piece) = pieces.blocking_recv() {
         let Some(entry) = files.get(saved.len()) else {
             // The splitter never sends more than the offer listed.
-            return fail(saved, ReceiveError::TooLong);
+            return fail(saved, unmarked, ReceiveError::TooLong);
         };
         let file = match current.take() {
             Some(file) => file,
             None => match IncomingFile::create(dir, &entry.name, entry.size) {
                 Ok(file) => file,
-                Err(error) => return fail(saved, error),
+                Err(error) => return fail(saved, unmarked, error),
             },
         };
         match piece {
             Piece::Data(bytes) => {
                 let mut file = file;
                 if let Err(error) = file.write(&bytes) {
-                    return fail(saved, error);
+                    return fail(saved, unmarked, error);
                 }
                 current = Some(file);
             }
             Piece::End(digest) => match file.finish(&digest) {
-                Ok(path) => saved.push(path),
-                Err(error) => return fail(saved, error),
+                Ok(done) => {
+                    unmarked = unmarked.saturating_add(u32::from(done.unmarked));
+                    saved.push(done.path);
+                }
+                Err(error) => return fail(saved, unmarked, error),
             },
         }
     }
     let complete = saved.len() == files.len();
     Written {
         saved,
+        unmarked,
         failure: None,
         complete,
     }
@@ -462,6 +546,7 @@ mod tests {
             written.saved,
             [dir.join("a.txt"), dir.join("empty"), dir.join("a (2).txt")]
         );
+        assert_eq!(written.unmarked, 0, "a test folder keeps the mark");
         assert_eq!(std::fs::read(dir.join("a (2).txt")).unwrap(), b"de");
         let _ = std::fs::remove_dir_all(&dir);
     }

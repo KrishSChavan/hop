@@ -29,9 +29,10 @@
 //! for piece in pieces {
 //!     file.write(piece)?;
 //! }
-//! // Checks the size and the SHA-256, then gives the file its final name.
+//! // Checks the size and the SHA-256, marks the file as coming from
+//! // another computer, then gives it its final name.
 //! let saved = file.finish(&digest)?;
-//! # let _ = saved;
+//! # let _ = (saved.path, saved.unmarked);
 //! # Ok(())
 //! # }
 //! ```
@@ -51,6 +52,11 @@
 //! - Nothing incomplete keeps a real name: a failure, or dropping the
 //!   writer, deletes the temporary file, and [`sweep`] deletes what a crash
 //!   left behind (only those temporary files).
+//! - A received file is checked before it is opened, as a download is. On
+//!   Windows it gets the Mark of the Web while it still has its temporary
+//!   name, so it never has its real name without it; on the Mac, macOS
+//!   quarantines what Hop.app creates. A drive that cannot keep the mark
+//!   still gets the file, and [`Saved::unmarked`] says so.
 //! - Errors and `Debug` output of the reader and writer never contain file
 //!   names or contents, so they are safe to log.
 
@@ -62,7 +68,7 @@ mod receive;
 mod send;
 
 pub use names::{MAX_NAME_BYTES, free_path, sanitize};
-pub use receive::{IncomingFile, ReceiveError, TEMP_SUFFIX, sweep};
+pub use receive::{IncomingFile, ReceiveError, Saved, TEMP_SUFFIX, sweep};
 pub use send::{FileReader, OutgoingFile, Piece, Plan, ReadError, plan};
 
 /// A file's SHA-256, as it travels after the file's bytes.

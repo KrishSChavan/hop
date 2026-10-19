@@ -213,6 +213,16 @@ async fn files_arrive_intact_with_clean_names_that_never_clobber() {
     assert_eq!(fs::read(&saved[0]).unwrap(), report);
     assert_eq!(fs::read(&saved[1]).unwrap(), b"");
     assert_eq!(fs::read(&saved[2]).unwrap(), notes);
+    // On Windows each one carries the Mark of the Web, as a download does.
+    #[cfg(windows)]
+    for path in &saved {
+        let mut stream = path.clone().into_os_string();
+        stream.push(":Zone.Identifier");
+        assert_eq!(
+            fs::read_to_string(stream).unwrap(),
+            "[ZoneTransfer]\r\nZoneId=3\r\n"
+        );
+    }
     assert_eq!(
         fs::read(received.join("report.pdf")).unwrap(),
         b"already here"
@@ -411,7 +421,14 @@ async fn refusal_for(
         panic!("a refusal: {:?}", a.log);
     };
     assert_eq!(failed_id, id);
-    // A refusal is not a transfer on the receiving side.
+    // The receiving side tells its own agent only about a cause that is
+    // its own to fix: a Received folder it cannot use.
+    if reason == TransferFailure::Refused(Refusal::Off) {
+        assert_eq!(
+            expect_transfer(&mut b).await,
+            failed(a.id(), id, false, TransferFailure::Refused(Refusal::Off))
+        );
+    }
     b.expect_quiet(Duration::from_millis(100)).await;
     assert!(names_in(&received).is_empty());
     reason
@@ -656,13 +673,14 @@ async fn a_file_that_changes_while_it_is_sent_fails_cleanly() {
         .unwrap()
         .set_len(1000)
         .unwrap();
+    // The sender's own failure; the receiver hears that the sender stopped.
     assert_eq!(
         expect_transfer(&mut a).await,
         failed(b.id(), id, true, TransferFailure::Io)
     );
     assert_eq!(
         expect_transfer(&mut b).await,
-        failed(a.id(), id, false, TransferFailure::Io)
+        failed(a.id(), id, false, TransferFailure::PeerFailed)
     );
     wait_until("the temporary file to go", || {
         names_in(&received).is_empty()
@@ -754,6 +772,43 @@ impl RawPeer {
             .unwrap();
         stream.write_all(&id.to_be_bytes()).await.unwrap();
         stream
+    }
+
+    /// The node's next offer: its id and files.
+    async fn offered(&mut self) -> (u64, Vec<FileEntry>) {
+        match self.reply().await {
+            FileMessage::Offer { id, files } => (id, files),
+            other => panic!("expected an offer, got {other:?}"),
+        }
+    }
+
+    /// Accepts the node's offer `id` and takes its data stream: the bytes
+    /// of the `files` it offered, each checked against its checksum. Then
+    /// tells the node they were saved.
+    async fn take(&mut self, id: u64, files: &[FileEntry]) -> Vec<Vec<u8>> {
+        // Only a receiver allows a data stream; the transport allows none.
+        self.conn
+            .set_max_concurrent_uni_streams(quinn::VarInt::from_u32(1));
+        self.write(Message::File(accepted(id))).await;
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), self.conn.accept_uni())
+            .await
+            .expect("the node opens its data stream")
+            .unwrap();
+        let mut stream_id = [0u8; 8];
+        stream.read_exact(&mut stream_id).await.unwrap();
+        assert_eq!(u64::from_be_bytes(stream_id), id);
+        let mut contents = Vec::new();
+        for file in files {
+            let mut content = vec![0; usize::try_from(file.size).unwrap()];
+            stream.read_exact(&mut content).await.unwrap();
+            let mut digest = [0u8; 32];
+            stream.read_exact(&mut digest).await.unwrap();
+            assert_eq!(digest, sha256(&content));
+            contents.push(content);
+        }
+        let saved = u32::try_from(files.len()).unwrap();
+        self.write(Message::File(outcome(id, saved, None))).await;
+        contents
     }
 
     /// Sends `files` as transfer `id` with the right checksums, after the
@@ -938,12 +993,13 @@ async fn a_stream_that_ends_early_or_is_reset_saves_nothing() {
             !temporary_files(&received).is_empty()
         })
         .await;
+        // Either way the sender stopped, not this side.
         let (failure, reason) = if reset {
             stream.reset(0u32.into()).unwrap();
-            (FileFailure::Cancelled, TransferFailure::Io)
+            (FileFailure::Cancelled, TransferFailure::PeerFailed)
         } else {
             stream.finish().unwrap();
-            (FileFailure::Incomplete, TransferFailure::Io)
+            (FileFailure::Incomplete, TransferFailure::PeerFailed)
         };
         assert_eq!(raw.reply().await, outcome(7, 0, Some(failure)));
         assert_eq!(
@@ -954,6 +1010,95 @@ async fn a_stream_that_ends_early_or_is_reset_saves_nothing() {
             names_in(&received).is_empty()
         })
         .await;
+    }
+}
+
+/// A file this side cannot save is its own failure: it tells the sender
+/// the disk failed, and its own agent that a file could not be saved here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_that_cannot_be_saved_here_is_this_sides_failure() {
+    let scratch = Scratch::new("disk");
+    let received = scratch.join("received");
+    let (mut node, mut raw, raw_id) = raw_pair(&received, |_| {}).await;
+    raw.offer(2, &[("big.bin", &[7u8; 100])]).await;
+    assert_eq!(raw.reply().await, accepted(2));
+    // The folder goes away before the data comes: nothing can be saved.
+    fs::remove_dir_all(&received).unwrap();
+    let mut stream = raw.data(2).await;
+    let _ = stream.write_all(&[7u8; 100]).await;
+    let _ = stream.write_all(&sha256(&[7u8; 100])).await;
+    let _ = stream.finish();
+    assert_eq!(raw.reply().await, outcome(2, 0, Some(FileFailure::Disk)));
+    assert_eq!(
+        expect_transfer(&mut node).await,
+        failed(raw_id, 2, false, TransferFailure::Io)
+    );
+}
+
+/// The receiver could not save a file: the sender says that the other
+/// computer failed, not that a file here could not be read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_receiver_that_cannot_save_is_the_other_computers_failure() {
+    let scratch = Scratch::new("their-disk");
+    let source = scratch.folder("source", &[("video.mov", &content(300_000, 7))]);
+    let (mut node, mut raw, raw_id) = raw_pair(&scratch.join("received"), |_| {}).await;
+    let id = node
+        .handle
+        .send_files(&raw_id, vec![source.join("video.mov")])
+        .unwrap();
+    let (offered, _) = raw.offered().await;
+    assert_eq!(offered, id);
+    raw.conn
+        .set_max_concurrent_uni_streams(quinn::VarInt::from_u32(1));
+    raw.write(Message::File(accepted(id))).await;
+    let mut stream = tokio::time::timeout(Duration::from_secs(5), raw.conn.accept_uni())
+        .await
+        .expect("the node opens its data stream")
+        .unwrap();
+    let mut start = [0u8; 1024];
+    stream.read_exact(&mut start).await.unwrap();
+    // Its disk is full, say.
+    stream.stop(0u32.into()).unwrap();
+    raw.write(Message::File(outcome(id, 0, Some(FileFailure::Disk))))
+        .await;
+    assert_eq!(
+        expect_transfer(&mut node).await,
+        failed(raw_id, id, true, TransferFailure::PeerFailed)
+    );
+}
+
+#[test]
+fn each_side_keeps_its_own_failures_apart_from_the_other_computers() {
+    use super::{outcome_failure, receiving_failure};
+    // Receiving: a file this side could not save is its own; data that
+    // broke off is the sender's.
+    assert_eq!(receiving_failure(FileFailure::Disk), TransferFailure::Io);
+    for broke_off in [FileFailure::Cancelled, FileFailure::Incomplete] {
+        assert_eq!(
+            receiving_failure(broke_off),
+            TransferFailure::PeerFailed,
+            "{broke_off:?}"
+        );
+    }
+    // Sending: whatever the receiver's outcome blames is the receiver's.
+    for theirs in [
+        FileFailure::Disk,
+        FileFailure::Cancelled,
+        FileFailure::Incomplete,
+    ] {
+        assert_eq!(
+            outcome_failure(theirs),
+            TransferFailure::PeerFailed,
+            "{theirs:?}"
+        );
+    }
+    // Damage and silence read the same from both sides.
+    for (failure, reason) in [
+        (FileFailure::Corrupt, TransferFailure::Corrupt),
+        (FileFailure::TimedOut, TransferFailure::TimedOut),
+    ] {
+        assert_eq!(receiving_failure(failure), reason);
+        assert_eq!(outcome_failure(failure), reason);
     }
 }
 
@@ -974,8 +1119,11 @@ async fn a_stream_for_no_accepted_offer_is_stopped() {
     assert_eq!(raw.reply().await, outcome(1, 1, None));
 }
 
+/// The sender stopped waiting for the answer (it came too late, say): the
+/// receiver tells it the transfer timed out, and tells its own agent that
+/// the sender did not go on with it, rather than that data stopped coming.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_accepted_offer_whose_data_never_comes_times_out() {
+async fn an_accepted_offer_whose_data_never_comes_is_reported_as_unanswered() {
     let scratch = Scratch::new("no-data");
     let received = scratch.join("received");
     let (mut node, mut raw, raw_id) = raw_pair(&received, |limits| {
@@ -992,8 +1140,96 @@ async fn an_accepted_offer_whose_data_never_comes_times_out() {
     assert!(started.elapsed() >= Duration::from_millis(300));
     assert_eq!(
         expect_transfer(&mut node).await,
-        failed(raw_id, 3, false, TransferFailure::TimedOut)
+        failed(raw_id, 3, false, TransferFailure::NoAnswer)
     );
+}
+
+/// A folder that was ready only after the sender stopped waiting for the
+/// answer (the user allowed the Downloads folder late, say): no answer
+/// goes, since it would be dropped, and the receiver says at once that the
+/// files did not come.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_ready_only_after_the_sender_stopped_waiting_is_not_answered() {
+    let scratch = Scratch::new("late");
+    let received = scratch.join("received");
+    // No wait at all: every offer is ready too late.
+    let (mut node, mut raw, raw_id) =
+        raw_pair(&received, |limits| limits.answer_timeout = Duration::ZERO).await;
+    raw.offer(5, &[("late.txt", b"late")]).await;
+    assert_eq!(
+        expect_transfer(&mut node).await,
+        failed(raw_id, 5, false, TransferFailure::NoAnswer)
+    );
+    assert_eq!(raw.reply_within(Duration::from_millis(300)).await, None);
+    assert!(names_in(&received).is_empty());
+}
+
+/// The receiver may answer only once its folder is ready (on a Mac, once
+/// the user allowed the Downloads folder): the sender waits longer for the
+/// answer than it lets a transfer go without progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_may_take_longer_than_progress_may_stall() {
+    let scratch = Scratch::new("slow-answer");
+    let source = scratch.folder("source", &[("photo.jpg", b"a photo")]);
+    let (mut node, mut raw, raw_id) = raw_pair(&scratch.join("received"), |limits| {
+        limits.transfer_timeout = Duration::from_millis(500);
+        limits.answer_timeout = Duration::from_secs(10);
+    })
+    .await;
+    let id = node
+        .handle
+        .send_files(&raw_id, vec![source.join("photo.jpg")])
+        .unwrap();
+    let (offered, files) = raw.offered().await;
+    assert_eq!(offered, id);
+    // Well over the time a transfer may go without progress.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(raw.take(id, &files).await, [b"a photo".to_vec()]);
+    assert_eq!(
+        expect_transfer(&mut node).await,
+        TransferEvent::Sent {
+            to: raw_id,
+            id,
+            files: 1,
+            skipped: 0
+        }
+    );
+}
+
+/// An offer the receiver never answers sends nothing, and says so: it is
+/// not a transfer that stopped moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_offer_nobody_answers_fails_as_unanswered_and_sends_nothing() {
+    let scratch = Scratch::new("no-answer");
+    let source = scratch.folder("source", &[("photo.jpg", b"a photo")]);
+    let (mut node, mut raw, raw_id) = raw_pair(&scratch.join("received"), |limits| {
+        limits.answer_timeout = Duration::from_millis(300);
+    })
+    .await;
+    // Allowed, but never opened: the node waits for an answer first.
+    raw.conn
+        .set_max_concurrent_uni_streams(quinn::VarInt::from_u32(1));
+    let started = Instant::now();
+    let id = node
+        .handle
+        .send_files(&raw_id, vec![source.join("photo.jpg")])
+        .unwrap();
+    let (offered, _) = raw.offered().await;
+    assert_eq!(offered, id);
+    assert_eq!(
+        expect_transfer(&mut node).await,
+        failed(raw_id, id, true, TransferFailure::NoAnswer)
+    );
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), raw.conn.accept_uni())
+            .await
+            .is_err(),
+        "no data stream"
+    );
+    // A late answer changes nothing.
+    raw.write(Message::File(accepted(id))).await;
+    node.expect_quiet(Duration::from_millis(200)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1014,10 +1250,16 @@ async fn a_peer_that_leaves_mid_transfer_leaves_nothing_behind() {
         expect_transfer(&mut node).await,
         failed(raw_id, 1, false, TransferFailure::Disconnected)
     );
-    assert!(matches!(
-        node.expect_down().await,
-        DownReason::Remote { code: 0, .. }
-    ));
+    // The peer's close, or, on a loaded machine where the node misses it,
+    // the reset the peer's endpoint answers its next packets with.
+    let down = node.expect_down().await;
+    assert!(
+        matches!(
+            down,
+            DownReason::Remote { code: 0, .. } | DownReason::Transport(_)
+        ),
+        "{down:?}"
+    );
     wait_until("the temporary file to go", || {
         names_in(&received).is_empty()
     })

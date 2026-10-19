@@ -142,8 +142,16 @@ pub struct Limits {
     /// Received transfers that may wait while another one runs (4); an
     /// offer beyond those is refused as busy.
     pub max_waiting_transfers: usize,
-    /// How long a transfer waits for an answer or an outcome, and how long
-    /// it may go without progress, before it fails (30 s).
+    /// How long a sender waits for the answer to its offer before it fails
+    /// with [`TransferFailure::NoAnswer`](crate::TransferFailure::NoAnswer)
+    /// (2 minutes). Longer than the wait for progress: the receiver
+    /// answers once its Received folder is ready, and on a Mac the first
+    /// use of the Downloads folder waits until the user allows it.
+    pub answer_timeout: Duration,
+    /// How long a transfer may go without progress, and how long a sender
+    /// waits for the outcome once the data is sent, before it fails (30 s).
+    /// A receiver gives up on an accepted offer whose data does not start
+    /// within this, too.
     pub transfer_timeout: Duration,
     /// The fastest this device sends file data on one connection, in bytes
     /// per second (12 MiB/s; zero means no limit), so a large transfer
@@ -163,6 +171,7 @@ impl Default for Limits {
             max_file_bytes: 4 * 1024 * 1024 * 1024,
             max_transfer_bytes: 16 * 1024 * 1024 * 1024,
             max_waiting_transfers: 4,
+            answer_timeout: Duration::from_secs(120),
             transfer_timeout: Duration::from_secs(30),
             file_rate: 12 * 1024 * 1024,
         }

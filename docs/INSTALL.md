@@ -105,12 +105,18 @@ The examples here are what the Mac shows when the PC is on its right.
    - To use the PC's shortcuts on the Mac (Ctrl+C copies there too): in Hop on the Mac, under **Shortcuts**, choose "Swap Ctrl and Cmd: Ctrl+C copies, as on a PC".
    - Each computer has its own choice, for the keys that arrive on it. To go back, choose "Keep keys as they are". Sharing restarts by itself after a change, which takes a few seconds.
 5. **Copy and paste** works between the computers, for text. Copy on one computer, move the cursor to the other one, and paste there. The text goes along when the cursor crosses, so move the cursor after you copy. Text copied from a password manager never goes to the other computer.
+   - Text you copied before you clicked **Start sharing**, or before sharing restarted after a change, stays behind: copy it again.
+   - The text goes along only when the cursor moves across. When you switch by using the other computer's own trackpad, mouse or keyboard instead, it stays behind.
 6. **Send files** by dropping them at the edge of the screen:
    1. Drag the files from Finder (or File Explorer) towards the edge that leads to the other computer. The cursor stays on this screen while you drag.
    2. Near the edge, a box appears: "Drop to send to Windows PC". Drop the files on it.
    3. Hop copies them to the other computer, into the **Hop Received** folder inside its **Downloads** folder, and opens that folder there to show them. The originals stay where they were.
 
-   Hop sends files, not folders: to send what is in a folder, open it and drag the files. The first time files arrive on the Mac, macOS asks whether Hop may access files in your Downloads folder. Click **Allow**.
+   Hop sends files, not folders: to send what is in a folder, open it and drag the files.
+
+   Files that arrive are marked as downloaded, like files from a web browser, so each computer checks them before they open. On the PC, Word or Excel may open them read-only at first (click **Enable Editing**), and a program may get a "Windows protected your PC" warning. On the Mac, opening an app that arrived asks first.
+
+   The first time files arrive on the Mac, macOS asks, on the Mac's screen, whether Hop may access files in your Downloads folder. Click **Allow**, and the files arrive. If you take longer than 2 minutes, the computer that sends them says "… did not answer, so nothing was sent": drop the files again.
 
 **The emergency keys.** If the keyboard and mouse ever seem stuck on the other computer, press these keys together on the computer you are typing on. Use the keys on the left side of the keyboard. Control comes back at once.
 - On the Mac: **Control + Option + Shift + Escape**.
@@ -139,7 +145,10 @@ Your pairing and your **Where is it?** and **Shortcuts** choices stay as they ar
 - **You clicked Cancel when Windows asked about networks.** Open Windows Security → Firewall & network protection → Allow an app through firewall. Click **Change settings**, find Hop, tick **Private**, and click **OK**. If Hop is not in the list, click **Allow another app…** and choose Hop.exe in your Hop folder.
 - **Start sharing is greyed out.** Hop says "Pair with your other computer first." Pair them as in step 4.
 - **Paste gives the old text.** Copied text goes to the other computer when the cursor crosses. Copy first, then move the cursor across, then paste. Both computers need the same version of Hop.
+  - Text copied before **Start sharing**, or before sharing restarted after a change, stays behind. So does text when you switch by using the other computer's own trackpad, mouse or keyboard. Copy it again, then move the cursor across.
+  - Text longer than about a million characters is not sent.
+  - On the Mac, if Activity says that copied text did not go because macOS does not let Hop read the clipboard, open System Settings → Privacy & Security → Paste from Other Apps and allow Hop.
 - **No box appears when you drag files to the edge.** Check that both computers are connected ("Connected to …") and run the same version of Hop. The box appears only while you drag files, close to the edge that leads to the other computer. **Activity** says what happened to files you dropped.
-- **Files from the PC never arrive on the Mac.** If you clicked Don't Allow when macOS asked about the Downloads folder: open System Settings → Privacy & Security → Files & Folders, find Hop, and switch on **Downloads Folder**.
+- **Files from the PC never arrive on the Mac.** If Activity on the PC says "Mac could not save the files in its Hop Received folder", or you clicked Don't Allow when macOS asked about the Downloads folder: open System Settings → Privacy & Security → Files & Folders on the Mac, find Hop, and switch on **Downloads Folder**. Then drop the files again. Activity on the Mac says the same.
 - **To pair again**, for example with a new computer: click **Forget…** under **Your other computer**, then pair as in step 4.
 - **Hop's log.** Click **Open log folder** under **Activity** in Hop's window. On the Mac the log is in `~/Library/Logs/Hop`, and on the PC in `%LOCALAPPDATA%\Hop\Logs`. The log never contains what you type or copy, the names of files you send, or pairing codes, so you can share it with Claude.

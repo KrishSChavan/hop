@@ -102,10 +102,12 @@
 //!   received, and a peer without `files` never gets a stream for data.
 //! - Files go only into the Received folder, under cleaned names that
 //!   never overwrite anything, and only once their size and SHA-256 check
-//!   out; a failure or a lost connection deletes what had not finished. The
-//!   folder is not touched before the first offer. File data is paced and
-//!   comes after the control stream, so input keeps flowing, and disk work
-//!   never runs on the network's workers.
+//!   out; a failure or a lost connection deletes what had not finished. On
+//!   Windows each one is marked as coming from another computer (the Mark
+//!   of the Web) before it gets its name, so it is checked as a download is.
+//!   The folder is not touched before the first offer. File data is paced
+//!   and comes after the control stream, so input keeps flowing, and disk
+//!   work never runs on the network's workers.
 //! - Logs (through `tracing`) hold connections, fingerprints, counts and
 //!   errors, never keys, key codes, clipboard text, file names, file
 //!   contents or checksums, pairing codes, SPAKE2 values, MACs, exporter

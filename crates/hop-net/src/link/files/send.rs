@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::pace::Pacer;
-use super::{CALLED_OFF, ConnFiles, ControlError, failure, refusal};
+use super::{CALLED_OFF, ConnFiles, ControlError, outcome_failure, refusal};
 use crate::{Refusal, TransferFailure};
 
 /// How much of a file the disk thread reads at a time.
@@ -57,7 +57,14 @@ pub(super) async fn transfer(
         ControlError::Encode => TransferFailure::Refused(Refusal::BadNames),
         ControlError::Gone => TransferFailure::Disconnected,
     })?;
-    match reply(&mut replies, timeout).await? {
+    // The answer may wait for the receiver's folder (on a Mac, for the user
+    // to allow the Downloads folder), so it has a longer limit than
+    // progress; without one, nothing was sent.
+    let answer = match reply(&mut replies, files.limits.answer_timeout).await {
+        Err(TransferFailure::TimedOut) => Err(TransferFailure::NoAnswer),
+        other => other,
+    };
+    match answer? {
         FileMessage::Answer { accepted: true, .. } => {}
         FileMessage::Answer {
             refusal: Some(refused),
@@ -105,8 +112,10 @@ pub(super) async fn transfer(
         FileMessage::Outcome {
             failure: Some(failed),
             ..
-        } => Err(failure(failed)),
-        _ => Err(TransferFailure::Io),
+        } => Err(outcome_failure(failed)),
+        // Fewer files saved than sent, or a reply out of order: the
+        // receiver did not take them all.
+        _ => Err(TransferFailure::PeerFailed),
     }
 }
 

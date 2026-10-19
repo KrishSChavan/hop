@@ -104,6 +104,12 @@ pub(crate) fn sent(sent: u32, skipped: u32, peer: &str) -> String {
     }
 }
 
+/// How to let Hop use a Mac's Downloads folder, which holds the Hop
+/// Received folder. Without it, macOS keeps Hop out and no file can arrive
+/// there.
+const DOWNLOADS_FOLDER: &str = "On a Mac, switch on Downloads Folder for Hop in System Settings > \
+                                Privacy & Security > Files & Folders.";
+
 /// Said when a transfer stopped before it was complete: whether this
 /// computer was sending, and why, in plain words.
 pub(crate) fn failed(outgoing: bool, reason: &TransferFailure, peer: &str) -> String {
@@ -123,9 +129,10 @@ fn failed_sending(reason: &TransferFailure, peer: &str) -> String {
         )
     };
     match reason {
-        TransferFailure::Refused(Refusal::Off) => {
-            refused("receiving files is turned off there".to_owned())
-        }
+        TransferFailure::Refused(Refusal::Off) => format!(
+            "{peer} could not save the files in its Hop Received folder, so nothing was sent. \
+             {DOWNLOADS_FOLDER}"
+        ),
         TransferFailure::Refused(Refusal::TooMany) => {
             refused("it takes at most 1,000 files at once".to_owned())
         }
@@ -146,12 +153,21 @@ fn failed_sending(reason: &TransferFailure, peer: &str) -> String {
             "Nothing was sent: {peer} cannot receive files (its Hop is older, or receiving files \
              is turned off there)."
         ),
+        TransferFailure::NoAnswer => format!(
+            "{peer} did not answer, so nothing was sent. On a Mac, allow Hop to use the Downloads \
+             folder (macOS asks on the Mac's screen), then drop the files again."
+        ),
         TransferFailure::Disconnected => partly("the connection closed"),
         TransferFailure::TimedOut => partly("nothing moved for 30 seconds"),
         TransferFailure::Corrupt => partly("a file arrived damaged, so it was not kept"),
+        // This computer's own failure, and the other computer's, apart: the
+        // other one's Activity says what went wrong there.
         TransferFailure::Io => {
-            partly("a file could not be read (it may have changed while it was sent)")
+            partly("a file could not be read here (it may have changed while it was sent)")
         }
+        TransferFailure::PeerFailed => partly(&format!(
+            "{peer} could not save a file (its disk may be full)"
+        )),
     }
 }
 
@@ -160,13 +176,14 @@ fn failed_receiving(reason: &TransferFailure, peer: &str) -> String {
     let partly = |why: &str| {
         format!(
             "Not all the files from {peer} arrived: {why}. The ones that arrived complete are \
-             in the Received folder."
+             in the Hop Received folder."
         )
     };
     match reason {
-        TransferFailure::Refused(Refusal::Off) => {
-            refused("receiving files is turned off on this computer")
-        }
+        TransferFailure::Refused(Refusal::Off) => format!(
+            "Could not take the files from {peer}: Hop cannot save them in this computer's Hop \
+             Received folder. {DOWNLOADS_FOLDER}"
+        ),
         TransferFailure::Refused(Refusal::TooMany) => refused("more than 1,000 files at once"),
         TransferFailure::Refused(Refusal::TooLarge) => {
             refused("a file is over 4 GB, or all of them together are over 16 GB")
@@ -177,10 +194,18 @@ fn failed_receiving(reason: &TransferFailure, peer: &str) -> String {
         TransferFailure::Refused(Refusal::BadNames) => {
             refused("a file name cannot be used on this computer")
         }
+        TransferFailure::NoAnswer => format!(
+            "Files from {peer} did not come: {peer} most likely stopped waiting for this \
+             computer's answer (on a Mac, the first files wait until you allow Hop to use the \
+             Downloads folder). Drop them again on {peer}."
+        ),
         TransferFailure::Disconnected => partly("the connection closed"),
         TransferFailure::TimedOut => partly("nothing arrived for 30 seconds"),
         TransferFailure::Corrupt => partly("a file arrived damaged, so it was not kept"),
-        TransferFailure::Io => partly("a file could not be saved (the disk may be full)"),
+        TransferFailure::Io => partly("a file could not be saved here (the disk may be full)"),
+        TransferFailure::PeerFailed => partly(&format!(
+            "{peer} stopped sending them (a file there may have changed while it was sent)"
+        )),
         // Only the sending side says these.
         TransferFailure::NothingToSend | TransferFailure::NotSupported => {
             partly("the transfer stopped")
@@ -192,17 +217,19 @@ fn failed_receiving(reason: &TransferFailure, peer: &str) -> String {
 /// names a file.
 pub(crate) fn failure_kind(reason: &TransferFailure) -> &'static str {
     match reason {
-        TransferFailure::Refused(Refusal::Off) => "refused: receiving files is off",
+        TransferFailure::Refused(Refusal::Off) => "refused: the Received folder cannot be used",
         TransferFailure::Refused(Refusal::TooMany) => "refused: too many files",
         TransferFailure::Refused(Refusal::TooLarge) => "refused: too large",
         TransferFailure::Refused(Refusal::Busy) => "refused: busy",
         TransferFailure::Refused(Refusal::BadNames) => "refused: unusable names",
         TransferFailure::NothingToSend => "nothing to send",
         TransferFailure::NotSupported => "not supported",
+        TransferFailure::NoAnswer => "no answer",
         TransferFailure::Disconnected => "disconnected",
         TransferFailure::TimedOut => "timed out",
         TransferFailure::Corrupt => "a file arrived damaged",
-        TransferFailure::Io => "a file could not be read or written",
+        TransferFailure::Io => "a file could not be read or saved here",
+        TransferFailure::PeerFailed => "the other computer could not go on",
     }
 }
 
@@ -318,10 +345,12 @@ mod tests {
             TransferFailure::Refused(Refusal::BadNames),
             TransferFailure::NothingToSend,
             TransferFailure::NotSupported,
+            TransferFailure::NoAnswer,
             TransferFailure::Disconnected,
             TransferFailure::TimedOut,
             TransferFailure::Corrupt,
             TransferFailure::Io,
+            TransferFailure::PeerFailed,
         ];
         let sending: Vec<String> = reasons
             .iter()
@@ -333,9 +362,13 @@ mod tests {
         }
         let distinct: std::collections::BTreeSet<&String> = sending.iter().collect();
         assert_eq!(distinct.len(), reasons.len(), "{sending:#?}");
+        // The Received folder cannot be used: on a Mac, Hop is not allowed
+        // the Downloads folder. docs/INSTALL.md quotes this line.
         assert_eq!(
-            failed(true, &TransferFailure::Refused(Refusal::Off), "Windows PC"),
-            "Windows PC did not take the files: receiving files is turned off there."
+            failed(true, &TransferFailure::Refused(Refusal::Off), "Mac"),
+            "Mac could not save the files in its Hop Received folder, so nothing was sent. On a \
+             Mac, switch on Downloads Folder for Hop in System Settings > Privacy & Security > \
+             Files & Folders."
         );
         assert_eq!(
             failed(true, &TransferFailure::Disconnected, "Windows PC"),
@@ -347,6 +380,14 @@ mod tests {
             "Nothing was sent to Windows PC: none of the dropped items is a file Hop can read \
              (folders are not sent)."
         );
+        // The first files to a Mac wait for its Downloads permission: an
+        // offer nobody answered sent nothing, and dropping again works.
+        // docs/INSTALL.md quotes the start of this line.
+        assert_eq!(
+            failed(true, &TransferFailure::NoAnswer, "Mac"),
+            "Mac did not answer, so nothing was sent. On a Mac, allow Hop to use the Downloads \
+             folder (macOS asks on the Mac's screen), then drop the files again."
+        );
 
         // The receiving side says it in its own words.
         assert_eq!(
@@ -354,9 +395,44 @@ mod tests {
             "Turned down files from Mac: this computer is busy with other files."
         );
         assert_eq!(
+            failed(false, &TransferFailure::Refused(Refusal::Off), "Windows PC"),
+            "Could not take the files from Windows PC: Hop cannot save them in this computer's \
+             Hop Received folder. On a Mac, switch on Downloads Folder for Hop in System \
+             Settings > Privacy & Security > Files & Folders."
+        );
+        assert_eq!(
             failed(false, &TransferFailure::Corrupt, "Mac"),
             "Not all the files from Mac arrived: a file arrived damaged, so it was not kept. The \
-             ones that arrived complete are in the Received folder."
+             ones that arrived complete are in the Hop Received folder."
+        );
+
+        // Each side tells its own failure apart from the other computer's.
+        assert_eq!(
+            failed(true, &TransferFailure::Io, "Windows PC"),
+            "Not all the files reached Windows PC: a file could not be read here (it may have \
+             changed while it was sent). The ones that arrived complete are kept there."
+        );
+        assert_eq!(
+            failed(true, &TransferFailure::PeerFailed, "Windows PC"),
+            "Not all the files reached Windows PC: Windows PC could not save a file (its disk \
+             may be full). The ones that arrived complete are kept there."
+        );
+        assert_eq!(
+            failed(false, &TransferFailure::Io, "Mac"),
+            "Not all the files from Mac arrived: a file could not be saved here (the disk may be \
+             full). The ones that arrived complete are in the Hop Received folder."
+        );
+        assert_eq!(
+            failed(false, &TransferFailure::PeerFailed, "Mac"),
+            "Not all the files from Mac arrived: Mac stopped sending them (a file there may have \
+             changed while it was sent). The ones that arrived complete are in the Hop Received \
+             folder."
+        );
+        assert_eq!(
+            failed(false, &TransferFailure::NoAnswer, "Windows PC"),
+            "Files from Windows PC did not come: Windows PC most likely stopped waiting for this \
+             computer's answer (on a Mac, the first files wait until you allow Hop to use the \
+             Downloads folder). Drop them again on Windows PC."
         );
         for reason in &reasons {
             let line = failed(false, reason, "Mac");

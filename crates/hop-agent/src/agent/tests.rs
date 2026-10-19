@@ -600,22 +600,28 @@ fn the_clipboard_follows_its_enter_even_when_another_message_comes_next() {
     assert_eq!(link.sent(), [enter, copied(), heartbeat]);
 }
 
-#[test]
-fn reading_the_clipboard_holds_up_nothing_else_the_cursor_leaving_does() {
-    // The controlled side: the Leave comes before letting go of what was
-    // injected, and the clipboard is read only once that is done.
-    let (mut exec, fake, link) = syncing_executor(Os::Windows, mac_id());
-    let _ = exec.execute(vec![inject_from_mac(KeyCode::LEFT_SHIFT, true)]);
-    fake.state().calls.clear();
-    let leave = CoreMessage::Leave {
-        seq: 1,
+/// A `Leave` from the PC back to the Mac.
+fn leave_to_the_mac(seq: u64) -> CoreMessage {
+    CoreMessage::Leave {
+        seq,
         to: mac_id(),
         entry: EntryPoint {
             display_id: 1,
             edge: Edge::Right,
             position: Point::new(1511.0, 400.0),
         },
-    };
+    }
+}
+
+#[test]
+fn the_controlled_side_sends_its_clipboard_before_its_leave() {
+    // The clipboard is read and sent before the Leave, so the controller
+    // has the text before it takes its keyboard back; letting go of what
+    // was injected and hiding the cursor come after, as the core asked.
+    let (mut exec, fake, link) = syncing_executor(Os::Windows, mac_id());
+    let _ = exec.execute(vec![inject_from_mac(KeyCode::LEFT_SHIFT, true)]);
+    fake.state().calls.clear();
+    let leave = leave_to_the_mac(1);
     let _ = exec.execute(vec![
         Action::Send {
             to: mac_id(),
@@ -624,17 +630,43 @@ fn reading_the_clipboard_holds_up_nothing_else_the_cursor_leaving_does() {
         Action::ReleaseAllInjected,
         Action::ConcealCursor,
     ]);
-    assert_eq!(link.sent(), [leave, copied()]);
+    assert_eq!(link.sent(), [copied(), leave]);
     let state = fake.state();
     assert_eq!(
         state.calls,
         [
+            Call::ReadClipboard,
             Call::Inject(key(KeyCode::LEFT_SHIFT, false)),
             Call::ReleaseAll,
             Call::Conceal,
-            Call::ReadClipboard,
         ]
     );
+}
+
+#[test]
+fn a_leave_goes_even_when_the_clipboard_cannot_be_read_or_sent() {
+    for (read, send) in [(false, true), (true, false)] {
+        let (mut exec, fake, link) = syncing_executor(Os::Windows, mac_id());
+        fake.state().fail_clipboard_read = !read;
+        if !send {
+            link.net().refuse_clipboard = Some(|| SendError::Overloaded);
+        }
+        let leave = leave_to_the_mac(1);
+        let _ = exec.execute(vec![
+            Action::Send {
+                to: mac_id(),
+                msg: leave.clone(),
+            },
+            Action::ReleaseAllInjected,
+        ]);
+        assert_eq!(link.sent(), [leave], "read {read}, send {send}");
+        // Nothing is left over for later: the Leave's chance has passed.
+        let _ = exec.execute(vec![Action::Send {
+            to: mac_id(),
+            msg: CoreMessage::Heartbeat { seq: 2 },
+        }]);
+        assert_eq!(link.sent_clipboard(), []);
+    }
 }
 
 #[test]
@@ -1277,23 +1309,16 @@ impl Rig {
     }
 
     /// The PC hands the cursor back to the Mac through its left edge, as
-    /// the session `seq` ends; `then` arrives right after the `Leave`.
-    fn come_back(&mut self, seq: u64, then: Option<NetEvent>) {
-        self.link.deliver(NetEvent::Message {
-            from: pc_id(),
-            msg: CoreMessage::Leave {
-                seq,
-                to: mac_id(),
-                entry: EntryPoint {
-                    display_id: 1,
-                    edge: Edge::Right,
-                    position: Point::new(1511.0, 400.0),
-                },
-            },
-        });
-        if let Some(event) = then {
+    /// the session `seq` ends; `first` arrives right before the `Leave`, as
+    /// the PC's clipboard does.
+    fn come_back(&mut self, seq: u64, first: Option<NetEvent>) {
+        if let Some(event) = first {
             self.link.deliver(event);
         }
+        self.link.deliver(NetEvent::Message {
+            from: pc_id(),
+            msg: leave_to_the_mac(seq),
+        });
         let _ = self.agent.poll();
         assert_eq!(self.agent.state(), State::Idle);
     }
@@ -1364,7 +1389,7 @@ fn the_clipboard_goes_to_the_pc_right_after_enter() {
 }
 
 #[test]
-fn the_clipboard_goes_to_the_mac_right_after_leave() {
+fn the_clipboard_goes_to_the_mac_right_before_leave() {
     let mut rig = Rig::pc("Mac", |_| {});
     rig.connect(&EVERYTHING);
     let seq = mac_enters(&mut rig.agent, &rig.link);
@@ -1387,7 +1412,7 @@ fn the_clipboard_goes_to_the_mac_right_after_leave() {
     let sent = rig.link.net().sent.clone();
     assert_eq!(sent[leave].0, mac_id());
     assert_eq!(
-        sent.get(leave + 1),
+        leave.checked_sub(1).and_then(|text| sent.get(text)),
         Some(&(
             mac_id(),
             CoreMessage::ClipboardText {
@@ -1395,8 +1420,33 @@ fn the_clipboard_goes_to_the_mac_right_after_leave() {
                 text: "copied on the PC".to_owned()
             }
         )),
-        "right after the Leave, to the computer the cursor goes to"
+        "right before the Leave, to the computer the cursor goes to"
     );
+}
+
+/// The Mac writes the PC's text while it still controls the PC, before it
+/// takes its keyboard back: Cmd+V right after coming back pastes the text
+/// copied on the PC, not the Mac's old one.
+#[test]
+fn text_from_the_pc_is_on_the_clipboard_before_the_mac_has_its_keyboard_back() {
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    let seq = rig.cross();
+    rig.fake.state().calls.clear();
+    rig.come_back(seq, Some(clipboard_from(pc_id(), "copied on the PC")));
+    let state = rig.fake.state();
+    assert_eq!(state.clipboard.as_deref(), Some("copied on the PC"));
+    let written = state
+        .calls
+        .iter()
+        .position(|call| *call == Call::WriteClipboard)
+        .expect("written");
+    let keyboard_back = state
+        .calls
+        .iter()
+        .position(|call| *call == Call::SetMode(CaptureMode::Passive))
+        .expect("the keyboard came back");
+    assert!(written < keyboard_back, "{:?}", state.calls);
 }
 
 #[test]
@@ -1413,6 +1463,54 @@ fn what_was_copied_before_sharing_started_stays_here() {
     rig.cross();
     assert_eq!(rig.link.sent_clipboard(), []);
     assert_eq!(rig.fake.state().clipboard_reads, 0, "not even read");
+}
+
+/// A Mac whose clipboard could not say its change count as sharing
+/// started (it took too long, say), with `copied` on it from before.
+fn mac_with_an_unknown_start(copied: &str) -> Rig {
+    let (platform, fake) = Fake::new(1512.0, 982.0);
+    fake.copy(copied);
+    fake.state().fail_clipboard_count = true;
+    let rig = Rig::start(
+        (platform, fake),
+        settings(mac_id(), Os::MacOs, pc_id(), "PC", Edge::Right),
+        |_| {},
+        (Os::Windows, display(1536.0, 864.0)),
+    );
+    rig.fake.state().fail_clipboard_count = false;
+    rig
+}
+
+#[test]
+fn a_clipboard_count_unknown_at_the_start_never_pushes_what_was_there() {
+    let mut rig = mac_with_an_unknown_start("copied before sharing started");
+    rig.connect(&EVERYTHING);
+    let seq = rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), [], "fail closed");
+    assert_eq!(rig.fake.state().clipboard_reads, 0, "not even read");
+    rig.come_back(seq, None);
+    rig.fake.copy("copied while sharing");
+    rig.cross();
+    assert_eq!(
+        rig.link.sent_clipboard(),
+        [(pc_id(), "copied while sharing".to_owned())]
+    );
+}
+
+#[test]
+fn a_clipboard_count_unknown_at_the_start_is_read_again_between_sessions() {
+    let mut rig = mac_with_an_unknown_start("copied before sharing started");
+    rig.connect(&EVERYTHING);
+    // The slower checks run every few seconds; this one runs now.
+    rig.agent.next_display_check = Instant::now();
+    rig.agent.tick();
+    rig.fake.copy("copied while sharing");
+    rig.cross();
+    assert_eq!(
+        rig.link.sent_clipboard(),
+        [(pc_id(), "copied while sharing".to_owned())],
+        "the first crossing carries it"
+    );
 }
 
 #[test]
@@ -1467,6 +1565,25 @@ fn a_clipboard_that_could_not_be_read_is_tried_again_at_the_next_crossing() {
 }
 
 #[test]
+fn a_clipboard_that_cannot_be_read_is_explained_in_activity_once() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::mac("Unreadable PC", |_| {});
+    rig.connect(&EVERYTHING);
+    // As the Mac's clipboard is when macOS does not let Hop read it.
+    rig.fake.state().fail_clipboard_read = true;
+    rig.fake.copy("clipboard-secret-unread");
+    let seq = rig.cross();
+    rig.come_back(seq, None);
+    rig.fake.copy("clipboard-secret-unread-again");
+    rig.cross();
+    assert_eq!(rig.link.sent_clipboard(), []);
+    let log = logging::tests::captured_text();
+    let line = "Copied text did not go to Unreadable PC: the fake refuses to read the clipboard.";
+    assert_eq!(log.matches(line).count(), 1, "once a run:\n{log}");
+    assert!(!log.contains("clipboard-secret"));
+}
+
+#[test]
 fn text_from_the_other_computer_is_pasted_here_and_never_sent_back() {
     let mut rig = Rig::mac("PC", |_| {});
     rig.connect(&EVERYTHING);
@@ -1492,6 +1609,46 @@ fn text_from_the_other_computer_is_pasted_here_and_never_sent_back() {
         rig.link.sent_clipboard().last(),
         Some(&(pc_id(), "copied on the Mac again".to_owned()))
     );
+}
+
+#[test]
+fn text_that_could_not_be_written_is_written_by_a_later_tick() {
+    let _ = logging::tests::capture();
+    let mut rig = Rig::pc("Mac", |_| {});
+    rig.connect(&EVERYTHING);
+    // Another app holds the PC's clipboard as the Mac's text arrives.
+    rig.fake.state().fail_clipboard_write = true;
+    rig.deliver(clipboard_from(mac_id(), "clipboard-secret-from-the-mac"));
+    assert_eq!(rig.fake.state().clipboard, None);
+    rig.agent.tick();
+    rig.fake.state().fail_clipboard_write = false;
+    // The first try again comes 100 ms after the failure.
+    thread::sleep(Duration::from_millis(120));
+    rig.agent.tick();
+    assert_eq!(
+        rig.fake.state().clipboard.as_deref(),
+        Some("clipboard-secret-from-the-mac")
+    );
+    // Written once, and never sent back.
+    let seq = mac_enters(&mut rig.agent, &rig.link);
+    rig.deliver(NetEvent::Message {
+        from: mac_id(),
+        msg: CoreMessage::Motion {
+            seq,
+            mark: MotionMark {
+                n: 1,
+                total_dx: -50.0,
+                total_dy: 0.0,
+            },
+        },
+    });
+    assert_eq!(rig.link.sent_clipboard(), []);
+    let log = logging::tests::captured_text();
+    assert!(
+        log.contains("clipboard text on this computer's clipboard after all"),
+        "{log}"
+    );
+    assert!(!log.contains("clipboard-secret"));
 }
 
 #[test]
@@ -1812,6 +1969,13 @@ fn sent_and_failed_transfers_become_status_lines_only() {
             outgoing: false,
             reason: TransferFailure::Disconnected,
         },
+        // This computer could not use its Received folder: it says so too.
+        TransferEvent::Failed {
+            peer: pc_id(),
+            id: 10,
+            outgoing: false,
+            reason: TransferFailure::Refused(Refusal::Off),
+        },
     ] {
         rig.deliver(NetEvent::Transfer(transfer));
     }
@@ -1823,7 +1987,10 @@ fn sent_and_failed_transfers_become_status_lines_only() {
         "Status PC did not take the files: it is busy with other files. Drop these again once \
          those have arrived.",
         "Not all the files from Status PC arrived: the connection closed. The ones that arrived \
-         complete are in the Received folder.",
+         complete are in the Hop Received folder.",
+        "Could not take the files from Status PC: Hop cannot save them in this computer's Hop \
+         Received folder. On a Mac, switch on Downloads Folder for Hop in System Settings > \
+         Privacy & Security > Files & Folders.",
     ] {
         assert!(log.contains(line), "{line:?} is not in the log:\n{log}");
     }

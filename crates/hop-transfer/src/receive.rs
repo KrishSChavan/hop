@@ -1,5 +1,6 @@
 //! Saving a file that arrives in pieces: under a temporary name first,
-//! hashed while written, and renamed only once it checks out.
+//! hashed while written, marked as coming from another computer, and
+//! renamed only once it checks out.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -16,6 +17,18 @@ use crate::names::{MAX_NAME_BYTES, cut, free_path, sanitize};
 /// to `.<name>.hop-part` in the Received folder, where `<name>` is its
 /// cleaned name, shortened if needed.
 pub const TEMP_SUFFIX: &str = ".hop-part";
+
+/// Windows' Mark of the Web, as browsers write it on a download: the file
+/// came from the internet zone (3). It lives in the file's
+/// `Zone.Identifier` stream ([`zone_identifier`]). With it, SmartScreen,
+/// Office's Protected View and Office's block on macros from the internet
+/// check a received file as they check a download: a file downloaded on
+/// one computer does not become trusted by moving to the other.
+#[cfg_attr(
+    not(any(windows, test)),
+    expect(dead_code, reason = "only Windows marks files this way")
+)]
+const MARK_OF_THE_WEB: &str = "[ZoneTransfer]\r\nZoneId=3\r\n";
 
 /// How many temporary names [`IncomingFile::create`] tries when one is
 /// taken: `.<name>.hop-part`, then `.<name>.2.hop-part` and so on.
@@ -52,14 +65,30 @@ pub enum ReceiveError {
     Io(#[from] io::Error),
 }
 
+/// A file that arrived complete and was saved, from
+/// [`IncomingFile::finish`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Saved {
+    /// Where the file is, under its final name. For the app to show; never
+    /// for the log.
+    pub path: PathBuf,
+    /// True when this system marks files that came from another computer
+    /// but the mark could not be written, so the file was saved without
+    /// it. On Windows that is the Mark of the Web, which a drive without
+    /// alternate data streams (FAT, exFAT) cannot keep; Windows saves
+    /// downloads there unmarked too. Always false where Hop writes no mark
+    /// itself.
+    pub unmarked: bool,
+}
+
 /// One file arriving from the other computer, from its first byte until
 /// it is saved.
 ///
 /// [`create`](Self::create) opens a new temporary file in the folder,
 /// [`write`](Self::write) appends the pieces in order while hashing them,
-/// and [`finish`](Self::finish) checks the size and the SHA-256 and gives
-/// the file its final name. Dropping it before `finish` succeeds deletes
-/// the temporary file.
+/// and [`finish`](Self::finish) checks the size and the SHA-256, marks the
+/// file as coming from another computer and gives it its final name.
+/// Dropping it before `finish` succeeds deletes the temporary file.
 pub struct IncomingFile {
     dir: PathBuf,
     /// The cleaned name the file gets once it checks out.
@@ -128,16 +157,21 @@ impl IncomingFile {
         self.written
     }
 
-    /// Checks that every byte arrived and that they match `expected`, then
-    /// renames the file to a free name in the folder ([`free_path`]) and
-    /// returns where it is.
+    /// Checks that every byte arrived and that they match `expected`, marks
+    /// the file as coming from another computer (on Windows, the Mark of
+    /// the Web) while it still has its temporary name, so it never has its
+    /// real name unmarked, then renames it to a free name in the folder
+    /// ([`free_path`]) and returns where it is.
+    ///
+    /// A mark that cannot be written does not stop the file: it is saved
+    /// all the same, and [`Saved::unmarked`] says so.
     ///
     /// # Errors
     ///
     /// [`ReceiveError::TooShort`], [`ReceiveError::Corrupt`], or
     /// [`ReceiveError::Io`] if the rename fails. The temporary file is
     /// deleted in every case.
-    pub fn finish(mut self, expected: &Digest) -> Result<PathBuf, ReceiveError> {
+    pub fn finish(mut self, expected: &Digest) -> Result<Saved, ReceiveError> {
         if self.written != self.size {
             return Err(ReceiveError::TooShort {
                 expected: self.size,
@@ -148,8 +182,11 @@ impl IncomingFile {
         if digest != *expected {
             return Err(ReceiveError::Corrupt);
         }
-        // Closed before the rename, so nothing holds the finished file open.
+        // Closed before the mark and the rename, so nothing holds the
+        // finished file open.
         drop(self.file.take());
+        // The mark stays with the file through the rename.
+        let unmarked = mark_from_elsewhere(&self.temp).is_err();
         let _placing = PLACING.lock().unwrap_or_else(PoisonError::into_inner);
         // A received file never gets a name the sweep would take for a
         // leftover temporary file.
@@ -161,8 +198,44 @@ impl IncomingFile {
         let path = free_path(&self.dir, &name)?;
         fs::rename(&self.temp, &path)?;
         self.placed = true;
-        Ok(path)
+        Ok(Saved { path, unmarked })
     }
+}
+
+/// Marks the file at `path` as one that came from another computer, as a
+/// browser marks a download, so that the system checks it before it is
+/// opened as it checks a download.
+///
+/// - **Windows:** the Mark of the Web ([`MARK_OF_THE_WEB`]), written to the
+///   file's `Zone.Identifier` stream with `std::fs`. It fails on a drive
+///   that keeps no alternate data streams (FAT, exFAT).
+/// - **macOS:** nothing is written here. Hop.app's Info.plist sets
+///   `LSFileQuarantineEnabled`, so macOS itself quarantines every file Hop
+///   creates, this one included.
+/// - **Elsewhere:** nothing.
+fn mark_from_elsewhere(path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        fs::write(zone_identifier(path), MARK_OF_THE_WEB)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// The stream that holds the Mark of the Web of the file at `path`:
+/// `<path>:Zone.Identifier`, an alternate data stream of the file itself,
+/// which moves with it when it is renamed.
+#[cfg_attr(
+    not(any(windows, test)),
+    expect(dead_code, reason = "only Windows marks files this way")
+)]
+fn zone_identifier(path: &Path) -> PathBuf {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    PathBuf::from(stream)
 }
 
 impl Drop for IncomingFile {
@@ -265,13 +338,16 @@ mod tests {
         Sha256::digest(bytes).into()
     }
 
-    /// Receives `content` as `name` in one piece per `piece` bytes.
+    /// Receives `content` as `name` in one piece per `piece` bytes, and
+    /// returns where it was saved. Every test folder can keep the mark.
     fn receive(dir: &Path, name: &str, content: &[u8], piece: usize) -> PathBuf {
         let mut file = IncomingFile::create(dir, name, content.len() as u64).unwrap();
         for chunk in content.chunks(piece.max(1)) {
             file.write(chunk).unwrap();
         }
-        file.finish(&sha256(content)).unwrap()
+        let saved = file.finish(&sha256(content)).unwrap();
+        assert!(!saved.unmarked);
+        saved.path
     }
 
     #[test]
@@ -291,9 +367,15 @@ mod tests {
             "not before finish"
         );
         let saved = file.finish(&sha256(&content)).unwrap();
-        assert_eq!(saved, scratch.path().join("greeting.txt"));
+        assert_eq!(
+            saved,
+            Saved {
+                path: scratch.path().join("greeting.txt"),
+                unmarked: false,
+            }
+        );
         assert_eq!(scratch.names(), ["greeting.txt"]);
-        assert_eq!(fs::read(&saved).unwrap(), content);
+        assert_eq!(fs::read(&saved.path).unwrap(), content);
     }
 
     #[test]
@@ -323,7 +405,7 @@ mod tests {
         let scratch = Scratch::new("receive-empty");
         let file = IncomingFile::create(scratch.path(), "empty", 0).unwrap();
         let saved = file.finish(&sha256(b"")).unwrap();
-        assert_eq!(fs::read(saved).unwrap(), b"");
+        assert_eq!(fs::read(saved.path).unwrap(), b"");
     }
 
     #[test]
@@ -444,6 +526,53 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("target.txt"), dir.join(".link.hop-part")).unwrap();
         assert_eq!(sweep(dir).unwrap(), 0);
         assert_eq!(fs::read(dir.join("target.txt")).unwrap(), b"keep me");
+    }
+
+    /// The Mark of the Web goes in the file's own `Zone.Identifier` stream,
+    /// written to the temporary name, so the saved file carries it.
+    #[test]
+    fn the_mark_of_the_web_is_the_files_zone_identifier_stream() {
+        let temp = Path::new(r"C:\Users\Krish\Downloads\Hop Received\.notes.txt.hop-part");
+        assert_eq!(
+            zone_identifier(temp),
+            PathBuf::from(
+                r"C:\Users\Krish\Downloads\Hop Received\.notes.txt.hop-part:Zone.Identifier"
+            )
+        );
+        // As a browser writes it for a download: from the internet zone.
+        assert_eq!(MARK_OF_THE_WEB, "[ZoneTransfer]\r\nZoneId=3\r\n");
+    }
+
+    /// On Windows a received file is checked as a download is: it carries
+    /// the Mark of the Web under its final name, written before the rename
+    /// (the only time its temporary name exists), and the stream is no
+    /// file of its own in the folder.
+    #[cfg(windows)]
+    #[test]
+    fn a_received_file_carries_the_mark_of_the_web() {
+        let scratch = Scratch::new("receive-mark");
+        let mut file = IncomingFile::create(scratch.path(), "setup.exe", 2).unwrap();
+        file.write(b"MZ").unwrap();
+        let saved = file.finish(&sha256(b"MZ")).unwrap();
+        assert!(!saved.unmarked);
+        assert_eq!(
+            fs::read_to_string(zone_identifier(&saved.path)).unwrap(),
+            MARK_OF_THE_WEB
+        );
+        assert_eq!(fs::read(&saved.path).unwrap(), b"MZ");
+        assert_eq!(scratch.names(), ["setup.exe"]);
+    }
+
+    /// Elsewhere Hop writes no mark of its own (on the Mac, macOS
+    /// quarantines what Hop.app creates), and nothing extra appears.
+    #[cfg(not(windows))]
+    #[test]
+    fn elsewhere_hop_writes_no_mark_of_its_own() {
+        let scratch = Scratch::new("receive-no-mark");
+        let file = IncomingFile::create(scratch.path(), "setup.exe", 0).unwrap();
+        let saved = file.finish(&sha256(b"")).unwrap();
+        assert!(!saved.unmarked);
+        assert_eq!(scratch.names(), ["setup.exe"]);
     }
 
     #[test]

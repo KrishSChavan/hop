@@ -30,9 +30,9 @@
 //!   changes also go to an unbounded channel, with a `send` that never
 //!   waits, so a slow app can never hold this thread up.
 //! - **The clipboard** (docs/M4-M5-DESIGN.md, section 4): text goes out
-//!   right after the `Enter` or `Leave` the cursor leaves with, and text
-//!   that arrives is written before the next event; the core never sees it
-//!   ([`clipboard`]).
+//!   right after the `Enter` or right before the `Leave` the cursor leaves
+//!   with, and text that arrives is written before the next event; the core
+//!   never sees it ([`clipboard`]).
 //! - **Files** (section 5.3): the drop zones follow the edges that lead to
 //!   the other computer while it is connected and takes files; files
 //!   dropped there go to it, and what happens to them becomes status lines
@@ -417,17 +417,24 @@ impl<L: Link> Agent<L> {
         busy
     }
 
-    /// One tick: timers, the lease, files dropped at the edge, and the
-    /// slower checks.
+    /// One tick: timers, the lease, files dropped at the edge, clipboard
+    /// text still waiting to be written, and the slower checks.
     pub(crate) fn tick(&mut self) {
         self.feed(Event::Tick);
         self.renew_lease();
         self.send_drops();
         let now = Instant::now();
+        self.exec.retry_clipboard_write(now);
         if now >= self.next_display_check {
             self.next_display_check = now + DISPLAY_CHECK;
             self.check_displays();
             self.check_local_network();
+            // A clipboard count that could not be read as sharing started
+            // is read again, but only while no session runs: a clipboard
+            // that hangs (up to `CLIPBOARD_TIMEOUT`) then holds up no one.
+            if self.core.state() == State::Idle {
+                self.exec.learn_clipboard_start();
+            }
         }
     }
 

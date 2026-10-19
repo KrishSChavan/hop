@@ -93,8 +93,10 @@ pub struct FileEntry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileRefusal {
-    /// Receiving files is turned off there, or its Received folder cannot be
-    /// created.
+    /// The receiver cannot use its Received folder: it cannot be created or
+    /// opened (on a Mac, Hop may not be allowed to use the Downloads
+    /// folder). A receiver with receiving turned off does not negotiate
+    /// `files`, so it is never offered files to refuse.
     Off,
     /// More files than the receiver takes in one transfer.
     TooMany,

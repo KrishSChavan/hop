@@ -40,7 +40,9 @@ use crate::{CloseCode, TransferEvent};
 /// reported as `Failed` with
 /// [`TransferFailure::Disconnected`](crate::TransferFailure::Disconnected)
 /// just before its `PeerDown`, or before the `PeerUp` of the connection
-/// that replaces it. Only a shutdown ends transfers without a report.
+/// that replaces it. Only a shutdown ends transfers without a report. (An
+/// offer the receiving side did not take is reported there only when the
+/// cause is its own; see [`TransferEvent`].)
 #[derive(Clone, Debug, PartialEq)]
 pub enum NetEvent {
     /// A paired peer finished its `Hello` exchange on a connection that is

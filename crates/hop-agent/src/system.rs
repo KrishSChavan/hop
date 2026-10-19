@@ -6,11 +6,13 @@
 //! The permission and the name go through `hop-platform`'s backends, like
 //! every other OS call; folders, files and the Settings pane open with the
 //! OS's own `open` (macOS) or `explorer` (Windows), on a thread of their
-//! own, so neither the app nor the agent ever waits for them.
+//! own, so neither the app nor the agent ever waits for them, and with
+//! their output thrown away, so nothing they print (a received file's
+//! path, say) reaches Hop's terminal or a log.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use hop_platform::PermissionState;
 
@@ -205,7 +207,16 @@ fn folder_command(dir: &Path) -> Option<Command> {
 /// Runs `command` on a thread of its own and waits for it there, so the app
 /// never waits and no finished process is left behind. A failure becomes a
 /// status line naming `what`.
+///
+/// The command reads nothing and its output goes nowhere. `open -R` prints
+/// the full path of a received file when it cannot show it, and Hop's own
+/// output can end up in a log file (`scripts/macos/run-agent.sh` keeps
+/// it), which must never hold a file name.
 fn launch(mut command: Command, what: &'static str) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let started = std::thread::Builder::new()
         .name("hop-open".into())
         .spawn(move || {
@@ -354,6 +365,47 @@ mod tests {
         } else {
             assert_eq!((selected, opened), (None, None));
         }
+    }
+
+    /// What a launched command prints goes nowhere, so a received file's
+    /// path never reaches Hop's terminal or a log. A shell stands in for
+    /// `open`: it looks at its own input and outputs and writes what it
+    /// found to a file.
+    #[cfg(unix)]
+    #[test]
+    fn a_launched_command_reads_and_prints_nothing_of_hops() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!(
+            "hop-agent-launch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("report");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                "found=''; for fd in 0 1 2; do \
+                 if [ /dev/fd/$fd -ef /dev/null ]; then found=\"$found null\"; \
+                 else found=\"$found other\"; fi; done; \
+                 echo \"$found\" > \"$1.part\" && mv \"$1.part\" \"$1\"",
+            )
+            .arg("sh")
+            .arg(&report);
+        launch(command, "a test command");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let found = loop {
+            if let Ok(found) = std::fs::read_to_string(&report) {
+                break found;
+            }
+            assert!(Instant::now() < deadline, "the command did not run");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found.trim(), "null null null");
     }
 
     /// Off the Mac nothing needs a permission. (On the Mac the check would

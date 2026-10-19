@@ -13,6 +13,13 @@ use hop_types::DeviceId;
 /// [`NetEvent::Transfer`](crate::NetEvent::Transfer): exactly one per
 /// transfer, before its connection's `PeerDown` or the `PeerUp` of the
 /// connection that replaces it. Only a shutdown ends transfers without one.
+///
+/// An offer the receiving computer did not take ends there with a `Failed`
+/// too, but only when the cause is on that computer, so the user can see
+/// it where it can be fixed: its Received folder cannot be used
+/// ([`Refusal::Off`]), or it was ready only after the sender stopped
+/// waiting ([`TransferFailure::NoAnswer`]). Other refusals are told on the
+/// sending side alone.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransferEvent {
     /// Files from the other computer arrived complete and were saved in the
@@ -65,25 +72,43 @@ pub enum TransferFailure {
     /// The other computer cannot receive files: its Hop is too old, or
     /// receiving files is turned off there.
     NotSupported,
+    /// The offer was not answered in time, so no file moved. Sending: the
+    /// other computer did not answer within
+    /// [`Limits::answer_timeout`](crate::Limits::answer_timeout) (2
+    /// minutes); on a Mac, the first files wait until the user allows Hop
+    /// to use the Downloads folder. Receiving: this computer's folder was
+    /// ready only after the other computer had stopped waiting, so no
+    /// answer went; or this computer accepted the files but they did not
+    /// start coming within 30 seconds, most likely because the answer came
+    /// too late.
+    NoAnswer,
     /// The connection to the other computer closed during the transfer.
     Disconnected,
-    /// The other computer did not answer, or the transfer made no progress,
-    /// for 30 seconds.
+    /// The transfer made no progress for 30 seconds, or the receiver's
+    /// outcome did not come within 30 seconds of the data.
     TimedOut,
     /// A file arrived damaged (it did not match its checksum), so it was not
     /// kept.
     Corrupt,
-    /// A file could not be read or written: for example, it changed while it
-    /// was being sent, or the disk is full. Also when the other computer
-    /// broke the transfer off.
+    /// This computer could not go on: sending, a file could not be read
+    /// (it changed while it was being sent, say); receiving, a file could
+    /// not be saved (the disk is full, say).
     Io,
+    /// The other computer could not go on: sending, it could not save a
+    /// file (its disk is full, say); receiving, it stopped sending (a file
+    /// there changed while it was being sent, say). Its own report says
+    /// why.
+    PeerFailed,
 }
 
 /// Why the receiving computer turned files down.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// Receiving files is turned off on that computer, or its Received
-    /// folder cannot be used.
+    /// That computer cannot save files in its Received folder: the folder
+    /// cannot be created or used. On a Mac, Hop may not be allowed to use
+    /// the Downloads folder (System Settings > Privacy & Security > Files &
+    /// Folders). (A computer with receiving files turned off never refuses:
+    /// it does not offer `files` at all, so nothing is offered to it.)
     Off,
     /// More files than one transfer can carry (1,000).
     TooMany,

@@ -12,7 +12,9 @@
 //!    survives the sanitizer, and it is not busy (one transfer running and
 //!    at most `max_waiting_transfers` waiting). The first offer of a run is
 //!    the first time the folder is touched: it is created then and swept of
-//!    leftover temporary files.
+//!    leftover temporary files. An offer the folder was ready for only after
+//!    `answer_timeout` (on a Mac, the user allowed the Downloads folder
+//!    late) gets no answer: the sender has stopped waiting.
 //! 3. After an accepted `Answer`, the sender opens one unidirectional
 //!    stream at priority −1 and writes the transfer id (8 bytes,
 //!    big-endian), then for each file exactly `size` bytes and their
@@ -24,9 +26,12 @@
 //!    `Outcome`.
 //!
 //! The receiver allows the peer one unidirectional stream at a time, and
-//! only once `files` is negotiated; the transport settings allow none. An
-//! answer, and every stretch of a transfer, must come within
-//! `transfer_timeout`. Any failure deletes the temporary files of that
+//! only once `files` is negotiated; the transport settings allow none. The
+//! answer must come within `answer_timeout` (the receiver may be waiting
+//! for its folder), and every stretch of a transfer after it within
+//! `transfer_timeout`. An offer that goes unanswered, on either side, is
+//! [`TransferFailure::NoAnswer`], as is an accepted one whose data does not
+//! start in time. Any failure deletes the temporary files of that
 //! transfer, stops its stream and, while the connection is up, sends an
 //! `Outcome` with the reason; a file never closes the connection. A
 //! connection that ends takes its transfers with it, and those that were
@@ -163,6 +168,8 @@ impl Drop for Reservation {
 struct Offered {
     id: u64,
     files: Vec<FileEntry>,
+    /// When it arrived: the sender waits `answer_timeout` from about then.
+    arrived: Instant,
 }
 
 /// A transfer waiting to be sent.
@@ -274,7 +281,12 @@ impl ConnFiles {
     pub(crate) fn on_message(&self, message: FileMessage) {
         match message {
             FileMessage::Offer { id, files } => {
-                if let Err(full) = self.offers.try_send(Offered { id, files }) {
+                let offered = Offered {
+                    id,
+                    files,
+                    arrived: Instant::now(),
+                };
+                if let Err(full) = self.offers.try_send(offered) {
                     let id = match full {
                         mpsc::error::TrySendError::Full(offer)
                         | mpsc::error::TrySendError::Closed(offer) => offer.id,
@@ -539,20 +551,35 @@ pub(super) fn refusal(refusal: FileRefusal) -> Refusal {
     }
 }
 
-/// The agent's word for a failure from the wire, on either side.
-pub(super) fn failure(failure: FileFailure) -> TransferFailure {
+/// The receiving side's word for why it stopped: its own failure (a file
+/// it could not save) kept apart from the sender's (the data broke off).
+pub(super) fn receiving_failure(failure: FileFailure) -> TransferFailure {
     match failure {
         FileFailure::Corrupt => TransferFailure::Corrupt,
         FileFailure::TimedOut => TransferFailure::TimedOut,
-        // The other side broke off, or a file could not be read or written.
-        FileFailure::Incomplete | FileFailure::Disk | FileFailure::Cancelled => TransferFailure::Io,
+        FileFailure::Disk => TransferFailure::Io,
+        // The sender reset the stream, or ended it early.
+        FileFailure::Incomplete | FileFailure::Cancelled => TransferFailure::PeerFailed,
+    }
+}
+
+/// The sending side's word for the failure the receiver's outcome gives:
+/// the receiver could not go on (a file it could not save, or data it says
+/// broke off), which is not this side's own failure.
+pub(super) fn outcome_failure(failure: FileFailure) -> TransferFailure {
+    match failure {
+        FileFailure::Corrupt => TransferFailure::Corrupt,
+        FileFailure::TimedOut => TransferFailure::TimedOut,
+        FileFailure::Disk | FileFailure::Incomplete | FileFailure::Cancelled => {
+            TransferFailure::PeerFailed
+        }
     }
 }
 
 /// A refusal, for the log.
 fn refusal_text(refusal: FileRefusal) -> &'static str {
     match refusal {
-        FileRefusal::Off => "receiving is off or the folder cannot be used",
+        FileRefusal::Off => "the Received folder cannot be used",
         FileRefusal::TooMany => "too many files",
         FileRefusal::TooLarge => "too large",
         FileRefusal::Busy => "busy",
@@ -564,7 +591,7 @@ fn refusal_text(refusal: FileRefusal) -> &'static str {
 fn describe(reason: &TransferFailure) -> &'static str {
     match reason {
         TransferFailure::Refused(refused) => match refused {
-            Refusal::Off => "refused: receiving is off there",
+            Refusal::Off => "refused: the Received folder there cannot be used",
             Refusal::TooMany => "refused: too many files",
             Refusal::TooLarge => "refused: too large",
             Refusal::Busy => "refused: busy",
@@ -572,10 +599,12 @@ fn describe(reason: &TransferFailure) -> &'static str {
         },
         TransferFailure::NothingToSend => "nothing that could be sent",
         TransferFailure::NotSupported => "the other device cannot receive files",
+        TransferFailure::NoAnswer => "no answer to the offer",
         TransferFailure::Disconnected => "disconnected",
         TransferFailure::TimedOut => "timed out",
         TransferFailure::Corrupt => "a file arrived damaged",
-        TransferFailure::Io => "a file could not be read or written",
+        TransferFailure::Io => "a file could not be read here",
+        TransferFailure::PeerFailed => "the other device could not save a file",
     }
 }
 
