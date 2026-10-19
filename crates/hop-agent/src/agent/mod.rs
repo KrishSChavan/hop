@@ -32,7 +32,8 @@
 //! - **The clipboard** (docs/M4-M5-DESIGN.md, section 4): text goes out
 //!   right after the `Enter` or right before the `Leave` the cursor leaves
 //!   with, and text that arrives is written before the next event; the core
-//!   never sees it ([`clipboard`]).
+//!   never sees it ([`clipboard`]). Text that could not be written is tried
+//!   again from the tick, but never while a crossing waits for its answer.
 //! - **Files** (section 5.3): the drop zones follow the edges that lead to
 //!   the other computer while it is connected and takes files; files
 //!   dropped there go to it, and what happens to them becomes status lines
@@ -418,13 +419,24 @@ impl<L: Link> Agent<L> {
     }
 
     /// One tick: timers, the lease, files dropped at the edge, clipboard
-    /// text still waiting to be written, and the slower checks.
+    /// text still waiting to be written (except while a crossing waits for
+    /// its answer), and the slower checks.
     pub(crate) fn tick(&mut self) {
         self.feed(Event::Tick);
         self.renew_lease();
         self.send_drops();
         let now = Instant::now();
-        self.exec.retry_clipboard_write(now);
+        // Not while a crossing waits for the other computer's answer: the
+        // `Enter` already read the clipboard's change count, and on a Mac
+        // whose clipboard waits on a slow app each call takes up to
+        // `CLIPBOARD_TIMEOUT`. A try on top could use up the time the
+        // other computer has to answer (`enter_timeout_ms`), and the
+        // crossing would fail although the answer is on its way. A
+        // crossing waits at most that long, so the first tick after the
+        // answer, or after the time is up, tries instead.
+        if !matches!(self.core.state(), State::Entering { .. }) {
+            self.exec.retry_clipboard_write(now);
+        }
         if now >= self.next_display_check {
             self.next_display_check = now + DISPLAY_CHECK;
             self.check_displays();

@@ -160,16 +160,35 @@ fn enter_seq(link: &FakeLink) -> u64 {
         .expect("an Enter was sent")
 }
 
-/// Pushes the Mac's cursor past its right edge and lets the PC accept.
-fn cross_to_the_pc(agent: &mut Agent<FakeLink>, fake: &Fake, link: &FakeLink) -> u64 {
+/// Pushes the Mac's cursor past its right edge: the `Enter` goes out, and
+/// the crossing waits for the PC's answer. Returns the session's `seq`.
+fn enter_the_pc(agent: &mut Agent<FakeLink>, fake: &Fake, link: &FakeLink) -> u64 {
     fake.state().cursor = Point::new(1505.0, 400.0);
     fake.motion(20.0, 0.0);
     let _ = agent.poll();
     let seq = enter_seq(link);
-    link.deliver(NetEvent::Message {
+    assert_eq!(
+        agent.state(),
+        State::Entering {
+            target: pc_id(),
+            seq
+        }
+    );
+    seq
+}
+
+/// The PC's answer to the `Enter` of session `seq`.
+fn enter_ack(seq: u64) -> NetEvent {
+    NetEvent::Message {
         from: pc_id(),
         msg: CoreMessage::EnterAck { seq },
-    });
+    }
+}
+
+/// Pushes the Mac's cursor past its right edge and lets the PC accept.
+fn cross_to_the_pc(agent: &mut Agent<FakeLink>, fake: &Fake, link: &FakeLink) -> u64 {
+    let seq = enter_the_pc(agent, fake, link);
+    link.deliver(enter_ack(seq));
     let _ = agent.poll();
     assert_eq!(
         agent.state(),
@@ -1649,6 +1668,68 @@ fn text_that_could_not_be_written_is_written_by_a_later_tick() {
         "{log}"
     );
     assert!(!log.contains("clipboard-secret"));
+}
+
+#[test]
+fn text_still_waiting_is_not_tried_again_while_a_crossing_waits_for_its_answer() {
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    let seq = rig.cross();
+    // Another app holds the Mac's clipboard as the PC's text comes back.
+    rig.fake.state().fail_clipboard_write = true;
+    rig.come_back(seq, Some(clipboard_from(pc_id(), "copied on the PC")));
+    rig.fake.state().fail_clipboard_write = false;
+    // A try again is due 100 ms after the failure, just as the cursor
+    // crosses again and the PC has not answered yet: the clipboard is
+    // left alone.
+    thread::sleep(Duration::from_millis(120));
+    let seq = enter_the_pc(&mut rig.agent, &rig.fake, &rig.link);
+    let calls = rig.fake.state().clipboard_calls;
+    rig.agent.tick();
+    assert_eq!(rig.fake.state().clipboard_calls, calls, "not even asked");
+    assert_eq!(rig.fake.state().clipboard, None);
+    // The first tick after the answer tries, and the text is written.
+    rig.deliver(enter_ack(seq));
+    assert_eq!(
+        rig.agent.state(),
+        State::Controlling {
+            target: pc_id(),
+            seq
+        }
+    );
+    rig.agent.tick();
+    assert_eq!(
+        rig.fake.state().clipboard.as_deref(),
+        Some("copied on the PC")
+    );
+}
+
+/// On a Mac whose clipboard waits on a slow app, every clipboard call gives
+/// up after `CLIPBOARD_TIMEOUT`. With the PC's text still waiting to be
+/// written there, crossing again waits for the `Enter`'s own look at the
+/// clipboard only, so the PC's answer still comes in time.
+#[test]
+fn a_clipboard_that_hangs_with_text_waiting_does_not_make_a_crossing_fail() {
+    let mut rig = Rig::mac("PC", |_| {});
+    rig.connect(&EVERYTHING);
+    let seq = rig.cross();
+    rig.fake.state().stall_clipboard = true;
+    // Writing the PC's text gives up, so a try again is due by the time
+    // the cursor crosses again.
+    rig.come_back(seq, Some(clipboard_from(pc_id(), "copied on the PC")));
+    let seq = enter_the_pc(&mut rig.agent, &rig.fake, &rig.link);
+    let calls = rig.fake.state().clipboard_calls;
+    rig.agent.tick();
+    assert_eq!(rig.fake.state().clipboard_calls, calls, "no try meanwhile");
+    rig.deliver(enter_ack(seq));
+    assert_eq!(
+        rig.agent.state(),
+        State::Controlling {
+            target: pc_id(),
+            seq
+        },
+        "the answer came in time"
+    );
 }
 
 #[test]

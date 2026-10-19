@@ -34,19 +34,30 @@
 //!
 //! Text from the other computer that cannot be written (another app holds
 //! the clipboard, say) waits as a pending write, tried again from the
-//! agent's tick for [`RETRY_WRITE_FOR`]: it goes once a try works, and is
-//! dropped when newer text arrives or when something is copied here
-//! meanwhile, which wins. Until something is copied here, what this
-//! clipboard holds is older than that text, so it is never sent back over
-//! it, not even once the text is given up. Only the text is kept for that,
-//! in memory; it is never logged.
+//! agent's tick for [`RETRY_WRITE_FOR`], though never while a crossing
+//! waits for its answer (`Agent::tick` says why): it goes once a try
+//! works, and is dropped when newer text arrives or when something is
+//! copied here meanwhile, which wins. Until something is copied here, what
+//! this clipboard holds is older than that text, so it is never sent back
+//! over it, not even once the text is given up. Only the text is kept for
+//! that, in memory; it is never logged.
+//!
+//! A copy made here shows as a change count newer than the one the
+//! clipboard had when the write failed. When that count cannot be read (on
+//! a Mac, every clipboard call waits while an app is slow to hand over what
+//! it copied), the newest count read before stands in for it. An older one
+//! would not do: the clipboard would look as if something had been copied
+//! here since, so the other computer's text would be dropped and the older
+//! text here sent back over it. Nor is a write that used up all of
+//! [`CLIPBOARD_TIMEOUT`] followed by a read of the count, which would only
+//! wait as long again.
 //!
 //! Nothing here logs.
 
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use hop_platform::{PlatformError, TextClipboard};
+use hop_platform::{CLIPBOARD_TIMEOUT, PlatformError, TextClipboard};
 use hop_types::CoreMessage;
 
 /// How long text from the other computer that could not be written is
@@ -133,9 +144,9 @@ pub(crate) enum Retried {
 struct PendingWrite {
     text: String,
     /// The clipboard's change count after the last failed write (or, when
-    /// that could not be read, the one both computers last had in common):
-    /// if the clipboard moves on from it, something was copied here since,
-    /// and that wins.
+    /// that could not be read, the newest one read before): if the
+    /// clipboard moves on from it, something was copied here since, and
+    /// that wins.
     count: u64,
     /// When to give up.
     until: Instant,
@@ -166,8 +177,15 @@ pub(crate) struct ClipboardSync {
     /// send), or right after it wrote the other computer's text. `None`
     /// until known. Unknown counts as already shared: the next crossing
     /// then only records the count and sends nothing, since what the
-    /// clipboard holds may have been copied before sharing started.
+    /// clipboard holds may have been copied before sharing started. It
+    /// never goes back to an older count, which would send again what
+    /// already went.
     synced: Option<u64>,
+    /// The newest change count read from the clipboard, or left by a
+    /// write, so far; `None` before any. Counts only grow, so this is the
+    /// closest there is to the clipboard's own count when that cannot be
+    /// read.
+    seen: Option<u64>,
     /// The generation of the last text offered.
     generation: u64,
     /// Text from the other computer that could not be written yet.
@@ -180,6 +198,7 @@ impl ClipboardSync {
         ClipboardSync {
             settings,
             synced: None,
+            seen: None,
             generation: 0,
             pending: None,
         }
@@ -198,7 +217,7 @@ impl ClipboardSync {
     /// [`ClipboardSync::learn_start`] tries again meanwhile.
     pub(crate) fn start(&mut self, clipboard: &dyn TextClipboard) {
         if self.settings.enabled {
-            self.synced = clipboard.change_count().ok();
+            self.synced = self.read_count(clipboard).ok();
         }
     }
 
@@ -214,7 +233,7 @@ impl ClipboardSync {
     /// only the change count, never the text.
     pub(crate) fn learn_start(&mut self, clipboard: &dyn TextClipboard) {
         if self.start_unknown() {
-            self.synced = clipboard.change_count().ok();
+            self.synced = self.read_count(clipboard).ok();
         }
     }
 
@@ -236,7 +255,7 @@ impl ClipboardSync {
         if !self.settings.enabled {
             return Ok(Offer::Unchanged);
         }
-        let count = clipboard.change_count()?;
+        let count = self.read_count(clipboard)?;
         let Some(synced) = self.synced else {
             self.synced = Some(count);
             return Ok(Offer::Unchanged);
@@ -283,7 +302,7 @@ impl ClipboardSync {
     /// waits to be tried again ([`ClipboardSync::retry`]) from `now` on,
     /// as long as there is a change count to tell a copy made here
     /// meanwhile by: the clipboard's own after the failure, or else the
-    /// one both computers last had in common.
+    /// newest one read before ([`ClipboardSync::count_after_failed_write`]).
     pub(crate) fn receive(
         &mut self,
         clipboard: &mut dyn TextClipboard,
@@ -294,13 +313,15 @@ impl ClipboardSync {
             return Ok(());
         }
         self.pending = None;
+        let started = Instant::now();
         match clipboard.write_text(text) {
             Ok(count) => {
+                self.saw(count);
                 self.synced = Some(count);
                 Ok(())
             }
             Err(error) => {
-                let count = clipboard.change_count().ok().or(self.synced);
+                let count = self.count_after_failed_write(clipboard, started);
                 self.pending = count.map(|count| PendingWrite {
                     text: text.to_owned(),
                     count,
@@ -318,8 +339,9 @@ impl ClipboardSync {
     /// checked, and if it moved on, something was copied here meanwhile and
     /// the text is dropped. A pending write is given up after
     /// [`RETRY_WRITE_FOR`], and what the clipboard held when it failed then
-    /// counts as in common, so it is not sent back over that text. Call it
-    /// often (every tick); it does nothing between tries.
+    /// counts as in common (unless something newer already does), so it is
+    /// not sent back over that text. Call it often (every tick); it does
+    /// nothing between tries.
     pub(crate) fn retry(&mut self, clipboard: &mut dyn TextClipboard, now: Instant) -> Retried {
         let Some(mut pending) = self.pending.take() else {
             return Retried::Nothing;
@@ -328,8 +350,10 @@ impl ClipboardSync {
             // What the clipboard held when the write failed is older than
             // the other computer's text: it counts as in common, so it is
             // never sent back over that text. Anything copied here since
-            // has another count, and goes.
-            self.synced = Some(pending.count);
+            // has another count, and goes. What went over since (a newer
+            // count) stays in common: going back to the older count would
+            // send it again.
+            self.synced = self.synced.max(Some(pending.count));
             return Retried::GaveUp;
         }
         if now < pending.next {
@@ -338,7 +362,7 @@ impl ClipboardSync {
         }
         pending.wait = pending.wait.saturating_mul(2);
         pending.next = now + pending.wait;
-        match clipboard.change_count() {
+        match self.read_count(clipboard) {
             Ok(count) if count != pending.count => return Retried::Superseded,
             Ok(_) => {}
             // No way to tell whether something was copied here: not now.
@@ -347,21 +371,64 @@ impl ClipboardSync {
                 return Retried::Failed(error);
             }
         }
+        let started = Instant::now();
         match clipboard.write_text(&pending.text) {
             Ok(count) => {
+                self.saw(count);
                 self.synced = Some(count);
                 Retried::Written
             }
             Err(error) => {
                 // A write that failed halfway may have moved the count on
                 // itself; that is no copy made here.
-                if let Ok(count) = clipboard.change_count() {
+                if let Some(count) = self.count_after_failed_write(clipboard, started) {
                     pending.count = count;
                 }
                 self.pending = Some(pending);
                 Retried::Failed(error)
             }
         }
+    }
+
+    /// The clipboard's change count right after a write that failed, which
+    /// a copy made here afterwards is told apart from. A write that used up
+    /// all of [`CLIPBOARD_TIMEOUT`] means the clipboard is not answering (on
+    /// a Mac, an app is slow to hand over what it copied, and every call
+    /// waits behind it), so the count is not even asked for: that would
+    /// only wait as long again, and fail too. Then, or when the count
+    /// cannot be read, the newest one read before stands in. `None` when
+    /// none was ever read.
+    fn count_after_failed_write(
+        &mut self,
+        clipboard: &dyn TextClipboard,
+        write_started: Instant,
+    ) -> Option<u64> {
+        if write_started.elapsed() < CLIPBOARD_TIMEOUT
+            && let Ok(count) = self.read_count(clipboard)
+        {
+            return Some(count);
+        }
+        self.newest()
+    }
+
+    /// Reads the clipboard's change count, and remembers it as the newest
+    /// one seen.
+    fn read_count(&mut self, clipboard: &dyn TextClipboard) -> Result<u64, PlatformError> {
+        let count = clipboard.change_count()?;
+        self.saw(count);
+        Ok(count)
+    }
+
+    /// Remembers `count`, read from the clipboard or left by a write, if it
+    /// is the newest one seen.
+    fn saw(&mut self, count: u64) {
+        self.seen = self.seen.max(Some(count));
+    }
+
+    /// The newest change count known: counts only grow, so the larger of
+    /// the newest one seen and the one in common.
+    fn newest(&self) -> Option<u64> {
+        self.seen.max(self.synced)
     }
 }
 
@@ -756,7 +823,7 @@ mod tests {
     #[test]
     fn a_pending_write_needs_a_count_to_tell_a_copy_made_here_by() {
         // The clipboard's own count cannot be read after the failure: the
-        // one both computers last had in common stands in for it.
+        // newest one read before (as sharing started) stands in for it.
         let (mut platform, fake) = Fake::new(1512.0, 982.0);
         let mut sync = ClipboardSync::new(ON);
         sync.start(platform.clipboard.as_ref());
@@ -804,6 +871,149 @@ mod tests {
             Retried::Nothing
         ));
         assert_eq!(fake.state().clipboard, None);
+    }
+
+    /// A sync whose clipboard could not hand over what was copied here (an
+    /// app slow to hand it over, say) as the cursor left, and then answered
+    /// nothing at all, neither the write nor the change count, as newer
+    /// text from the other computer arrived at `at`: a Mac's clipboard does
+    /// that while it waits on such an app. It answers again now.
+    fn write_to_a_clipboard_that_answered_nothing() -> (Platform, Fake, ClipboardSync, Instant) {
+        let (mut platform, fake) = Fake::new(1512.0, 982.0);
+        let mut sync = ClipboardSync::new(ON);
+        sync.start(platform.clipboard.as_ref());
+        fake.copy("older, copied here");
+        fake.state().fail_clipboard_read = true;
+        assert!(sync.offer(platform.clipboard.as_ref()).is_err());
+        {
+            let mut state = fake.state();
+            state.fail_clipboard_read = false;
+            state.fail_clipboard_write = true;
+            state.fail_clipboard_count = true;
+        }
+        let at = Instant::now();
+        assert!(
+            sync.receive(platform.clipboard.as_mut(), "newer, from the PC", at)
+                .is_err()
+        );
+        {
+            let mut state = fake.state();
+            state.fail_clipboard_write = false;
+            state.fail_clipboard_count = false;
+        }
+        (platform, fake, sync, at)
+    }
+
+    #[test]
+    fn text_that_came_while_the_clipboard_answered_nothing_is_written_once_it_answers() {
+        let (mut platform, fake, mut sync, at) = write_to_a_clipboard_that_answered_nothing();
+        // Nothing was copied here since: the newest count read stands in
+        // for the one the clipboard could not say, so it is no copy.
+        assert!(matches!(
+            sync.retry(platform.clipboard.as_mut(), at + ms(100)),
+            Retried::Written
+        ));
+        assert_eq!(
+            fake.state().clipboard.as_deref(),
+            Some("newer, from the PC")
+        );
+        // Written, it counts as in common, and the older text never goes.
+        assert_eq!(
+            sync.offer(platform.clipboard.as_ref()).ok(),
+            Some(Offer::Unchanged)
+        );
+        assert_eq!(fake.state().clipboard_reads, 0);
+    }
+
+    #[test]
+    fn older_text_is_never_sent_back_over_text_that_came_while_the_clipboard_answered_nothing() {
+        let (mut platform, fake, mut sync, at) = write_to_a_clipboard_that_answered_nothing();
+        // Not while the newer text waits,
+        assert_eq!(
+            sync.offer(platform.clipboard.as_ref()).ok(),
+            Some(Offer::Unchanged)
+        );
+        // nor once it is given up because the clipboard still takes no text.
+        fake.state().fail_clipboard_write = true;
+        let mut now = at;
+        while !matches!(
+            sync.retry(platform.clipboard.as_mut(), now),
+            Retried::GaveUp
+        ) {
+            now += ms(10);
+        }
+        assert_eq!(
+            sync.offer(platform.clipboard.as_ref()).ok(),
+            Some(Offer::Unchanged)
+        );
+        assert_eq!(fake.state().clipboard_reads, 0);
+
+        // Something copied here afterwards goes as usual.
+        fake.copy("copied here later");
+        let offer = sync.offer(platform.clipboard.as_ref()).expect("read");
+        assert_eq!(text(&offer), Some((1, "copied here later")));
+    }
+
+    #[test]
+    fn giving_text_up_never_sends_again_what_already_went() {
+        let (mut platform, fake, mut sync, at) = failed_write("from the PC");
+        // Copied here after the write failed: it goes as usual,
+        fake.copy("copied here meanwhile");
+        let Offer::Text { count, .. } = sync.offer(platform.clipboard.as_ref()).expect("read")
+        else {
+            panic!("no text");
+        };
+        sync.sent(count);
+        // and when the waiting text is given up before a try saw the copy,
+        // it does not go again.
+        assert!(matches!(
+            sync.retry(platform.clipboard.as_mut(), at + RETRY_WRITE_FOR),
+            Retried::GaveUp
+        ));
+        assert_eq!(
+            sync.offer(platform.clipboard.as_ref()).ok(),
+            Some(Offer::Unchanged)
+        );
+        assert_eq!(fake.state().clipboard_reads, 1, "read once");
+    }
+
+    #[test]
+    fn a_write_that_ran_out_of_time_is_not_followed_by_a_wait_for_the_count() {
+        let (mut platform, fake) = Fake::new(1512.0, 982.0);
+        let mut sync = ClipboardSync::new(ON);
+        sync.start(platform.clipboard.as_ref());
+        // Every call waits CLIPBOARD_TIMEOUT and fails: the write runs out
+        // of time, and the count would too.
+        fake.state().stall_clipboard = true;
+        let before = fake.state().clipboard_calls;
+        let at = Instant::now();
+        assert!(
+            sync.receive(platform.clipboard.as_mut(), "from the PC", at)
+                .is_err()
+        );
+        assert_eq!(
+            fake.state().clipboard_calls,
+            before + 1,
+            "the write, and nothing after it"
+        );
+        // The text still waits, against the newest count read, and goes
+        // once the clipboard answers again.
+        fake.state().stall_clipboard = false;
+        assert!(matches!(
+            sync.retry(platform.clipboard.as_mut(), at + ms(100)),
+            Retried::Written
+        ));
+        assert_eq!(fake.state().clipboard.as_deref(), Some("from the PC"));
+
+        // A write that fails at once is followed by a read of the count: one
+        // that failed halfway may have moved it.
+        fake.state().fail_clipboard_write = true;
+        let before = fake.state().clipboard_calls;
+        assert!(
+            sync.receive(platform.clipboard.as_mut(), "again", Instant::now())
+                .is_err()
+        );
+        assert_eq!(fake.state().clipboard_calls, before + 2);
     }
 
     #[test]

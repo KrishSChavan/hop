@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hop_net::{NetEvent, SendError};
 use hop_platform::{
-    CaptureMode, CapturedEvent, CursorControl, Displays, DropCatcher, DropZone, InputCapture,
-    InputInjector, Permission, PermissionState, Permissions, Platform, PlatformError, Result,
-    SystemState, TextClipboard,
+    CLIPBOARD_TIMEOUT, CaptureMode, CapturedEvent, CursorControl, Displays, DropCatcher, DropZone,
+    InputCapture, InputInjector, Permission, PermissionState, Permissions, Platform, PlatformError,
+    Result, SystemState, TextClipboard,
 };
 use hop_types::{
     CoreMessage, DeviceId, DisplayInfo, InputEvent, KeyCode, MouseButton, Point, Rect,
@@ -70,8 +70,15 @@ pub(crate) struct FakeState {
     pub(crate) fail_clipboard_read: bool,
     /// Writing the clipboard fails.
     pub(crate) fail_clipboard_write: bool,
+    /// Every clipboard call waits [`CLIPBOARD_TIMEOUT`] and then fails, as
+    /// every call does on a Mac whose clipboard waits on an app that is
+    /// slow to hand over what it copied.
+    pub(crate) stall_clipboard: bool,
     /// How many times the clipboard's text was read.
     pub(crate) clipboard_reads: u32,
+    /// How many times the clipboard was asked anything (its change count,
+    /// its text, or to take text), whether it answered or not.
+    pub(crate) clipboard_calls: u32,
     /// The drop zones the agent set last, and the label it gave them.
     pub(crate) zones: Vec<DropZone>,
     pub(crate) label: String,
@@ -130,7 +137,9 @@ impl Fake {
             fail_clipboard_count: false,
             fail_clipboard_read: false,
             fail_clipboard_write: false,
+            stall_clipboard: false,
             clipboard_reads: 0,
+            clipboard_calls: 0,
             zones: Vec::new(),
             label: String::new(),
             no_drop_target: false,
@@ -219,6 +228,25 @@ struct Part(Arc<Mutex<FakeState>>);
 impl Part {
     fn state(&self) -> MutexGuard<'_, FakeState> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Counts a clipboard call. While the clipboard stalls, the call waits
+    /// as long as a real one may, without holding the state, and then
+    /// fails as a real one does.
+    fn clipboard_call(&self) -> Result<()> {
+        let stalled = {
+            let mut state = self.state();
+            state.clipboard_calls += 1;
+            state.stall_clipboard
+        };
+        if stalled {
+            std::thread::sleep(CLIPBOARD_TIMEOUT);
+            return Err(PlatformError::Os(format!(
+                "the fake clipboard did not answer within {} ms",
+                CLIPBOARD_TIMEOUT.as_millis()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -358,6 +386,7 @@ impl Displays for Part {
 /// A clipboard in memory; no test reads or writes the real one.
 impl TextClipboard for Part {
     fn change_count(&self) -> Result<u64> {
+        self.clipboard_call()?;
         let state = self.state();
         if state.fail_clipboard_count {
             return Err(refused("read the clipboard's change count"));
@@ -366,6 +395,7 @@ impl TextClipboard for Part {
     }
 
     fn read_text(&self, max_bytes: usize) -> Result<Option<String>> {
+        self.clipboard_call()?;
         let mut state = self.state();
         if state.fail_clipboard_read {
             return Err(refused("read the clipboard"));
@@ -379,6 +409,7 @@ impl TextClipboard for Part {
     }
 
     fn write_text(&mut self, text: &str) -> Result<u64> {
+        self.clipboard_call()?;
         let mut state = self.state();
         if state.fail_clipboard_write {
             return Err(refused("write the clipboard"));

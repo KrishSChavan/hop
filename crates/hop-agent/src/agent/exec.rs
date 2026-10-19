@@ -23,12 +23,14 @@
 //!   is on the controller's clipboard before its keyboard is back. The
 //!   price: the controller gets its keyboard back later, by the time the
 //!   read takes here and the write takes there (normally a few
-//!   milliseconds each, at most `CLIPBOARD_TIMEOUT` each), and keys typed
-//!   on it meanwhile reach this computer after its session ended, so they
-//!   are dropped, as keys typed while the `Leave` travels always were. A
-//!   paste key that does nothing is better than one that pastes the wrong
-//!   text. Releasing what was injected waits for the read too; nothing
-//!   here is in use by then, since the cursor has moved on.
+//!   milliseconds each; a clipboard that hangs is given up on after
+//!   `CLIPBOARD_TIMEOUT`, and a write given up on is not followed by any
+//!   other clipboard call there), and keys typed on it meanwhile reach
+//!   this computer after its session ended, so they are dropped, as keys
+//!   typed while the `Leave` travels always were. A paste key that does
+//!   nothing is better than one that pastes the wrong text. Releasing what
+//!   was injected waits for the read too; nothing here is in use by then,
+//!   since the cursor has moved on.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -386,8 +388,10 @@ impl<L: Link> Executor<L> {
 
     /// Tries again to put clipboard text from the other computer that could
     /// not be written on this computer's clipboard, when a try is due
-    /// (`ClipboardSync::retry`). Called every tick; between tries, and with
-    /// nothing waiting, it touches nothing. The text is never logged.
+    /// (`ClipboardSync::retry`). Called from the agent's tick, except while
+    /// a crossing waits for its answer (`Agent::tick` says why); between
+    /// tries, and with nothing waiting, it touches nothing. The text is
+    /// never logged.
     pub(crate) fn retry_clipboard_write(&mut self, now: Instant) {
         match self.clipboard.retry(self.platform.clipboard.as_mut(), now) {
             Retried::Nothing => {}
