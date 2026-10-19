@@ -1,0 +1,13 @@
+[package]
+name = "hop-transfer"
+description = "Hop's file transfers on disk: safe names, saving files that arrive, reading files to send"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# SHA-256 of every file sent and received (MIT OR Apache-2.0). The same
+# version hop-net uses for fingerprints.
+sha2 = "=0.10.9"
+thiserror.workspace = true

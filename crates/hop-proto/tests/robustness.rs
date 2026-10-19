@@ -3,13 +3,51 @@
 
 mod common;
 
-use common::{every_message, pop_all, raw_frame};
+use common::{EVERY_FAILURE, EVERY_REFUSAL, every_message, pop_all, raw_frame};
 use hop_proto::{
-    Capability, Decoded, FrameDecoder, KIND_CORE, KIND_HELLO, MAX_DATAGRAM_LEN, Message,
-    decode_datagram, encode_datagram, encode_frame, negotiate,
+    Capability, Decoded, FileEntry, FileMessage, FrameDecoder, KIND_CORE, KIND_FILE, KIND_HELLO,
+    KIND_NUDGE, MAX_DATAGRAM_LEN, MAX_FILE_NAME_BYTES, Message, ProtoError, decode_datagram,
+    encode_datagram, encode_frame, negotiate,
 };
 use hop_types::{CoreMessage, MotionMark};
 use proptest::prelude::*;
+
+/// Any file entry: names of any characters (control and path characters
+/// included, since the receiver cleans them, not the protocol) and sizes.
+fn any_entry(max_name_chars: usize) -> impl Strategy<Value = FileEntry> {
+    (
+        prop::collection::vec(any::<char>(), 0..=max_name_chars),
+        any::<u64>(),
+    )
+        .prop_map(|(name, size)| FileEntry {
+            name: name.into_iter().collect(),
+            size,
+        })
+}
+
+/// Any file message within the limits.
+fn any_file_message() -> impl Strategy<Value = FileMessage> {
+    prop_oneof![
+        (any::<u64>(), prop::collection::vec(any_entry(40), 0..20))
+            .prop_map(|(id, files)| FileMessage::Offer { id, files }),
+        (
+            any::<u64>(),
+            any::<bool>(),
+            prop::option::of(prop::sample::select(EVERY_REFUSAL.to_vec()))
+        )
+            .prop_map(|(id, accepted, refusal)| FileMessage::Answer {
+                id,
+                accepted,
+                refusal
+            }),
+        (
+            any::<u64>(),
+            any::<u32>(),
+            prop::option::of(prop::sample::select(EVERY_FAILURE.to_vec()))
+        )
+            .prop_map(|(id, saved, failure)| FileMessage::Outcome { id, saved, failure }),
+    ]
+}
 
 /// Feeds `bytes` to a decoder in pieces whose sizes cycle through `chunks`,
 /// popping after every piece, and checks the decoder never holds more than
@@ -50,7 +88,7 @@ proptest! {
 
     #[test]
     fn random_bodies_of_known_kinds_never_panic(
-        kind in prop_oneof![Just(KIND_HELLO), Just(KIND_CORE)],
+        kind in prop_oneof![Just(KIND_HELLO), Just(KIND_CORE), Just(KIND_FILE), Just(KIND_NUDGE)],
         body in prop::collection::vec(any::<u8>(), 0..512),
     ) {
         let mut decoder = FrameDecoder::new();
@@ -144,6 +182,48 @@ proptest! {
         prop_assert_eq!(mark.n, n);
         prop_assert_eq!(mark.total_dx.to_bits(), total_dx.to_bits());
         prop_assert_eq!(mark.total_dy.to_bits(), total_dy.to_bits());
+    }
+
+    #[test]
+    fn any_file_message_within_the_limits_round_trips(message in any_file_message()) {
+        let message = Message::File(message);
+        let frame = encode_frame(&message).expect("within the limits");
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&frame).expect("valid frame");
+        prop_assert_eq!(decoder.pop(), Some(Ok(Decoded::Message(message.clone()))));
+        // Datagrams carry the same body when it fits; nothing is cut.
+        match encode_datagram(&message) {
+            Ok(datagram) => {
+                prop_assert_eq!(decode_datagram(&datagram), Ok(Decoded::Message(message)));
+            }
+            Err(error) => {
+                let too_large = matches!(error, ProtoError::DatagramTooLarge { .. });
+                prop_assert!(too_large, "{:?}", error);
+            }
+        }
+    }
+
+    #[test]
+    fn a_name_past_the_limit_is_refused_wherever_it_is(
+        files in prop::collection::vec(any_entry(8), 0..10),
+        at in any::<prop::sample::Index>(),
+        extra in 1usize..64,
+    ) {
+        let mut files = files;
+        let long = FileEntry { name: "n".repeat(MAX_FILE_NAME_BYTES + extra), size: 1 };
+        let index = at.index(files.len() + 1);
+        files.insert(index, long);
+        let count = files.len();
+        let message = FileMessage::Offer { id: 1, files };
+        let expected = ProtoError::FileOfferTooLarge {
+            files: count,
+            longest_name: MAX_FILE_NAME_BYTES + extra,
+        };
+        prop_assert_eq!(encode_frame(&Message::File(message.clone())), Err(expected.clone()));
+        let body = rmp_serde::to_vec_named(&message).expect("encodes");
+        let mut decoder = FrameDecoder::new();
+        decoder.push(&raw_frame(KIND_FILE, &body)).expect("framing is fine");
+        prop_assert_eq!(decoder.pop(), Some(Err(expected)));
     }
 
     #[test]

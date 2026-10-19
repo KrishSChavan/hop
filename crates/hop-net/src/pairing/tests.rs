@@ -687,3 +687,109 @@ async fn a_joiner_with_no_address_or_its_own_key_gets_a_clear_error() {
     assert!(matches!(result, Err(PairError::SelfPairing)), "{result:?}");
     host_task.abort();
 }
+
+/// A joiner that typed a wrong code sends its confirmation and reads the
+/// answer only after the connection has closed. The host must say why
+/// with its close code (`WRONG_CODE`) and nothing else: a finished stream
+/// reaching the joiner first would read as "the stream ended early" (the
+/// flaky failure of hop-agent's wrong-code test on Windows CI).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_reader_hears_wrong_code_and_never_an_early_end() {
+    let host_id = Arc::new(Identity::generate().unwrap());
+    let joiner_id = Arc::new(Identity::generate().unwrap());
+    let mut patient = timing();
+    patient.max_attempts = 1000;
+    let mut host = host_with(&host_id, code("111111"), patient).await;
+    let failures = count_failures(&mut host);
+    let address = host.local_addr();
+    let host_task = tokio::spawn(host.wait_for_joiner());
+    for attempt in 1..=30 {
+        let (_endpoint, conn) = raw_joiner(&joiner_id, address).await;
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        let (spake, ours) = Spake2::<Ed25519Group>::start_a(
+            &Password::new(b"222222"),
+            &SpakeIdentity::new(joiner_id.fingerprint().as_bytes()),
+            &SpakeIdentity::new(host_id.fingerprint().as_bytes()),
+        );
+        wire::write_frame(&mut send, Kind::Spake, &ours)
+            .await
+            .unwrap();
+        let theirs = wire::read_frame(&mut recv, Kind::Spake).await.unwrap();
+        let key = spake.finish(&theirs).unwrap();
+        let binding = wire::channel_binding(&conn).unwrap();
+        let mac = wire::confirmation(&key, wire::LABEL_JOINER, &binding);
+        wire::write_frame(
+            &mut send,
+            Kind::Confirm,
+            &wire::encode_confirm(&mac, &joiner_info()),
+        )
+        .await
+        .unwrap();
+        // Read only once the host has hung up.
+        let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("the host closes");
+        let quinn::ConnectionError::ApplicationClosed(close) = closed else {
+            panic!("attempt {attempt}: {closed:?}");
+        };
+        assert_eq!(
+            CloseCode::from_code(close.error_code.into_inner()),
+            Some(CloseCode::WrongCode)
+        );
+        let read = wire::read_frame(&mut recv, Kind::Confirm).await;
+        assert!(
+            matches!(&read, Err(failure) if matches!(failure.error, PairError::WrongCode)),
+            "attempt {attempt}: {read:?}"
+        );
+        wait_until("the failure count", || {
+            failures.load(Ordering::SeqCst) == attempt
+        })
+        .await;
+    }
+    host_task.abort();
+}
+
+/// A host from before the fix above could let the end of its stream
+/// overtake its `WRONG_CODE` close. The joiner waits a moment for the close
+/// code that follows an early end, so it still reports a wrong code. Here
+/// the race is made certain: the host ends its stream, waits, then closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_joiner_explains_an_early_end_by_the_close_that_follows() {
+    let host_id = Arc::new(Identity::generate().unwrap());
+    let joiner_id = Arc::new(Identity::generate().unwrap());
+    let tls = tls::server_config(
+        &host_id,
+        Accept::AnyEd25519,
+        tls::ALPN_PAIRING,
+        Arc::default(),
+    )
+    .unwrap();
+    let transport = Arc::new(pairing_transport(1).build().unwrap());
+    let server = tls::quic_server(tls, transport, 16).unwrap();
+    let endpoint = bind_endpoint(loopback(), Some(server)).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let old_host = tokio::spawn(async move {
+        let conn = endpoint.accept().await.unwrap().await.unwrap();
+        let joiner = tls::peer_fingerprint(&conn).unwrap();
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        let theirs = wire::read_frame(&mut recv, Kind::Spake).await.unwrap();
+        let (spake, ours) = Spake2::<Ed25519Group>::start_b(
+            &Password::new(b"111111"),
+            &SpakeIdentity::new(joiner.as_bytes()),
+            &SpakeIdentity::new(host_id.fingerprint().as_bytes()),
+        );
+        wire::write_frame(&mut send, Kind::Spake, &ours)
+            .await
+            .unwrap();
+        let _ = spake.finish(&theirs);
+        wire::read_frame(&mut recv, Kind::Confirm).await.unwrap();
+        // The end of the stream first, then the close that says why.
+        send.finish().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        conn.close(CloseCode::WrongCode.varint(), b"wrong code");
+        let _ = tokio::time::timeout(Duration::from_secs(1), endpoint.wait_idle()).await;
+    });
+    let result = join(&joiner_id, code("222222"), &[address]).await;
+    assert!(matches!(result, Err(PairError::WrongCode)), "{result:?}");
+    old_host.await.unwrap();
+}

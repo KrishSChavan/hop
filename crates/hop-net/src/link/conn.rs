@@ -1,6 +1,6 @@
 //! One session connection: the checks after the TLS handshake, the `Hello`
-//! exchange, the duplicate rule, and then reading and writing until it
-//! closes.
+//! exchange, the duplicate rule, and then reading and writing (and moving
+//! files, when negotiated) until it closes.
 
 use std::sync::{Arc, OnceLock};
 
@@ -14,6 +14,7 @@ use quinn::{RecvStream, SendStream};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use super::files::{ConnFiles, Queues};
 use super::{Current, Shared};
 use crate::events::{DownReason, Offer, PeerUp};
 use crate::sanitize::{MAX_DISPLAY_CHARS, display_bytes, display_text};
@@ -207,9 +208,18 @@ pub(crate) async fn establish(
         dialled_by_us: direction == Direction::Outgoing,
     };
     let (name, remote) = (up.name.clone(), up.remote);
+    let clipboard = up.supports_clipboard();
 
     // 4. One connection per pair.
-    let outgoing = decide_and_announce(&shared, &link, conn_id, direction, &our_frame, up).await?;
+    let (outgoing, files) =
+        decide_and_announce(&shared, &link, conn_id, direction, &our_frame, up).await?;
+    if files.is_some() {
+        // The peer may now open one data stream at a time; the transport
+        // settings allow none, so a peer that did not negotiate `files`
+        // never can.
+        link.conn
+            .set_max_concurrent_uni_streams(quinn::VarInt::from_u32(1));
+    }
     shared.queue.wake();
     tracing::info!(
         peer = %name,
@@ -221,7 +231,7 @@ pub(crate) async fn establish(
 
     // 5. Read and write until the connection closes.
     tokio::spawn(run(
-        shared, link, peer, conn_id, send, recv, outgoing, alive,
+        shared, link, peer, conn_id, send, recv, outgoing, clipboard, files, alive,
     ));
     Ok(())
 }
@@ -364,9 +374,14 @@ enum Verdict {
     Wait,
 }
 
+/// The file transfers of a new current connection, and the work they take
+/// in.
+type FilesOf = Option<(Arc<ConnFiles>, Queues)>;
+
 /// Applies the duplicate rule (docs/M2-DESIGN.md, "One connection per
 /// pair") and, if the new connection wins, makes it the peer's current
-/// one and announces it.
+/// one and announces it. Returns the control stream's send queue and, when
+/// `files` was negotiated, the connection's file transfers.
 ///
 /// Both devices decide from the pinned ids alone, so they keep the same
 /// connection: the one dialled by the lower id. Between two connections
@@ -385,7 +400,7 @@ async fn decide_and_announce(
     direction: Direction,
     our_frame: &Bytes,
     up: PeerUp,
-) -> Result<mpsc::Receiver<Bytes>, SetupError> {
+) -> Result<(mpsc::Receiver<Bytes>, FilesOf), SetupError> {
     let peer = up.peer.clone();
     let grace_end = Instant::now() + shared.timing.duplicate_grace;
     let mut changes = shared.subscribe_changes();
@@ -431,7 +446,27 @@ async fn decide_and_announce(
                         return Err(refuse(link, CloseCode::Protocol, "announced twice"));
                     };
                     let negotiated = up.negotiated.clone();
-                    if !shared.queue.announce(conn_id, up) {
+                    let files = match (&shared.inbox, up.supports_files()) {
+                        (Some(inbox), true) => Some(ConnFiles::new(
+                            peer.clone(),
+                            conn_id,
+                            link.clone(),
+                            shared.queue.clone(),
+                            shared.limits.clone(),
+                            inbox.clone(),
+                            &outgoing,
+                        )),
+                        _ => None,
+                    };
+                    // The transfers of a connection this one replaces end
+                    // here, reported just before the new `PeerUp`.
+                    let old_files = slot.current.as_ref().and_then(|old| old.files.clone());
+                    let announce = |ended| shared.queue.announce(conn_id, up, ended);
+                    let announced = match &old_files {
+                        Some(old_files) => old_files.end_replaced(announce),
+                        None => announce(Vec::new()),
+                    };
+                    if !announced {
                         drop(table);
                         link.close(CloseCode::Overloaded, "the agent is not keeping up");
                         return Err(SetupError::Closed(CloseCode::Overloaded));
@@ -442,6 +477,7 @@ async fn decide_and_announce(
                         outgoing,
                         dialled_by_us: direction == Direction::Outgoing,
                         negotiated,
+                        files: files.as_ref().map(|(files, _)| files.clone()),
                     });
                     slot.incompatible_logged = false;
                     drop(table);
@@ -451,7 +487,7 @@ async fn decide_and_announce(
                             .close(CloseCode::Duplicate, "replaced by another connection");
                     }
                     shared.bump();
-                    return Ok(outgoing_rx);
+                    return Ok((outgoing_rx, files));
                 }
             }
         }
@@ -522,8 +558,9 @@ enum End {
 }
 
 /// Runs a connection after its announcement: reads the control stream,
-/// writes the send queue, and reports the close if it is still the peer's
-/// current connection.
+/// writes the send queue, moves files when `files` was negotiated, and
+/// reports the close if it is still the peer's current connection.
+/// `clipboard` says whether `ClipboardText` is delivered.
 #[allow(clippy::too_many_arguments)]
 async fn run(
     shared: Arc<Shared>,
@@ -533,15 +570,26 @@ async fn run(
     send: SendStream,
     recv: RecvStream,
     outgoing: mpsc::Receiver<Bytes>,
+    clipboard: bool,
+    files: FilesOf,
     alive: mpsc::Sender<()>,
 ) {
     let since = Instant::now();
+    let (files, queues) = files.unzip();
+    // Moves files both ways; it never ends by itself.
+    let serving = async {
+        match (files.clone(), queues) {
+            (Some(files), Some(queues)) => match files.serve(queues).await {},
+            _ => std::future::pending::<End>().await,
+        }
+    };
     // No branch waits on `closed()`: when the peer closes, the reader
     // first hands over everything that already arrived (the `Release` a
     // quitting peer sent last) and only then reports the loss.
     let end = tokio::select! {
-        end = read_control(&shared, &peer, conn_id, recv) => end,
+        end = read_control(&shared, &peer, conn_id, clipboard, files.as_deref(), recv) => end,
         end = write_control(send, outgoing) => end,
+        end = serving => end,
     };
     match end {
         // Closed with `DUPLICATE` when it was replaced.
@@ -574,6 +622,10 @@ async fn run(
             link.close(CloseCode::Protocol, why);
         }
     }
+    // Its transfers end with it, and are reported before its `PeerDown`.
+    if let Some(files) = &files {
+        files.end();
+    }
     let reason = link.down_reason();
     let reported = {
         let mut table = shared.lock_table();
@@ -597,8 +649,15 @@ async fn run(
 }
 
 /// Reads frames from the control stream and queues their messages for the
-/// core.
-async fn read_control(shared: &Shared, peer: &DeviceId, conn_id: u64, mut recv: RecvStream) -> End {
+/// core, handing file messages to `files`.
+async fn read_control(
+    shared: &Shared,
+    peer: &DeviceId,
+    conn_id: u64,
+    clipboard: bool,
+    files: Option<&ConnFiles>,
+    mut recv: RecvStream,
+) -> End {
     let mut decoder = FrameDecoder::new();
     loop {
         let chunk = match recv.read_chunk(READ_CHUNK, true).await {
@@ -616,6 +675,16 @@ async fn read_control(shared: &Shared, peer: &DeviceId, conn_id: u64, mut recv: 
             };
             let msg = match frame {
                 Ok(Decoded::Message(Message::Core(msg))) => msg,
+                // Only from a peer that negotiated `files` (otherwise
+                // dropped); never for the core, and never waits.
+                Ok(Decoded::Message(Message::File(file))) => {
+                    if let Some(files) = files {
+                        files.on_message(file);
+                    }
+                    continue;
+                }
+                // A nudge belongs in a datagram, and means as little here.
+                Ok(Decoded::Message(Message::Nudge)) => continue,
                 Ok(Decoded::Message(Message::Hello(_))) => {
                     break Some(End::Protocol("a second Hello"));
                 }
@@ -626,8 +695,9 @@ async fn read_control(shared: &Shared, peer: &DeviceId, conn_id: u64, mut recv: 
                 Err(_) => break Some(End::Protocol("a frame that does not decode")),
             };
             let reliable = match &msg {
-                // Not negotiated in M2: dropped, and never logged.
-                CoreMessage::ClipboardText { .. } => continue,
+                // Delivered only where both sides turned the clipboard on;
+                // otherwise dropped. Never logged either way.
+                CoreMessage::ClipboardText { .. } if !clipboard => continue,
                 CoreMessage::Motion { .. } => false,
                 _ => true,
             };
@@ -666,8 +736,8 @@ async fn write_control(mut send: SendStream, mut outgoing: mpsc::Receiver<Bytes>
 }
 
 /// Reads datagrams and queues the `Motion` messages among them. Anything
-/// else, and anything that arrives before the connection is announced, is
-/// dropped.
+/// else (a nudge only had to arrive), and anything that arrives before the
+/// connection is announced, is dropped.
 async fn read_datagrams(shared: Arc<Shared>, link: Arc<Link>, peer: DeviceId, conn_id: u64) {
     let mut was_current = false;
     loop {

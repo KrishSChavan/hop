@@ -13,9 +13,12 @@
 //! |---|---|---|
 //! | [`KIND_HELLO`] = 1 | [`Message::Hello`] | Versions, identity, displays and capabilities. The first message on a connection |
 //! | [`KIND_CORE`] = 2 | [`Message::Core`] | A [`CoreMessage`]: the control hand-off and the clipboard |
+//! | [`KIND_FILE`] = 3 | [`Message::File`] | A [`FileMessage`]: a file transfer's offer, answer or outcome, as stream frames on the control stream, to peers that negotiated `files` |
+//! | [`KIND_NUDGE`] = 4 | [`Message::Nudge`] | Nothing (an empty body), as a datagram only: it wakes the peer's Wi-Fi radio, and every build ignores it |
 //!
 //! A kind this build does not know decodes to [`Decoded::Unknown`], so the
-//! caller can skip it.
+//! caller can skip it. Builds from before kinds 3 and 4 skip those the same
+//! way.
 //!
 //! # Handshake
 //!
@@ -50,7 +53,12 @@
 //!
 //! See [`encode_datagram`] and [`decode_datagram`]. Datagrams can be lost or
 //! reordered, so Hop uses them only for pointer motion
-//! ([`CoreMessage::Motion`]), where the latest message wins.
+//! ([`CoreMessage::Motion`]), where the latest message wins, and for
+//! [`Message::Nudge`], which carries nothing.
+//!
+//! File data does not travel in frames: after an accepted
+//! [`FileMessage::Answer`], the sender writes it on a unidirectional stream
+//! of its own, as the [`FileMessage`] docs describe.
 //!
 //! # Body
 //!
@@ -68,9 +76,12 @@
 //! | [`MAX_FRAME_LEN`] | 1 MiB + 64 KiB | The body of one stream frame |
 //! | [`MAX_DATAGRAM_LEN`] | 1200 bytes | A whole datagram, kind included |
 //! | [`MAX_CLIPBOARD_TEXT`] | 1 MiB | The UTF-8 text of one `ClipboardText` |
+//! | [`MAX_OFFER_FILES`] | 1,000 | The files listed in one [`FileMessage::Offer`] |
+//! | [`MAX_FILE_NAME_BYTES`] | 1,024 bytes | The UTF-8 name of one file in an offer |
 //!
 //! Oversized input is rejected, never truncated. Encoding checks the same
-//! limits, so Hop never sends what its peer would refuse.
+//! limits, so Hop never sends what its peer would refuse. An offer at both
+//! file limits still fits in one frame.
 //!
 //! # Evolving the protocol
 //!
@@ -85,10 +96,11 @@
 //!    using it instead.
 //! 3. **A new enum variant is not backward compatible.** An older peer cannot
 //!    decode a message that contains a variant it does not know. Send a new
-//!    [`CoreMessage`] variant, or a new value of an enum inside one, only to a
-//!    peer that negotiated the capability that introduced it. [`Hello`] is
-//!    decoded before any negotiation, so the enums inside it (such as `Os`)
-//!    must not gain variants within a major version.
+//!    [`CoreMessage`] or [`FileMessage`] variant, or a new value of an enum
+//!    inside one (such as [`FileRefusal`]), only to a peer that negotiated
+//!    the capability that introduced it. [`Hello`] is decoded before any
+//!    negotiation, so the enums inside it (such as `Os`) must not gain
+//!    variants within a major version.
 //! 4. **A new message kind takes the next unused number.** Older peers skip
 //!    it.
 //! 5. **Versions.** A new feature adds a capability or raises the version of
@@ -136,14 +148,20 @@
 
 mod datagram;
 mod error;
+mod file;
 mod frame;
 mod hello;
 mod message;
 
 pub use datagram::{MAX_DATAGRAM_LEN, decode_datagram, encode_datagram};
 pub use error::ProtoError;
+pub use file::{
+    FileEntry, FileFailure, FileMessage, FileRefusal, MAX_FILE_NAME_BYTES, MAX_OFFER_FILES,
+};
 pub use frame::{FrameDecoder, MAX_FRAME_LEN, encode_frame};
 pub use hello::{
     Capability, Hello, Negotiated, PROTO_MAJOR, PROTO_MINOR, caps, default_capabilities, negotiate,
 };
-pub use message::{Decoded, KIND_CORE, KIND_HELLO, MAX_CLIPBOARD_TEXT, Message};
+pub use message::{
+    Decoded, KIND_CORE, KIND_FILE, KIND_HELLO, KIND_NUDGE, MAX_CLIPBOARD_TEXT, Message,
+};

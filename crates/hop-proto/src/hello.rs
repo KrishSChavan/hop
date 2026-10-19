@@ -24,7 +24,8 @@ pub mod caps {
     pub const KEYMAP: &str = "keymap";
     /// Syncing plain-text clipboard contents.
     pub const CLIPBOARD_TEXT: &str = "clipboard.text";
-    /// Sending files to the other computer's Received folder.
+    /// Sending files to the other computer's Received folder: the
+    /// [`FileMessage`](crate::FileMessage)s and the data streams after them.
     pub const FILES: &str = "files";
 }
 
@@ -50,13 +51,15 @@ impl Capability {
     }
 }
 
-/// The capabilities this build supports: `input`, `keymap` and
-/// `clipboard.text`, each at version 1.
+/// The capabilities this build's protocol supports: `input`, `keymap`,
+/// `clipboard.text` and `files`, each at version 1. The network layer
+/// advertises only those it has turned on.
 pub fn default_capabilities() -> Vec<Capability> {
     vec![
         Capability::new(caps::INPUT, 1),
         Capability::new(caps::KEYMAP, 1),
         Capability::new(caps::CLIPBOARD_TEXT, 1),
+        Capability::new(caps::FILES, 1),
     ]
 }
 

@@ -1450,6 +1450,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac",
  "hop-proto",
+ "hop-transfer",
  "hop-types",
  "mdns-sd",
  "quinn",
@@ -1517,6 +1518,14 @@ dependencies = [
  "hop-keymap",
  "hop-platform",
  "hop-types",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hop-transfer"
+version = "0.1.1"
+dependencies = [
+ "sha2",
  "thiserror 2.0.21",
 ]
 

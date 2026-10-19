@@ -4,7 +4,10 @@
 mod common;
 
 use common::{every_message, pop_all, raw_frame};
-use hop_proto::{Decoded, FrameDecoder, KIND_CORE, KIND_HELLO, Message, ProtoError, encode_frame};
+use hop_proto::{
+    Decoded, FrameDecoder, KIND_CORE, KIND_FILE, KIND_HELLO, KIND_NUDGE, Message, ProtoError,
+    encode_frame,
+};
 use hop_types::CoreMessage;
 
 fn stream_of(messages: &[Message]) -> Vec<u8> {
@@ -136,6 +139,10 @@ fn a_malformed_body_is_an_error_and_the_next_frame_still_decodes() {
         (KIND_CORE, with_trailing_byte),       // two values
         (KIND_CORE, vec![0x2a]),               // the number 42, not a message
         (KIND_HELLO, vec![0x80]),              // an empty map: fields missing
+        (KIND_FILE, vec![]),                   // no value at all
+        (KIND_FILE, vec![0x80]),               // an empty map: no variant
+        (KIND_FILE, b"\xa5offer".to_vec()),    // a variant without its fields
+        (KIND_NUDGE, vec![0xc0]),              // a nudge carries nothing
     ];
     for (kind, body) in bad_bodies {
         let mut stream = raw_frame(kind, &body);
@@ -170,4 +177,41 @@ fn an_unknown_core_variant_is_a_decode_error() {
             ..
         }))
     ));
+}
+
+#[test]
+fn an_unknown_file_variant_or_refusal_is_a_decode_error() {
+    // Rule 3 again: new file messages, refusals and failures need a newer
+    // version of the `files` capability first.
+    let mut cancel = vec![0x81, 0xa6];
+    cancel.extend_from_slice(b"cancel");
+    cancel.extend_from_slice(&[0x81, 0xa2]);
+    cancel.extend_from_slice(b"id");
+    cancel.push(0x01);
+    let mut answer = vec![0x81, 0xa6];
+    answer.extend_from_slice(b"answer");
+    answer.extend_from_slice(&[0x83, 0xa2]);
+    answer.extend_from_slice(b"id");
+    answer.extend_from_slice(&[0x01, 0xa8]);
+    answer.extend_from_slice(b"accepted");
+    answer.extend_from_slice(&[0xc2, 0xa7]);
+    answer.extend_from_slice(b"refusal");
+    answer.push(0xa8);
+    answer.extend_from_slice(b"too_late");
+    for body in [cancel, answer] {
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .push(&raw_frame(KIND_FILE, &body))
+            .expect("framing is fine");
+        assert!(
+            matches!(
+                decoder.pop(),
+                Some(Err(ProtoError::Decode {
+                    kind: KIND_FILE,
+                    ..
+                }))
+            ),
+            "{body:x?}"
+        );
+    }
 }

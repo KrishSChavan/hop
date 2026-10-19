@@ -37,8 +37,9 @@ impl TransportParams {
         let mut config = TransportConfig::default();
         config
             .max_concurrent_bidi_streams(VarInt::from_u32(self.peer_bidi_streams))
-            // No unidirectional streams in M2; clipboard and file transfers
-            // raise this in M4 and M5.
+            // None here: a session connection that negotiates `files`
+            // allows the peer one at a time once its `Hello` is through
+            // (see `link::files`), and pairing never allows any.
             .max_concurrent_uni_streams(VarInt::from_u32(0))
             .stream_receive_window(VarInt::from_u32(self.stream_window))
             .receive_window(VarInt::from_u32(self.connection_window))

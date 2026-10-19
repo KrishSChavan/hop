@@ -1,9 +1,11 @@
 //! The session link: one QUIC endpoint that listens for and dials paired
-//! peers, keeps one connection per peer, and carries `Hello` and
-//! `CoreMessage`s (docs/M2-DESIGN.md, "Transport").
+//! peers, keeps one connection per peer, and carries `Hello`,
+//! `CoreMessage`s, nudges and file transfers (docs/M2-DESIGN.md,
+//! "Transport"; docs/M4-M5-DESIGN.md).
 
 mod conn;
 mod dial;
+mod files;
 #[cfg(test)]
 mod tests;
 
@@ -18,7 +20,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use hop_proto::encode_frame;
-use hop_proto::{Capability, Hello, Message, Negotiated, ProtoError, caps, encode_datagram};
+use hop_proto::{
+    Capability, Hello, KIND_NUDGE, Message, Negotiated, ProtoError, caps, encode_datagram,
+};
 use hop_types::{CoreMessage, DeviceId, DisplayInfo, Os};
 use tokio::sync::{Semaphore, mpsc, watch};
 use tokio::time::Instant;
@@ -31,6 +35,10 @@ use crate::transport::TransportParams;
 use crate::{CloseCode, Fingerprint, Identity, ratelimit};
 
 pub(crate) use conn::Link;
+use files::{ConnFiles, Inbox};
+
+/// A nudge: the kind alone (`Message::Nudge` as a datagram).
+static NUDGE: [u8; 2] = KIND_NUDGE.to_be_bytes();
 
 /// A paired peer the link may talk to, as pairing saved it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,6 +132,23 @@ pub struct Limits {
     /// [`NetHandle::send`] closes the connection with `OVERLOADED` rather
     /// than drop a message.
     pub send_capacity: usize,
+    /// The most files one received transfer may hold (1,000, the protocol's
+    /// own limit). An offer of more is refused.
+    pub max_transfer_files: usize,
+    /// The largest file this device receives, in bytes (4 GiB).
+    pub max_file_bytes: u64,
+    /// The most bytes one received transfer may hold in all (16 GiB).
+    pub max_transfer_bytes: u64,
+    /// Received transfers that may wait while another one runs (4); an
+    /// offer beyond those is refused as busy.
+    pub max_waiting_transfers: usize,
+    /// How long a transfer waits for an answer or an outcome, and how long
+    /// it may go without progress, before it fails (30 s).
+    pub transfer_timeout: Duration,
+    /// The fastest this device sends file data on one connection, in bytes
+    /// per second (12 MiB/s; zero means no limit), so a large transfer
+    /// does not fill the Wi-Fi queue in front of the input.
+    pub file_rate: u64,
 }
 
 impl Default for Limits {
@@ -134,6 +159,12 @@ impl Default for Limits {
             event_capacity: 1024,
             max_pending_connection_events: 32,
             send_capacity: 256,
+            max_transfer_files: hop_proto::MAX_OFFER_FILES,
+            max_file_bytes: 4 * 1024 * 1024 * 1024,
+            max_transfer_bytes: 16 * 1024 * 1024 * 1024,
+            max_waiting_transfers: 4,
+            transfer_timeout: Duration::from_secs(30),
+            file_rate: 12 * 1024 * 1024,
         }
     }
 }
@@ -157,14 +188,15 @@ pub struct NetConfig {
     pub displays: Vec<DisplayInfo>,
     /// The paired peers.
     pub peers: Vec<PinnedPeer>,
-    /// Advertise the `clipboard.text` capability and accept `ClipboardText`
-    /// from peers that negotiated it (milestone M4). [`NetConfig::new`]
-    /// leaves it off; the agent sets it from `clipboard.enabled`.
+    /// Advertise the `clipboard.text` capability, and send and accept
+    /// `ClipboardText` on connections where both sides did (milestone M4).
+    /// [`NetConfig::new`] leaves it off; the agent sets it from
+    /// `clipboard.enabled`.
     pub clipboard: bool,
     /// Receive files into this folder and advertise the `files` capability
     /// (milestone M5). `None`, which [`NetConfig::new`] sets, means off;
     /// since both sides must advertise `files`, no files then travel either
-    /// way.
+    /// way. The folder is not touched until the first offer arrives.
     pub files: Option<FilesConfig>,
     /// Advertise this device and look for peers with mDNS. Tests turn it
     /// off: multicast would trigger macOS's Local Network prompt.
@@ -224,7 +256,10 @@ impl fmt::Debug for NetConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilesConfig {
     /// The folder received files are saved in: `transfer.received_dir`, or
-    /// Downloads › Hop Received. It is created when the first files arrive.
+    /// Downloads › Hop Received. Nothing reads or creates it before the
+    /// first offer arrives (on the Mac, the first access inside Downloads
+    /// asks the user once); it is created then, if needed, and swept of
+    /// the temporary files an earlier run left.
     pub received_dir: PathBuf,
 }
 
@@ -262,8 +297,8 @@ pub enum SendError {
     /// follows, and both sides fail open.
     #[error("the connection was overloaded and has been closed")]
     Overloaded,
-    /// The message needs a capability the two devices did not negotiate
-    /// (in M2, `ClipboardText`).
+    /// The message needs a capability the two devices did not negotiate:
+    /// `ClipboardText` needs `clipboard.text`, and files need `files`.
     #[error("the peer did not negotiate this kind of message")]
     NotNegotiated,
     /// The message could not be encoded (for example, clipboard text over
@@ -272,13 +307,22 @@ pub enum SendError {
     Encode(#[source] ProtoError),
 }
 
-/// The capabilities this build implements. Only these are advertised, so
-/// no peer sends what M2 would drop (clipboard text comes in M4).
-pub(crate) fn implemented_capabilities() -> Vec<Capability> {
-    vec![
+/// The capabilities this device advertises: `input` and `keymap` always,
+/// `clipboard.text` when [`NetConfig::clipboard`] is on, and `files` when
+/// [`NetConfig::files`] is set. A capability is used only when both sides
+/// advertise it, so turning one off here keeps it off in both directions.
+pub(crate) fn implemented_capabilities(clipboard: bool, files: bool) -> Vec<Capability> {
+    let mut capabilities = vec![
         Capability::new(caps::INPUT, 1),
         Capability::new(caps::KEYMAP, 1),
-    ]
+    ];
+    if clipboard {
+        capabilities.push(Capability::new(caps::CLIPBOARD_TEXT, 1));
+    }
+    if files {
+        capabilities.push(Capability::new(caps::FILES, 1));
+    }
+    capabilities
 }
 
 /// Starts the link: binds the port, then listens for and dials the pinned
@@ -314,6 +358,9 @@ pub async fn start(
     // the listener must stop holding a connection well before that.
     timing.duplicate_grace = timing.duplicate_grace.min(timing.hello_timeout / 2);
     let limits = config.limits;
+    let inbox = config
+        .files
+        .map(|files| Arc::new(Inbox::new(files.received_dir, &limits)));
 
     let setup = |err: String| NetError::Setup(err);
     let server_transport = Arc::new(session_transport(&timing, 1).build().map_err(setup)?);
@@ -383,7 +430,10 @@ pub async fn start(
         }),
         timing,
         limits: limits.clone(),
+        clipboard: config.clipboard,
+        inbox,
         next_conn: AtomicU64::new(1),
+        next_transfer: AtomicU64::new(1),
         handshakes: Arc::new(Semaphore::new(limits.max_handshakes.max(1))),
         stopping,
         stats,
@@ -547,35 +597,54 @@ impl NetHandle {
     }
 
     /// Sends the files at `paths` to `to` and returns the transfer's id at
-    /// once, without blocking. The outcome arrives later as a
-    /// [`NetEvent::Transfer`](crate::NetEvent::Transfer) with that id:
-    /// [`TransferEvent::Sent`](crate::TransferEvent::Sent) or
+    /// once, without blocking; safe to call from any thread. The outcome
+    /// arrives later as a [`NetEvent::Transfer`](crate::NetEvent::Transfer)
+    /// with that id: [`TransferEvent::Sent`](crate::TransferEvent::Sent) or
     /// [`TransferEvent::Failed`](crate::TransferEvent::Failed).
     ///
     /// Only regular files are sent, read on a thread of their own; folders
     /// and files that cannot be read are skipped and counted. The files are
-    /// copied: nothing here moves or changes them.
-    ///
-    /// This is a stub until work package T4 replaces it: it always returns
-    /// [`SendError::NotNegotiated`].
+    /// copied: nothing here moves or changes them. Transfers to one peer go
+    /// one after the other, each at most [`Limits::file_rate`].
     ///
     /// # Errors
     ///
     /// [`SendError::NotConnected`] if `to` has no current connection, and
-    /// [`SendError::NotNegotiated`] if the two did not negotiate `files`.
+    /// [`SendError::NotNegotiated`] if the two did not negotiate `files`
+    /// (one of them is too old, or has receiving turned off).
     pub fn send_files(&self, to: &DeviceId, paths: Vec<PathBuf>) -> Result<u64, SendError> {
-        let _ = (to, paths);
-        Err(SendError::NotNegotiated)
+        let shared = &self.inner.shared;
+        let files = {
+            let table = shared.lock_table();
+            let current = table
+                .peers
+                .get(to)
+                .and_then(|slot| slot.current.as_ref())
+                .ok_or(SendError::NotConnected)?;
+            current.files.clone().ok_or(SendError::NotNegotiated)?
+        };
+        let id = shared.next_transfer.fetch_add(1, Ordering::Relaxed);
+        files.start_sending(id, paths)?;
+        Ok(id)
     }
 
     /// Sends `to` a tiny datagram that every build ignores, so that its
     /// Wi-Fi radio is awake when the cursor crosses to it (carries out
-    /// `Action::Nudge`). Best effort: it never blocks and never fails
-    /// loudly, and a peer that is not connected is skipped.
-    ///
-    /// This is a stub until work package T4 replaces it: it does nothing.
+    /// `Action::Nudge`). Best effort: it never blocks, never fails and logs
+    /// nothing, and a peer that is not connected, or whose connection has
+    /// no datagrams, is skipped.
     pub fn nudge(&self, to: &DeviceId) {
-        let _ = to;
+        let table = self.inner.shared.lock_table();
+        let Some(current) = table.peers.get(to).and_then(|slot| slot.current.as_ref()) else {
+            return;
+        };
+        let conn = &current.link.conn;
+        if conn
+            .max_datagram_size()
+            .is_some_and(|max| NUDGE.len() <= max)
+        {
+            let _ = conn.send_datagram(Bytes::from_static(&NUDGE));
+        }
     }
 
     /// Replaces the displays sent in `Hello`. Connections made from now on
@@ -727,7 +796,13 @@ pub(crate) struct Shared {
     local: Mutex<Local>,
     pub(crate) timing: Timing,
     pub(crate) limits: Limits,
+    /// Whether this device advertises `clipboard.text`.
+    clipboard: bool,
+    /// Receiving files, when this device advertises `files`.
+    pub(crate) inbox: Option<Arc<Inbox>>,
     next_conn: AtomicU64,
+    /// The id of the next file transfer this device sends.
+    next_transfer: AtomicU64,
     pub(crate) handshakes: Arc<Semaphore>,
     stopping: watch::Sender<bool>,
     pub(crate) stats: Arc<VerifierStats>,
@@ -793,6 +868,8 @@ pub(crate) struct Current {
     pub(crate) outgoing: mpsc::Sender<Bytes>,
     pub(crate) dialled_by_us: bool,
     pub(crate) negotiated: Negotiated,
+    /// The connection's file transfers, when both sides negotiated `files`.
+    pub(crate) files: Option<Arc<ConnFiles>>,
 }
 
 impl Shared {
@@ -868,7 +945,7 @@ impl Shared {
             local.displays.clone(),
         );
         hello.os = local.os;
-        hello.capabilities = implemented_capabilities();
+        hello.capabilities = implemented_capabilities(self.clipboard, self.inbox.is_some());
         hello
     }
 

@@ -5,10 +5,15 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use common::{VARIANT_COUNT, every_core_message, every_message, sample_hello, variant_name};
+use common::{
+    EVERY_FAILURE, EVERY_REFUSAL, FILE_VARIANT_COUNT, VARIANT_COUNT, every_core_message,
+    every_file_message, every_message, failure_name, file_variant_name, refusal_name, sample_hello,
+    variant_name,
+};
 use hop_proto::{
-    Decoded, FrameDecoder, Hello, KIND_CORE, KIND_HELLO, MAX_DATAGRAM_LEN, Message, PROTO_MAJOR,
-    PROTO_MINOR, decode_datagram, default_capabilities, encode_datagram, encode_frame,
+    Decoded, FileEntry, FileMessage, FrameDecoder, Hello, KIND_CORE, KIND_FILE, KIND_HELLO,
+    KIND_NUDGE, MAX_DATAGRAM_LEN, Message, PROTO_MAJOR, PROTO_MINOR, decode_datagram,
+    default_capabilities, encode_datagram, encode_frame,
 };
 use hop_types::{CoreMessage, DeviceId, Os, RejectReason};
 
@@ -26,6 +31,41 @@ fn through_frame(message: &Message) -> Decoded {
 fn samples_cover_every_core_message_variant() {
     let names: BTreeSet<_> = every_core_message().iter().map(variant_name).collect();
     assert_eq!(names.len(), VARIANT_COUNT, "missing samples: {names:?}");
+}
+
+#[test]
+fn samples_cover_every_file_message_variant_refusal_and_failure() {
+    let samples = every_file_message();
+    let names: BTreeSet<_> = samples.iter().map(file_variant_name).collect();
+    assert_eq!(
+        names.len(),
+        FILE_VARIANT_COUNT,
+        "missing samples: {names:?}"
+    );
+    let refusals: BTreeSet<_> = samples
+        .iter()
+        .filter_map(|message| match message {
+            FileMessage::Answer {
+                refusal: Some(refusal),
+                ..
+            } => Some(refusal_name(*refusal)),
+            _ => None,
+        })
+        .collect();
+    let failures: BTreeSet<_> = samples
+        .iter()
+        .filter_map(|message| match message {
+            FileMessage::Outcome {
+                failure: Some(failure),
+                ..
+            } => Some(failure_name(*failure)),
+            _ => None,
+        })
+        .collect();
+    // The name functions have no catch-all arm, so a new value fails to
+    // build there; these counts catch one missing from the arrays.
+    assert_eq!(refusals.len(), EVERY_REFUSAL.len());
+    assert_eq!(failures.len(), EVERY_FAILURE.len());
 }
 
 #[test]
@@ -70,11 +110,75 @@ fn frame_header_is_kind_then_big_endian_body_length() {
 }
 
 #[test]
-fn kinds_are_one_for_hello_and_two_for_core() {
+fn kinds_are_one_for_hello_two_for_core_three_for_files_and_four_for_nudges() {
     assert_eq!(KIND_HELLO, 1);
     assert_eq!(KIND_CORE, 2);
+    assert_eq!(KIND_FILE, 3);
+    assert_eq!(KIND_NUDGE, 4);
     assert_eq!(Message::Hello(sample_hello()).kind(), 1);
     assert_eq!(Message::Core(CoreMessage::Heartbeat { seq: 0 }).kind(), 2);
+    for file in every_file_message() {
+        assert_eq!(Message::File(file).kind(), 3);
+    }
+    assert_eq!(Message::Nudge.kind(), 4);
+}
+
+/// Locks the wire format of the file messages and the nudge, as above.
+#[test]
+fn file_messages_and_the_nudge_have_the_documented_bytes() {
+    let answer = encode_frame(
+        &FileMessage::Answer {
+            id: 5,
+            accepted: false,
+            refusal: Some(hop_proto::FileRefusal::TooLarge),
+        }
+        .into(),
+    )
+    .expect("encodes");
+    let mut body = vec![0x81, 0xa6]; // one-entry map: the variant
+    body.extend_from_slice(b"answer");
+    body.extend_from_slice(&[0x83, 0xa2]); // three fields
+    body.extend_from_slice(b"id");
+    body.extend_from_slice(&[0x05, 0xa8]);
+    body.extend_from_slice(b"accepted");
+    body.extend_from_slice(&[0xc2, 0xa7]); // false
+    body.extend_from_slice(b"refusal");
+    body.push(0xa9);
+    body.extend_from_slice(b"too_large");
+    let mut expected = vec![0x00, 0x03, 0x00, 0x00, 0x00, body.len() as u8];
+    expected.extend_from_slice(&body);
+    assert_eq!(answer, expected);
+
+    let offer = encode_datagram(
+        &FileMessage::Offer {
+            id: 1,
+            files: vec![FileEntry {
+                name: "a".to_owned(),
+                size: 2,
+            }],
+        }
+        .into(),
+    )
+    .expect("fits");
+    let mut expected = vec![0x00, 0x03, 0x81, 0xa5];
+    expected.extend_from_slice(b"offer");
+    expected.extend_from_slice(&[0x82, 0xa2]);
+    expected.extend_from_slice(b"id");
+    expected.extend_from_slice(&[0x01, 0xa5]);
+    expected.extend_from_slice(b"files");
+    expected.extend_from_slice(&[0x91, 0x82, 0xa4]); // one entry, two fields
+    expected.extend_from_slice(b"name");
+    expected.extend_from_slice(&[0xa1, b'a', 0xa4]);
+    expected.extend_from_slice(b"size");
+    expected.push(0x02);
+    assert_eq!(offer, expected);
+
+    // A nudge is its kind and nothing else.
+    assert_eq!(encode_datagram(&Message::Nudge), Ok(vec![0x00, 0x04]));
+    assert_eq!(
+        encode_frame(&Message::Nudge),
+        Ok(vec![0x00, 0x04, 0x00, 0x00, 0x00, 0x00])
+    );
 }
 
 /// Locks the wire format: named fields, snake_case variant names, unit enum
@@ -134,4 +238,22 @@ fn messages_convert_from_their_contents() {
     );
     let release = CoreMessage::Release { seq: 3 };
     assert_eq!(Message::from(release.clone()), Message::Core(release));
+    let outcome = FileMessage::Outcome {
+        id: 9,
+        saved: 0,
+        failure: None,
+    };
+    assert_eq!(Message::from(outcome.clone()), Message::File(outcome));
+}
+
+#[test]
+fn every_file_message_knows_its_transfer() {
+    for message in every_file_message() {
+        let expected = match &message {
+            FileMessage::Offer { id, .. }
+            | FileMessage::Answer { id, .. }
+            | FileMessage::Outcome { id, .. } => *id,
+        };
+        assert_eq!(message.id(), expected);
+    }
 }

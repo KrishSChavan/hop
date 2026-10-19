@@ -63,6 +63,24 @@ pub enum ProtoError {
         max: usize,
     },
 
+    /// A file offer lists more files than [`MAX_OFFER_FILES`], or names a
+    /// file with more than [`MAX_FILE_NAME_BYTES`] bytes.
+    ///
+    /// [`MAX_OFFER_FILES`]: crate::MAX_OFFER_FILES
+    /// [`MAX_FILE_NAME_BYTES`]: crate::MAX_FILE_NAME_BYTES
+    #[error(
+        "a file offer of {files} files whose longest name is {longest_name} bytes is over the \
+         limits of {max_files} files and {max_name} bytes per name",
+        max_files = crate::MAX_OFFER_FILES,
+        max_name = crate::MAX_FILE_NAME_BYTES
+    )]
+    FileOfferTooLarge {
+        /// How many files the offer lists.
+        files: usize,
+        /// The length of its longest file name, in UTF-8 bytes.
+        longest_name: usize,
+    },
+
     /// A message could not be turned into MessagePack. Hop's own message
     /// types always encode, so this points to a bug.
     #[error("cannot encode a message of kind {kind}: {reason}")]
@@ -75,7 +93,8 @@ pub enum ProtoError {
 
     /// A body is not valid MessagePack for its kind: a required field is
     /// missing, a value has the wrong type, an enum variant is unknown,
-    /// nesting is too deep, or bytes follow the message.
+    /// nesting is too deep, or bytes follow the message (a nudge has no
+    /// body at all).
     #[error("malformed body for message kind {kind}: {reason}")]
     Decode {
         /// The kind the body arrived under.

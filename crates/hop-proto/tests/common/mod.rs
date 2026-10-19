@@ -4,8 +4,8 @@
 #![allow(dead_code)]
 
 use hop_proto::{
-    Decoded, FrameDecoder, Hello, Message, PROTO_MAJOR, PROTO_MINOR, ProtoError,
-    default_capabilities,
+    Decoded, FileEntry, FileFailure, FileMessage, FileRefusal, FrameDecoder, Hello, Message,
+    PROTO_MAJOR, PROTO_MINOR, ProtoError, default_capabilities,
 };
 use hop_types::{
     CoreMessage, DeviceId, DisplayInfo, Edge, EntryPoint, InputEvent, KeyCode, MotionMark,
@@ -179,11 +179,133 @@ pub fn variant_name(message: &CoreMessage) -> &'static str {
 
 pub const VARIANT_COUNT: usize = 10;
 
-/// Every sample message, `Hello` first.
+/// Every value of `FileRefusal`; `refusal_name` keeps it honest.
+pub const EVERY_REFUSAL: [FileRefusal; 5] = [
+    FileRefusal::Off,
+    FileRefusal::TooMany,
+    FileRefusal::TooLarge,
+    FileRefusal::Busy,
+    FileRefusal::BadNames,
+];
+
+/// Every value of `FileFailure`; `failure_name` keeps it honest.
+pub const EVERY_FAILURE: [FileFailure; 5] = [
+    FileFailure::Incomplete,
+    FileFailure::Corrupt,
+    FileFailure::Disk,
+    FileFailure::Cancelled,
+    FileFailure::TimedOut,
+];
+
+/// At least one sample of every `FileMessage` variant, and an answer and an
+/// outcome with every refusal and failure. `file_variant_name` keeps this
+/// list honest. Each fits in a datagram, like every other sample.
+pub fn every_file_message() -> Vec<FileMessage> {
+    let mut messages = vec![
+        FileMessage::Offer {
+            id: 1,
+            files: vec![
+                FileEntry {
+                    name: "Quarterly report.pdf".to_owned(),
+                    size: 48_213,
+                },
+                FileEntry {
+                    name: "héllo wörld 👋.txt".to_owned(),
+                    size: 0,
+                },
+                FileEntry {
+                    name: "../not a path\\at all".to_owned(),
+                    size: u64::MAX,
+                },
+            ],
+        },
+        FileMessage::Offer {
+            id: u64::MAX,
+            files: vec![],
+        },
+        FileMessage::Answer {
+            id: 1,
+            accepted: true,
+            refusal: None,
+        },
+        FileMessage::Outcome {
+            id: 1,
+            saved: 3,
+            failure: None,
+        },
+    ];
+    messages.extend(EVERY_REFUSAL.map(|refusal| FileMessage::Answer {
+        id: 2,
+        accepted: false,
+        refusal: Some(refusal),
+    }));
+    messages.extend(EVERY_FAILURE.map(|failure| FileMessage::Outcome {
+        id: 3,
+        saved: 1,
+        failure: Some(failure),
+    }));
+    messages
+}
+
+/// Every `FileMessage` variant name. No catch-all arm: a new variant breaks
+/// the build here until it gets a sample above.
+pub fn file_variant_name(message: &FileMessage) -> &'static str {
+    match message {
+        FileMessage::Offer { .. } => "offer",
+        FileMessage::Answer { .. } => "answer",
+        FileMessage::Outcome { .. } => "outcome",
+    }
+}
+
+pub const FILE_VARIANT_COUNT: usize = 3;
+
+/// Every refusal's wire name. No catch-all arm, as above.
+pub fn refusal_name(refusal: FileRefusal) -> &'static str {
+    match refusal {
+        FileRefusal::Off => "off",
+        FileRefusal::TooMany => "too_many",
+        FileRefusal::TooLarge => "too_large",
+        FileRefusal::Busy => "busy",
+        FileRefusal::BadNames => "bad_names",
+    }
+}
+
+/// Every failure's wire name. No catch-all arm, as above.
+pub fn failure_name(failure: FileFailure) -> &'static str {
+    match failure {
+        FileFailure::Incomplete => "incomplete",
+        FileFailure::Corrupt => "corrupt",
+        FileFailure::Disk => "disk",
+        FileFailure::Cancelled => "cancelled",
+        FileFailure::TimedOut => "timed_out",
+    }
+}
+
+/// Every sample message: `Hello` first, then the core and file messages and
+/// a nudge.
 pub fn every_message() -> Vec<Message> {
     let mut messages = vec![Message::Hello(sample_hello())];
     messages.extend(every_core_message().into_iter().map(Message::Core));
+    messages.extend(every_file_message().into_iter().map(Message::File));
+    messages.push(Message::Nudge);
     messages
+}
+
+/// A file offer of `count` files whose names are each `name_len` bytes of
+/// ASCII.
+pub fn offer(count: usize, name_len: usize) -> FileMessage {
+    FileMessage::Offer {
+        id: 7,
+        files: (0..count)
+            .map(|index| FileEntry {
+                name: format!("{index:0>width$}", width = name_len)
+                    .chars()
+                    .take(name_len)
+                    .collect(),
+                size: u64::MAX - index as u64,
+            })
+            .collect(),
+    }
 }
 
 /// A frame built by hand, for bodies `encode_frame` would never produce.

@@ -3,10 +3,11 @@
 
 mod common;
 
-use common::{pop_all, raw_frame, sample_hello};
+use common::{offer, pop_all, raw_frame, sample_hello};
 use hop_proto::{
-    Decoded, FrameDecoder, KIND_CORE, MAX_CLIPBOARD_TEXT, MAX_DATAGRAM_LEN, MAX_FRAME_LEN, Message,
-    ProtoError, decode_datagram, encode_datagram, encode_frame,
+    Decoded, FileEntry, FileMessage, FrameDecoder, KIND_CORE, KIND_FILE, MAX_CLIPBOARD_TEXT,
+    MAX_DATAGRAM_LEN, MAX_FILE_NAME_BYTES, MAX_FRAME_LEN, MAX_OFFER_FILES, Message, ProtoError,
+    decode_datagram, encode_datagram, encode_frame,
 };
 use hop_types::{CoreMessage, MotionMark};
 
@@ -28,6 +29,127 @@ fn limits_have_the_documented_values() {
     assert_eq!(MAX_FRAME_LEN, 1024 * 1024 + 64 * 1024);
     assert_eq!(MAX_DATAGRAM_LEN, 1200);
     assert_eq!(MAX_CLIPBOARD_TEXT, 1024 * 1024);
+    assert_eq!(MAX_OFFER_FILES, 1000);
+    assert_eq!(MAX_FILE_NAME_BYTES, 1024);
+}
+
+/// The bytes a misbehaving peer would send for `message`, skipping the
+/// encode-side checks.
+fn raw_file_frame(message: &FileMessage) -> Vec<u8> {
+    raw_frame(
+        KIND_FILE,
+        &rmp_serde::to_vec_named(message).expect("encodes"),
+    )
+}
+
+#[test]
+fn an_offer_at_both_limits_fits_in_one_frame() {
+    let message = Message::File(offer(MAX_OFFER_FILES, MAX_FILE_NAME_BYTES));
+    let frame = encode_frame(&message).expect("within the limits");
+    assert!(frame.len() - 6 <= MAX_FRAME_LEN);
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&frame).expect("valid");
+    assert_eq!(decoder.pop(), Some(Ok(Decoded::Message(message))));
+}
+
+#[test]
+fn an_offer_of_too_many_files_is_refused_on_encode_and_decode() {
+    let too_many = offer(MAX_OFFER_FILES + 1, 4);
+    let expected = ProtoError::FileOfferTooLarge {
+        files: MAX_OFFER_FILES + 1,
+        longest_name: 4,
+    };
+    let message = Message::File(too_many.clone());
+    assert_eq!(encode_frame(&message), Err(expected.clone()));
+    assert_eq!(encode_datagram(&message), Err(expected.clone()));
+
+    let heartbeat = Message::Core(CoreMessage::Heartbeat { seq: 3 });
+    let mut stream = raw_file_frame(&too_many);
+    stream.extend(encode_frame(&heartbeat).expect("encodes"));
+    let mut decoder = FrameDecoder::new();
+    decoder.push(&stream).expect("framing is fine");
+    assert_eq!(
+        pop_all(&mut decoder),
+        vec![Err(expected), Ok(Decoded::Message(heartbeat))]
+    );
+}
+
+#[test]
+fn a_file_name_over_the_limit_is_refused_on_encode_and_decode() {
+    let long = offer(2, MAX_FILE_NAME_BYTES + 1);
+    let expected = ProtoError::FileOfferTooLarge {
+        files: 2,
+        longest_name: MAX_FILE_NAME_BYTES + 1,
+    };
+    assert_eq!(
+        encode_frame(&Message::File(long.clone())),
+        Err(expected.clone())
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder
+        .push(&raw_file_frame(&long))
+        .expect("framing is fine");
+    assert_eq!(decoder.pop(), Some(Err(expected)));
+}
+
+#[test]
+fn the_name_limit_counts_bytes_not_characters() {
+    let named = |name: String| {
+        Message::File(FileMessage::Offer {
+            id: 1,
+            files: vec![FileEntry { name, size: 1 }],
+        })
+    };
+    // "é" is two bytes in UTF-8.
+    assert!(encode_frame(&named("é".repeat(MAX_FILE_NAME_BYTES / 2))).is_ok());
+    assert_eq!(
+        encode_frame(&named("é".repeat(MAX_FILE_NAME_BYTES / 2 + 1))),
+        Err(ProtoError::FileOfferTooLarge {
+            files: 1,
+            longest_name: MAX_FILE_NAME_BYTES + 2,
+        })
+    );
+}
+
+#[test]
+fn answers_outcomes_and_empty_offers_have_no_file_limits_to_break() {
+    for message in [
+        FileMessage::Offer {
+            id: 0,
+            files: vec![],
+        },
+        FileMessage::Answer {
+            id: u64::MAX,
+            accepted: true,
+            refusal: None,
+        },
+        FileMessage::Outcome {
+            id: u64::MAX,
+            saved: u32::MAX,
+            failure: None,
+        },
+    ] {
+        let datagram = encode_datagram(&Message::File(message.clone())).expect("fits");
+        assert_eq!(
+            decode_datagram(&datagram),
+            Ok(Decoded::Message(Message::File(message)))
+        );
+    }
+}
+
+#[test]
+fn a_nudge_with_a_body_is_refused() {
+    // A nudge is the kind alone; anything after it is malformed (and a
+    // receiver drops a bad datagram).
+    let mut datagram = hop_proto::KIND_NUDGE.to_be_bytes().to_vec();
+    datagram.push(0xc0);
+    assert!(matches!(
+        decode_datagram(&datagram),
+        Err(ProtoError::Decode {
+            kind: hop_proto::KIND_NUDGE,
+            ..
+        })
+    ));
 }
 
 #[test]

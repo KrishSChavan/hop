@@ -61,6 +61,10 @@ const CODE_REJECT_FROM: u32 = 4_294_000_000;
 /// The default pairing port is the session port plus one.
 pub const DEFAULT_PAIRING_PORT: u16 = 47801;
 
+/// How long a side whose peer ended its stream early waits for the peer's
+/// close code, which says why (see [`Failure::explained`]).
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
+
 /// A six-digit one-time pairing code.
 ///
 /// It is shown on the host's screen only ([`PairingCode::reveal`]) and
@@ -728,22 +732,36 @@ pub async fn pair_join(
             continue;
         }
         let mut confirmation_sent = false;
-        let exchange = joiner_exchange(&conn, &identity, host, &code, &me, &mut confirmation_sent);
+        // The stream lives out here, so that a failure closes the
+        // connection before the stream is dropped (see `host_run`).
+        let mut streams = None;
+        let exchange = joiner_exchange(
+            &conn,
+            &identity,
+            host,
+            &code,
+            &me,
+            &mut confirmation_sent,
+            &mut streams,
+        );
         let result = tokio::time::timeout(timing.exchange_timeout, exchange).await;
-        let (peer, recv) = match result {
-            Ok(Ok(confirmed)) => confirmed,
-            Ok(Err(failure)) => {
+        let (peer, (send, recv)) = match (result, streams.take()) {
+            (Ok(Ok(peer)), Some(streams)) => (peer, streams),
+            (Ok(Err(failure)), streams) => {
+                let failure = failure.explained(&conn, CLOSE_WAIT).await;
                 if let Some(code) = failure.close {
                     conn.close(code.varint(), code.name().as_bytes());
                 }
+                drop(streams);
                 if confirmation_sent {
                     return Err(failure.error);
                 }
                 last_error = failure.error;
                 continue;
             }
-            Err(_) => {
+            (_, streams) => {
                 conn.close(CloseCode::Protocol.varint(), b"too slow");
+                drop(streams);
                 let error = PairError::Connection("the other laptop stopped answering".to_owned());
                 if confirmation_sent {
                     return Err(error);
@@ -752,13 +770,15 @@ pub async fn pair_join(
                 continue;
             }
         };
+        // Nothing more to send: the stream ends here, as the host expects.
+        drop(send);
         on_confirmed(&peer);
         let mut recv = recv;
         // Declared after `recv`, so it is dropped first: a join dropped while
         // it waits (the app's Cancel) closes with EXPIRED before the stream
         // could send anything.
         let mut stop_waiting = CloseIfDropped(Some(conn.clone()));
-        let verdict = wait_for_verdict(&mut recv, timing.verdict_timeout).await;
+        let verdict = wait_for_verdict(&conn, &mut recv, timing.verdict_timeout).await;
         stop_waiting.disarm();
         // The host takes a normal close (SHUTDOWN, 0) as proof that its
         // "accepted" arrived, so it is sent only then. Otherwise a host
@@ -802,7 +822,8 @@ impl Drop for CloseIfDropped {
     }
 }
 
-/// The joiner's steps 2 and 3 on one connection.
+/// The joiner's steps 2 and 3 on one connection. The stream goes into
+/// `streams`, which outlives the exchange.
 async fn joiner_exchange(
     conn: &quinn::Connection,
     identity: &Identity,
@@ -810,44 +831,49 @@ async fn joiner_exchange(
     code: &PairingCode,
     me: &PairInfo,
     confirmation_sent: &mut bool,
-) -> Result<(PairedPeer, RecvStream), Failure> {
-    let (mut send, mut recv) = conn.open_bi().await.map_err(Failure::connection)?;
+    streams: &mut Option<(SendStream, RecvStream)>,
+) -> Result<PairedPeer, Failure> {
+    let (send, recv) = streams.insert(conn.open_bi().await.map_err(Failure::connection)?);
     let joiner = identity.fingerprint();
     let (spake, ours) = Spake2::<Ed25519Group>::start_a(
         &code.password(),
         &SpakeIdentity::new(joiner.as_bytes()),
         &SpakeIdentity::new(host.as_bytes()),
     );
-    wire::write_frame(&mut send, Kind::Spake, &ours).await?;
-    let theirs = wire::read_frame(&mut recv, Kind::Spake).await?;
+    wire::write_frame(send, Kind::Spake, &ours).await?;
+    let theirs = wire::read_frame(recv, Kind::Spake).await?;
     let key = Zeroizing::new(spake.finish(&theirs).map_err(|_| Failure::wrong_code())?);
     let binding = wire::channel_binding(conn)?;
     let mac = wire::confirmation(&key, wire::LABEL_JOINER, &binding);
     *confirmation_sent = true;
-    wire::write_frame(&mut send, Kind::Confirm, &wire::encode_confirm(&mac, me)).await?;
-    let reply = wire::read_frame(&mut recv, Kind::Confirm).await?;
+    wire::write_frame(send, Kind::Confirm, &wire::encode_confirm(&mac, me)).await?;
+    let reply = wire::read_frame(recv, Kind::Confirm).await?;
     let (their_mac, os, name) = wire::parse_confirm(&reply)?;
     if !wire::verify_confirmation(&key, wire::LABEL_HOST, &binding, &their_mac) {
         return Err(Failure::wrong_code());
     }
-    let peer = PairedPeer {
+    Ok(PairedPeer {
         name: display_text(&name, MAX_DISPLAY_CHARS),
         id: host.device_id(),
         os,
         fingerprint: host,
-    };
-    Ok((peer, recv))
+    })
 }
 
 /// Waits for the host's "accepted", or its close. No answer in time counts
 /// as no, and the joiner then closes with `EXPIRED`.
-async fn wait_for_verdict(recv: &mut RecvStream, timeout: Duration) -> Result<(), Failure> {
+async fn wait_for_verdict(
+    conn: &quinn::Connection,
+    recv: &mut RecvStream,
+    timeout: Duration,
+) -> Result<(), Failure> {
     match tokio::time::timeout(timeout, wire::read_frame(recv, Kind::Accepted)).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(failure)) => Err(failure),
+        Ok(Err(failure)) => Err(failure.explained(conn, CLOSE_WAIT).await),
         Err(_) => Err(Failure {
             error: PairError::Declined,
             close: Some(CloseCode::Expired),
+            ended_early: false,
         }),
     }
 }
@@ -911,35 +937,45 @@ async fn host_run(incoming: quinn::Incoming, ctx: Arc<HostContext>) -> RunOutcom
         return RunOutcome::Failed { counted: false };
     }
     let mut spake_sent = false;
-    let exchange = host_exchange(&conn, &ctx, joiner, &mut spake_sent);
-    match tokio::time::timeout(timing.exchange_timeout, exchange).await {
-        Ok(Ok((peer, send))) => RunOutcome::Confirmed(Confirmed { peer, conn, send }),
-        Ok(Err(failure)) => {
-            if let Some(code) = failure.close {
-                conn.close(code.varint(), code.name().as_bytes());
-            }
-            RunOutcome::Failed {
-                counted: spake_sent,
-            }
-        }
-        Err(_) => {
-            conn.close(CloseCode::Protocol.varint(), b"too slow");
-            RunOutcome::Failed {
-                counted: spake_sent,
-            }
-        }
+    // The stream lives out here, outside the timed exchange, so that a run
+    // that fails closes the connection while the stream is still open.
+    // Dropping the stream first would finish it, and that end could reach
+    // the joiner before the close code saying why (`WRONG_CODE`): the
+    // joiner would then report a broken stream instead of a wrong code.
+    // Once the connection is closed, dropping the stream sends nothing.
+    let mut streams = None;
+    let exchange = host_exchange(&conn, &ctx, joiner, &mut spake_sent, &mut streams);
+    let close: Option<(CloseCode, &[u8])> =
+        match tokio::time::timeout(timing.exchange_timeout, exchange).await {
+            Ok(Ok(peer)) => match streams.take() {
+                Some((send, _recv)) => {
+                    return RunOutcome::Confirmed(Confirmed { peer, conn, send });
+                }
+                None => Some((CloseCode::Protocol, b"no stream")),
+            },
+            Ok(Err(failure)) => failure.close.map(|code| (code, code.name().as_bytes())),
+            Err(_) => Some((CloseCode::Protocol, b"too slow")),
+        };
+    if let Some((code, reason)) = close {
+        conn.close(code.varint(), reason);
+    }
+    drop(streams);
+    RunOutcome::Failed {
+        counted: spake_sent,
     }
 }
 
-/// The host's steps 2 and 3 on one connection.
+/// The host's steps 2 and 3 on one connection. The stream goes into
+/// `streams`, which outlives the exchange.
 async fn host_exchange(
     conn: &quinn::Connection,
     ctx: &HostContext,
     joiner: Fingerprint,
     spake_sent: &mut bool,
-) -> Result<(PairedPeer, SendStream), Failure> {
-    let (mut send, mut recv) = conn.accept_bi().await.map_err(Failure::connection)?;
-    let theirs = wire::read_frame(&mut recv, Kind::Spake).await?;
+    streams: &mut Option<(SendStream, RecvStream)>,
+) -> Result<PairedPeer, Failure> {
+    let (send, recv) = streams.insert(conn.accept_bi().await.map_err(Failure::connection)?);
+    let theirs = wire::read_frame(recv, Kind::Spake).await?;
     let host = ctx.identity.fingerprint();
     let (spake, ours) = Spake2::<Ed25519Group>::start_b(
         &ctx.code.password(),
@@ -949,29 +985,23 @@ async fn host_exchange(
     // From here on this run counts as an attempt unless it succeeds: the
     // joiner could test a guess against this message.
     *spake_sent = true;
-    wire::write_frame(&mut send, Kind::Spake, &ours).await?;
+    wire::write_frame(send, Kind::Spake, &ours).await?;
     let key = Zeroizing::new(spake.finish(&theirs).map_err(|_| Failure::wrong_code())?);
     let binding = wire::channel_binding(conn)?;
-    let confirm = wire::read_frame(&mut recv, Kind::Confirm).await?;
+    let confirm = wire::read_frame(recv, Kind::Confirm).await?;
     let (their_mac, os, name) = wire::parse_confirm(&confirm)?;
     // Nothing the joiner sent is trusted until its confirmation checks out.
     if !wire::verify_confirmation(&key, wire::LABEL_JOINER, &binding, &their_mac) {
         return Err(Failure::wrong_code());
     }
     let mac = wire::confirmation(&key, wire::LABEL_HOST, &binding);
-    wire::write_frame(
-        &mut send,
-        Kind::Confirm,
-        &wire::encode_confirm(&mac, &ctx.me),
-    )
-    .await?;
-    let peer = PairedPeer {
+    wire::write_frame(send, Kind::Confirm, &wire::encode_confirm(&mac, &ctx.me)).await?;
+    Ok(PairedPeer {
         name: display_text(&name, MAX_DISPLAY_CHARS),
         id: joiner.device_id(),
         os,
         fingerprint: joiner,
-    };
-    Ok((peer, send))
+    })
 }
 
 /// Closes a joiner that arrived during a run with `BUSY`, after its

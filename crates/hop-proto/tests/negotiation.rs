@@ -22,18 +22,20 @@ fn hello(major: u16, minor: u16, capabilities: &[(&str, u16)]) -> Hello {
 }
 
 #[test]
-fn default_capabilities_are_input_keymap_and_clipboard_text() {
+fn default_capabilities_are_input_keymap_clipboard_text_and_files() {
     assert_eq!(
         default_capabilities(),
         vec![
             Capability::new("input", 1),
             Capability::new("keymap", 1),
             Capability::new("clipboard.text", 1),
+            Capability::new("files", 1),
         ]
     );
     assert_eq!(caps::INPUT, "input");
     assert_eq!(caps::KEYMAP, "keymap");
     assert_eq!(caps::CLIPBOARD_TEXT, "clipboard.text");
+    assert_eq!(caps::FILES, "files");
     assert_eq!((PROTO_MAJOR, PROTO_MINOR), (1, 0));
 }
 
@@ -47,6 +49,7 @@ fn two_identical_builds_agree_on_everything_sorted_by_name() {
             proto_minor: PROTO_MINOR,
             capabilities: vec![
                 Capability::new(caps::CLIPBOARD_TEXT, 1),
+                Capability::new(caps::FILES, 1),
                 Capability::new(caps::INPUT, 1),
                 Capability::new(caps::KEYMAP, 1),
             ],

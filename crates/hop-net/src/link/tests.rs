@@ -1,6 +1,7 @@
 //! Loopback tests of the session link. Every socket binds 127.0.0.1, so no
 //! test sends anything onto the real network (and macOS shows no Local
-//! Network prompt).
+//! Network prompt). The file transfer tests in `files/tests.rs` share the
+//! helpers here.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use crate::{DownReason, Identity, NetEvent, PeerUp};
 
 /// Test timing: short enough to keep the tests quick, long enough for a
 /// loaded CI machine.
-fn timing() -> Timing {
+pub(super) fn timing() -> Timing {
     Timing {
         handshake_timeout: Duration::from_secs(3),
         hello_timeout: Duration::from_millis(1500),
@@ -35,11 +36,11 @@ fn timing() -> Timing {
     }
 }
 
-fn loopback() -> SocketAddr {
+pub(super) fn loopback() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
-fn pin(identity: &Identity, name: &str) -> PinnedPeer {
+pub(super) fn pin(identity: &Identity, name: &str) -> PinnedPeer {
     PinnedPeer {
         id: identity.device_id(),
         fingerprint: identity.fingerprint(),
@@ -48,26 +49,26 @@ fn pin(identity: &Identity, name: &str) -> PinnedPeer {
     }
 }
 
-struct Node {
-    identity: Arc<Identity>,
-    handle: NetHandle,
-    events: NetEvents,
+pub(super) struct Node {
+    pub(super) identity: Arc<Identity>,
+    pub(super) handle: NetHandle,
+    pub(super) events: NetEvents,
     /// Every event taken from `events`, in order.
-    log: Vec<NetEvent>,
+    pub(super) log: Vec<NetEvent>,
 }
 
 impl Node {
-    fn id(&self) -> DeviceId {
+    pub(super) fn id(&self) -> DeviceId {
         self.identity.device_id()
     }
 
-    fn address(&self) -> String {
+    pub(super) fn address(&self) -> String {
         self.handle.local_addr().to_string()
     }
 
     /// The next event, waiting up to `wait`. Polls, so the tokio worker
     /// is never blocked.
-    async fn next(&mut self, wait: Duration) -> Option<NetEvent> {
+    pub(super) async fn next(&mut self, wait: Duration) -> Option<NetEvent> {
         let deadline = Instant::now() + wait;
         loop {
             if let Some(event) = self.events.try_recv() {
@@ -82,7 +83,11 @@ impl Node {
     }
 
     /// Waits for an event matching `want`, failing on timeout.
-    async fn expect(&mut self, what: &str, want: impl Fn(&NetEvent) -> bool) -> NetEvent {
+    pub(super) async fn expect(
+        &mut self,
+        what: &str,
+        want: impl Fn(&NetEvent) -> bool,
+    ) -> NetEvent {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -94,7 +99,7 @@ impl Node {
         }
     }
 
-    async fn expect_up(&mut self) -> PeerUp {
+    pub(super) async fn expect_up(&mut self) -> PeerUp {
         match self
             .expect("PeerUp", |e| matches!(e, NetEvent::PeerUp(_)))
             .await
@@ -104,7 +109,7 @@ impl Node {
         }
     }
 
-    async fn expect_down(&mut self) -> DownReason {
+    pub(super) async fn expect_down(&mut self) -> DownReason {
         match self
             .expect("PeerDown", |e| matches!(e, NetEvent::PeerDown { .. }))
             .await
@@ -115,14 +120,14 @@ impl Node {
     }
 
     /// Asserts that nothing arrives for `wait`.
-    async fn expect_quiet(&mut self, wait: Duration) {
+    pub(super) async fn expect_quiet(&mut self, wait: Duration) {
         if let Some(event) = self.next(wait).await {
             panic!("expected no event, got {event:?}");
         }
     }
 }
 
-async fn node_with(
+pub(super) async fn node_with(
     identity: Arc<Identity>,
     peers: Vec<PinnedPeer>,
     edit: impl FnOnce(&mut NetConfig),
@@ -142,26 +147,34 @@ async fn node_with(
     }
 }
 
-async fn node(identity: Arc<Identity>, peers: Vec<PinnedPeer>) -> Node {
+pub(super) async fn node(identity: Arc<Identity>, peers: Vec<PinnedPeer>) -> Node {
     node_with(identity, peers, |_| {}).await
 }
 
 /// Two nodes that pin each other; only `a` knows `b`'s address, so only
 /// `a` dials.
 async fn pair() -> (Node, Node) {
+    pair_with(|_| {}, |_| {}).await
+}
+
+/// [`pair`], with `edit_a` and `edit_b` applied to the two configs.
+pub(super) async fn pair_with(
+    edit_a: impl FnOnce(&mut NetConfig),
+    edit_b: impl FnOnce(&mut NetConfig),
+) -> (Node, Node) {
     let a_id = Arc::new(Identity::generate().unwrap());
     let b_id = Arc::new(Identity::generate().unwrap());
-    let b = node(b_id.clone(), vec![pin(&a_id, "a")]).await;
-    let a = node(a_id, vec![pin(&b_id, "b")]).await;
+    let b = node_with(b_id.clone(), vec![pin(&a_id, "a")], edit_b).await;
+    let a = node_with(a_id, vec![pin(&b_id, "b")], edit_a).await;
     assert!(a.handle.set_peer_address(&b.id(), Some(b.address())));
     (a, b)
 }
 
-fn heartbeat(seq: u64) -> CoreMessage {
+pub(super) fn heartbeat(seq: u64) -> CoreMessage {
     CoreMessage::Heartbeat { seq }
 }
 
-fn key_input(seq: u64) -> CoreMessage {
+pub(super) fn key_input(seq: u64) -> CoreMessage {
     CoreMessage::Input {
         seq,
         mark: MotionMark::default(),
@@ -183,7 +196,7 @@ async fn a_pinned_pair_connects_and_exchanges_messages() {
     assert!(up_a.dialled_by_us && !up_b.dialled_by_us);
     assert_eq!(up_a.name, "test device");
     assert_eq!(up_a.app_version, "0.1.0-test");
-    // Only what M2 implements is negotiated.
+    // The clipboard and files stay off unless the config turns them on.
     let names: Vec<&str> = up_a
         .negotiated
         .capabilities
@@ -191,6 +204,7 @@ async fn a_pinned_pair_connects_and_exchanges_messages() {
         .map(|c| c.name.as_str())
         .collect();
     assert_eq!(names, ["input", "keymap"]);
+    assert!(!up_a.supports_clipboard() && !up_a.supports_files());
     assert_eq!(a.handle.connected_peers(), vec![b.id()]);
 
     // Reliable messages arrive in order, both ways.
@@ -264,6 +278,186 @@ async fn motion_travels_as_datagrams() {
         }
     );
     assert!(conn.stats().frame_rx.datagram > datagrams_before);
+}
+
+fn clipboard_text(generation: u64, text: &str) -> CoreMessage {
+    CoreMessage::ClipboardText {
+        generation,
+        text: text.to_owned(),
+    }
+}
+
+#[test]
+fn the_capabilities_advertised_follow_the_config() {
+    let names = |clipboard, files| -> Vec<String> {
+        implemented_capabilities(clipboard, files)
+            .into_iter()
+            .map(|capability| format!("{} {}", capability.name, capability.version))
+            .collect()
+    };
+    assert_eq!(names(false, false), ["input 1", "keymap 1"]);
+    assert_eq!(
+        names(true, false),
+        ["input 1", "keymap 1", "clipboard.text 1"]
+    );
+    assert_eq!(names(false, true), ["input 1", "keymap 1", "files 1"]);
+    assert_eq!(
+        names(true, true),
+        ["input 1", "keymap 1", "clipboard.text 1", "files 1"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_text_travels_before_the_keys_sent_after_it() {
+    let on = |config: &mut NetConfig| config.clipboard = true;
+    let (mut a, mut b) = pair_with(on, on).await;
+    let up = a.expect_up().await;
+    b.expect_up().await;
+    assert!(up.supports_clipboard());
+    let names: Vec<&str> = up
+        .negotiated
+        .capabilities
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(names, ["clipboard.text", "input", "keymap"]);
+    // As after a crossing: the text, then the keys that may paste it.
+    a.handle
+        .send(&b.id(), clipboard_text(1, "copied on a"))
+        .unwrap();
+    a.handle.send(&b.id(), key_input(2)).unwrap();
+    for expected in [clipboard_text(1, "copied on a"), key_input(2)] {
+        let event = b
+            .expect("a message", |e| matches!(e, NetEvent::Message { .. }))
+            .await;
+        assert_eq!(
+            event,
+            NetEvent::Message {
+                from: a.id(),
+                msg: expected
+            }
+        );
+    }
+    // And the other way.
+    b.handle.send(&a.id(), clipboard_text(5, "from b")).unwrap();
+    let event = a
+        .expect("ClipboardText", |e| matches!(e, NetEvent::Message { .. }))
+        .await;
+    assert_eq!(
+        event,
+        NetEvent::Message {
+            from: b.id(),
+            msg: clipboard_text(5, "from b")
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_text_needs_both_sides_to_turn_it_on() {
+    // Only `a` turns it on: not negotiated, so `a` cannot send it.
+    let (mut a, mut b) = pair_with(|config| config.clipboard = true, |_| {}).await;
+    let up = a.expect_up().await;
+    b.expect_up().await;
+    assert!(!up.supports_clipboard());
+    assert!(matches!(
+        a.handle.send(&b.id(), clipboard_text(1, "secret")),
+        Err(SendError::NotNegotiated)
+    ));
+
+    // A peer that sends it anyway (this raw one advertises everything) to
+    // a device with the clipboard off: dropped, and what follows arrives.
+    let a_id = Arc::new(Identity::generate().unwrap());
+    let b_id = Arc::new(Identity::generate().unwrap());
+    let mut b = node(b_id.clone(), vec![pin(&a_id, "a")]).await;
+    let (_endpoint, _conn, mut send, _recv) =
+        raw_session(&a_id, &b_id, b.handle.local_addr(), None).await;
+    b.expect_up().await;
+    let text = Message::Core(clipboard_text(1, "unwanted"));
+    send.write_all(&encode_frame(&text).unwrap()).await.unwrap();
+    send.write_all(&encode_frame(&Message::Core(heartbeat(4))).unwrap())
+        .await
+        .unwrap();
+    let event = b
+        .expect("Heartbeat", |e| matches!(e, NetEvent::Message { .. }))
+        .await;
+    assert_eq!(
+        event,
+        NetEvent::Message {
+            from: a_id.device_id(),
+            msg: heartbeat(4)
+        }
+    );
+}
+
+/// With room for four messages, fifty clipboard texts would close the
+/// connection as overloaded; only the newest one waits, so it stays up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_newest_clipboard_text_waits_for_the_core() {
+    let on = |config: &mut NetConfig| config.clipboard = true;
+    let small = |config: &mut NetConfig| {
+        config.clipboard = true;
+        config.limits.event_capacity = 4;
+    };
+    let (mut a, mut b) = pair_with(on, small).await;
+    a.expect_up().await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.events.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // b's core reads nothing meanwhile.
+    for generation in 1..=50 {
+        let text = format!("text {generation} {}", "x".repeat(1000));
+        a.handle
+            .send(&b.id(), clipboard_text(generation, &text))
+            .unwrap();
+    }
+    a.handle.send(&b.id(), heartbeat(51)).unwrap();
+    // The heartbeat came last on the stream, so once it waits, everything
+    // before it was handled.
+    while b.events.len() < 3 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(matches!(
+        b.next(Duration::ZERO).await,
+        Some(NetEvent::PeerUp(_))
+    ));
+    let Some(NetEvent::Message { msg, .. }) = b.next(Duration::ZERO).await else {
+        panic!("a clipboard text: {:?}", b.log);
+    };
+    let CoreMessage::ClipboardText { generation, .. } = msg else {
+        panic!("the clipboard text first");
+    };
+    assert_eq!(generation, 50, "the newest");
+    assert_eq!(
+        b.next(Duration::ZERO).await,
+        Some(NetEvent::Message {
+            from: a.id(),
+            msg: heartbeat(51)
+        })
+    );
+    b.expect_quiet(Duration::from_millis(200)).await;
+    a.expect_quiet(Duration::ZERO).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nudge_is_a_datagram_the_peer_ignores() {
+    assert_eq!(encode_datagram(&Message::Nudge).unwrap(), NUDGE);
+    let (mut a, mut b) = pair().await;
+    a.expect_up().await;
+    b.expect_up().await;
+    let conn = b.handle.current_connection(&a.id()).unwrap();
+    let before = conn.stats().frame_rx.datagram;
+    // Datagrams may be lost even on loopback; nudge a few times.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while conn.stats().frame_rx.datagram == before {
+        assert!(Instant::now() < deadline, "no nudge arrived");
+        a.handle.nudge(&b.id());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    b.expect_quiet(Duration::from_millis(100)).await;
+    // A peer that is not connected is skipped, quietly.
+    a.handle.nudge(&DeviceId::new("nobody"));
+    a.expect_quiet(Duration::ZERO).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -674,7 +868,7 @@ fn unusable_peers_are_skipped() {
 
 /// Connects to `server` as `client` (which the server pins) over a raw
 /// QUIC connection, writes `client`'s Hello, and reads the server's.
-async fn raw_session(
+pub(super) async fn raw_session(
     client: &Identity,
     server: &Identity,
     address: SocketAddr,
@@ -699,7 +893,7 @@ async fn raw_session(
     (endpoint, conn, send, recv)
 }
 
-async fn raw_connect(
+pub(super) async fn raw_connect(
     client: &Identity,
     server: &Identity,
     address: SocketAddr,
@@ -727,13 +921,13 @@ async fn raw_connect(
     (endpoint, conn)
 }
 
-fn hello_frame(id: DeviceId, major: u16) -> Vec<u8> {
+pub(super) fn hello_frame(id: DeviceId, major: u16) -> Vec<u8> {
     let mut hello = Hello::new("0.1.0", id, "raw peer", Vec::new());
     hello.proto_major = major;
     encode_frame(&Message::Hello(hello)).unwrap()
 }
 
-fn app_code(error: &quinn::ConnectionError) -> Option<u64> {
+pub(super) fn app_code(error: &quinn::ConnectionError) -> Option<u64> {
     match error {
         quinn::ConnectionError::ApplicationClosed(close) => Some(close.error_code.into_inner()),
         _ => None,

@@ -10,6 +10,7 @@ publish.workspace = true
 # No hop-config: the agent maps its config to `NetConfig` and `PinnedPeer`,
 # so this crate does not depend on the file format.
 hop-proto.workspace = true
+hop-transfer.workspace = true
 hop-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

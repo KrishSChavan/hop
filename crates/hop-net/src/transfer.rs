@@ -9,9 +9,10 @@ use std::path::PathBuf;
 
 use hop_types::DeviceId;
 
-/// What happened to a file transfer, delivered as
-/// [`NetEvent::Transfer`](crate::NetEvent::Transfer). Only events from the
-/// peer's current connection are delivered.
+/// How a file transfer ended, delivered as
+/// [`NetEvent::Transfer`](crate::NetEvent::Transfer): exactly one per
+/// transfer, before its connection's `PeerDown` or the `PeerUp` of the
+/// connection that replaces it. Only a shutdown ends transfers without one.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TransferEvent {
     /// Files from the other computer arrived complete and were saved in the
@@ -73,14 +74,16 @@ pub enum TransferFailure {
     /// kept.
     Corrupt,
     /// A file could not be read or written: for example, it changed while it
-    /// was being sent, or the disk is full.
+    /// was being sent, or the disk is full. Also when the other computer
+    /// broke the transfer off.
     Io,
 }
 
 /// Why the receiving computer turned files down.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// Receiving files is turned off on that computer.
+    /// Receiving files is turned off on that computer, or its Received
+    /// folder cannot be used.
     Off,
     /// More files than one transfer can carry (1,000).
     TooMany,

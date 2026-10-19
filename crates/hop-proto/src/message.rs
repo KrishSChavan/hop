@@ -5,6 +5,7 @@ use hop_types::CoreMessage;
 use serde::de::DeserializeOwned;
 
 use crate::ProtoError;
+use crate::file::{self, FileMessage};
 use crate::hello::{self, Hello};
 
 /// Kind number of [`Message::Hello`].
@@ -12,6 +13,12 @@ pub const KIND_HELLO: u16 = 1;
 
 /// Kind number of [`Message::Core`].
 pub const KIND_CORE: u16 = 2;
+
+/// Kind number of [`Message::File`].
+pub const KIND_FILE: u16 = 3;
+
+/// Kind number of [`Message::Nudge`].
+pub const KIND_NUDGE: u16 = 4;
 
 /// Largest clipboard text, in UTF-8 bytes, that a `ClipboardText` message
 /// may carry: 1 MiB. Longer text is rejected on encode and on decode, never
@@ -37,6 +44,14 @@ pub enum Message {
     Hello(Hello),
     /// A control hand-off or clipboard message.
     Core(CoreMessage),
+    /// A file transfer's offer, answer or outcome, on the control stream.
+    /// Sent only to a peer that negotiated `files`.
+    File(FileMessage),
+    /// A wake-up with no body, sent only as a datagram: receiving it wakes
+    /// the peer's Wi-Fi radio before the cursor crosses. Every build
+    /// ignores it (builds that predate it see an unknown kind), so it needs
+    /// no capability.
+    Nudge,
 }
 
 impl Message {
@@ -45,6 +60,8 @@ impl Message {
         match self {
             Message::Hello(_) => KIND_HELLO,
             Message::Core(_) => KIND_CORE,
+            Message::File(_) => KIND_FILE,
+            Message::Nudge => KIND_NUDGE,
         }
     }
 
@@ -57,6 +74,12 @@ impl Message {
                 check_clipboard(core)?;
                 rmp_serde::encode::write_named(out, core)
             }
+            Message::File(file) => {
+                file::check_limits(file)?;
+                rmp_serde::encode::write_named(out, file)
+            }
+            // The body is empty: the kind says everything.
+            Message::Nudge => Ok(()),
         };
         written.map_err(|err| ProtoError::Encode {
             kind: self.kind(),
@@ -74,6 +97,12 @@ impl From<Hello> for Message {
 impl From<CoreMessage> for Message {
     fn from(core: CoreMessage) -> Self {
         Message::Core(core)
+    }
+}
+
+impl From<FileMessage> for Message {
+    fn from(file: FileMessage) -> Self {
+        Message::File(file)
     }
 }
 
@@ -98,6 +127,18 @@ pub(crate) fn decode_message(kind: u16, body: &[u8]) -> Result<Decoded, ProtoErr
             let core: CoreMessage = decode_body(kind, body)?;
             check_clipboard(&core)?;
             Message::Core(core)
+        }
+        KIND_FILE => {
+            let file: FileMessage = decode_body(kind, body)?;
+            file::check_limits(&file)?;
+            Message::File(file)
+        }
+        KIND_NUDGE if body.is_empty() => Message::Nudge,
+        KIND_NUDGE => {
+            return Err(ProtoError::Decode {
+                kind,
+                reason: format!("{} unexpected bytes in a nudge", body.len()),
+            });
         }
         _ => return Ok(Decoded::Unknown { kind }),
     };
@@ -356,5 +397,41 @@ mod tests {
             decode_message(9, &[0xc1, 0xff]),
             Ok(Decoded::Unknown { kind: 9 })
         );
+    }
+
+    #[test]
+    fn a_nudge_is_an_empty_body_and_nothing_else() {
+        let mut body = Vec::new();
+        Message::Nudge.write_body(&mut body).expect("encodes");
+        assert!(body.is_empty());
+        assert_eq!(
+            decode_message(KIND_NUDGE, &[]),
+            Ok(Decoded::Message(Message::Nudge))
+        );
+        let Err(ProtoError::Decode { kind, reason }) = decode_message(KIND_NUDGE, &[0x90, 0x90])
+        else {
+            panic!("a nudge with a body is malformed");
+        };
+        assert_eq!(kind, KIND_NUDGE);
+        assert!(reason.contains("2 unexpected bytes"), "{reason}");
+    }
+
+    #[test]
+    fn file_messages_use_the_shared_body_rules() {
+        // Hostile length prefixes and deep nesting fail for kind 3 as for
+        // every other kind.
+        for body in [
+            &[0xdd, 0xff, 0xff, 0xff, 0xff, 0xc0][..],
+            &[0xdb, 0xff, 0xff, 0xff, 0xff, b'a'][..],
+        ] {
+            assert!(decode_message(KIND_FILE, body).is_err(), "{body:x?}");
+        }
+        assert!(matches!(
+            decode_message(KIND_FILE, &nested_junk(100_000)),
+            Err(ProtoError::Decode {
+                kind: KIND_FILE,
+                ..
+            })
+        ));
     }
 }

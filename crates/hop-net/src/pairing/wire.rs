@@ -13,6 +13,8 @@
 //! | 2 | Confirm | 32-byte HMAC, 1-byte OS, then the name in UTF-8 |
 //! | 3 | Accepted | empty: the host's user said yes and the host saved |
 
+use std::time::Duration;
+
 use hmac::{Hmac, Mac};
 use hop_types::Os;
 use quinn::{RecvStream, SendStream};
@@ -58,6 +60,10 @@ pub(crate) enum Kind {
 pub(crate) struct Failure {
     pub(crate) error: PairError,
     pub(crate) close: Option<CloseCode>,
+    /// The other side ended or reset its stream where a message was due.
+    /// It is usually closing the connection, and its close code, right
+    /// behind, says why (see `explained`).
+    pub(crate) ended_early: bool,
 }
 
 impl Failure {
@@ -65,6 +71,7 @@ impl Failure {
         Failure {
             error: PairError::WrongCode,
             close: Some(CloseCode::WrongCode),
+            ended_early: false,
         }
     }
 
@@ -72,6 +79,7 @@ impl Failure {
         Failure {
             error: PairError::Protocol(why.to_owned()),
             close: Some(CloseCode::Protocol),
+            ended_early: false,
         }
     }
 
@@ -82,7 +90,39 @@ impl Failure {
             }
             other => PairError::Connection(display_bytes(other.to_string().as_bytes(), 80)),
         };
-        Failure { error, close: None }
+        Failure {
+            error,
+            close: None,
+            ended_early: false,
+        }
+    }
+
+    fn ended_early() -> Failure {
+        Failure {
+            ended_early: true,
+            ..Failure::protocol("the stream ended early")
+        }
+    }
+
+    /// This failure, or, for a stream that ended early, the reason the
+    /// other side gives when it closes the connection within `wait`.
+    ///
+    /// A side that fails closes the connection with a code saying why, but
+    /// an older Hop could let the end of its stream overtake that close:
+    /// a joiner that typed a wrong code then saw "the stream ended early"
+    /// instead of `WRONG_CODE`.
+    pub(crate) async fn explained(self, conn: &quinn::Connection, wait: Duration) -> Failure {
+        if !self.ended_early {
+            return self;
+        }
+        match tokio::time::timeout(wait, conn.closed()).await {
+            Ok(quinn::ConnectionError::ApplicationClosed(close)) => Failure {
+                error: error_for_close(close.error_code.into_inner()),
+                close: None,
+                ended_early: false,
+            },
+            _ => self,
+        }
     }
 }
 
@@ -150,7 +190,7 @@ fn read_failure(error: quinn::ReadExactError) -> Failure {
         quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(error)) => {
             Failure::connection(error)
         }
-        _ => Failure::protocol("the stream ended early"),
+        _ => Failure::ended_early(),
     }
 }
 

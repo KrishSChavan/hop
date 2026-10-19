@@ -19,6 +19,7 @@ hop-platform-macos = { path = "crates/hop-platform-macos" }
 hop-platform-windows = { path = "crates/hop-platform-windows" }
 hop-selftest = { path = "crates/hop-selftest" }
 hop-net = { path = "crates/hop-net" }
+hop-transfer = { path = "crates/hop-transfer" }
 hop-agent = { path = "crates/hop-agent" }
 
 anyhow = "1.0.104"

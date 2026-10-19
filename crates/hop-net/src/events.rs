@@ -33,6 +33,14 @@ use crate::{CloseCode, TransferEvent};
 /// (a duplicate was resolved); the core treats it as "the old connection is
 /// gone". Nothing from a replaced or closed connection follows its
 /// replacement or its `PeerDown`.
+///
+/// Every file transfer ends with exactly one [`NetEvent::Transfer`]
+/// (`Received`, `Sent` or `Failed`), within its connection's run: the
+/// transfers still running when a connection closes or is replaced are
+/// reported as `Failed` with
+/// [`TransferFailure::Disconnected`](crate::TransferFailure::Disconnected)
+/// just before its `PeerDown`, or before the `PeerUp` of the connection
+/// that replaces it. Only a shutdown ends transfers without a report.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NetEvent {
     /// A paired peer finished its `Hello` exchange on a connection that is
@@ -45,16 +53,19 @@ pub enum NetEvent {
         /// Why, for the log.
         reason: DownReason,
     },
-    /// A message from a peer's current connection. `ClipboardText` never
-    /// appears in M2: it is not negotiated, and the network drops it.
+    /// A message from a peer's current connection, in the order it was
+    /// sent. `ClipboardText` appears only from a peer that negotiated
+    /// `clipboard.text` (the network drops it otherwise), and at most one
+    /// per peer waits here: a newer one replaces it, at the back of the
+    /// queue, since each one would overwrite the clipboard anyway.
     Message {
         /// The sender.
         from: DeviceId,
         /// The message.
         msg: CoreMessage,
     },
-    /// What happened to a file transfer with a peer's current connection.
-    /// This one is for the agent, not the core: the core never sees files.
+    /// How a file transfer with a peer's current connection ended. This one
+    /// is for the agent, not the core: the core never sees files.
     Transfer(TransferEvent),
 }
 
@@ -244,7 +255,9 @@ pub(crate) struct EventQueue {
 
 struct QueueState {
     events: VecDeque<NetEvent>,
-    /// `Message` events waiting; at most `capacity`.
+    /// `Message` and `Transfer` events waiting: at most `capacity`, except
+    /// for the transfer reports that may go past it (see
+    /// [`EventQueue::transfer`] and [`EventQueue::announce`]).
     messages: usize,
     /// `PeerUp` and `PeerDown` events waiting. A connection is announced
     /// only while fewer than `max_states` are waiting, and each announced
@@ -262,14 +275,45 @@ impl QueueState {
     fn pop(&mut self) -> Option<NetEvent> {
         let event = self.events.pop_front()?;
         match event {
-            NetEvent::Message { .. } => self.messages = self.messages.saturating_sub(1),
+            NetEvent::Message { .. } | NetEvent::Transfer(_) => {
+                self.messages = self.messages.saturating_sub(1);
+            }
             NetEvent::PeerUp(_) | NetEvent::PeerDown { .. } => {
                 self.states = self.states.saturating_sub(1);
             }
-            // Not queued yet: work package T4 queues them, and bounds them.
-            NetEvent::Transfer(_) => {}
         }
         Some(event)
+    }
+
+    /// Whether `conn` is the connection last announced for `peer`, and the
+    /// queue still takes events: `None` if so, otherwise the answer for an
+    /// event from it.
+    fn refuse(&self, peer: &DeviceId, conn: u64) -> Option<Offer> {
+        if self.closed {
+            Some(Offer::Closed)
+        } else if self.current.get(peer) != Some(&conn) {
+            Some(Offer::NotCurrent)
+        } else {
+            None
+        }
+    }
+
+    /// Takes out the `ClipboardText` from `peer` that is still waiting, if
+    /// any.
+    fn drop_waiting_clipboard(&mut self, peer: &DeviceId) {
+        let waiting = self.events.iter().position(|event| {
+            matches!(
+                event,
+                NetEvent::Message {
+                    from,
+                    msg: CoreMessage::ClipboardText { .. },
+                } if from == peer
+            )
+        });
+        if let Some(index) = waiting {
+            self.events.remove(index);
+            self.messages = self.messages.saturating_sub(1);
+        }
     }
 }
 
@@ -301,10 +345,19 @@ impl EventQueue {
     /// Announces connection `conn` as `up.peer`'s current one. Returns
     /// false (and changes nothing) if too many connection events are
     /// waiting or nobody listens; the caller then closes the connection.
-    pub(crate) fn announce(&self, conn: u64, up: PeerUp) -> bool {
+    ///
+    /// `ended` are the last reports of the connection `conn` replaces (its
+    /// transfers that had not finished), queued just before the `PeerUp`
+    /// in the same step. They are never refused for lack of room: each
+    /// ends a transfer, and there are only as many as transfers.
+    pub(crate) fn announce(&self, conn: u64, up: PeerUp, ended: Vec<TransferEvent>) -> bool {
         let mut state = self.lock();
         if state.closed || state.states >= state.max_states {
             return false;
+        }
+        for event in ended {
+            state.messages += 1;
+            state.events.push_back(NetEvent::Transfer(event));
         }
         state.current.insert(up.peer.clone(), conn);
         state.states += 1;
@@ -316,13 +369,17 @@ impl EventQueue {
     /// does not fit returns [`Offer::Full`]; an unreliable one (`Motion`)
     /// that does not fit is dropped and also returns `Full`, which the
     /// caller ignores for motion.
+    ///
+    /// A `ClipboardText` takes the place of the one from the same peer
+    /// that is still waiting, if any, and goes to the back: each one can be
+    /// a megabyte, and only the newest would stay on the clipboard anyway.
     pub(crate) fn offer(&self, from: &DeviceId, conn: u64, msg: CoreMessage) -> Offer {
         let mut state = self.lock();
-        if state.closed {
-            return Offer::Closed;
+        if let Some(refused) = state.refuse(from, conn) {
+            return refused;
         }
-        if state.current.get(from) != Some(&conn) {
-            return Offer::NotCurrent;
+        if matches!(msg, CoreMessage::ClipboardText { .. }) {
+            state.drop_waiting_clipboard(from);
         }
         if state.messages >= state.capacity {
             return Offer::Full;
@@ -333,6 +390,31 @@ impl EventQueue {
             msg,
         });
         Offer::Queued
+    }
+
+    /// Queues how a file transfer on connection `conn` with `peer` ended,
+    /// counting it with the messages.
+    ///
+    /// Returns `None` if `conn` is not the peer's current connection or
+    /// nobody listens. Otherwise the report is queued even when the queue
+    /// is full, since it ends a transfer and must not be lost, and the
+    /// result says whether it was full: the caller then closes the
+    /// connection with `OVERLOADED`, so the queue grows past its bound by
+    /// no more than the transfers that connection had.
+    pub(crate) fn transfer(
+        &self,
+        peer: &DeviceId,
+        conn: u64,
+        event: TransferEvent,
+    ) -> Option<bool> {
+        let mut state = self.lock();
+        if state.refuse(peer, conn).is_some() {
+            return None;
+        }
+        let full = state.messages >= state.capacity;
+        state.messages += 1;
+        state.events.push_back(NetEvent::Transfer(event));
+        Some(full)
     }
 
     /// Reports that connection `conn` to `peer` closed. Queues `PeerDown`
@@ -406,11 +488,11 @@ mod tests {
         let events = NetEvents::new(queue.clone());
         let peer = DeviceId::new("p");
         assert_eq!(queue.offer(&peer, 1, heartbeat(0)), Offer::NotCurrent);
-        assert!(queue.announce(1, up("p")));
+        assert!(queue.announce(1, up("p"), Vec::new()));
         assert_eq!(queue.offer(&peer, 1, heartbeat(1)), Offer::Queued);
         // Connection 2 replaces 1: from then on 1 is not heard, and its
         // close is not reported.
-        assert!(queue.announce(2, up("p")));
+        assert!(queue.announce(2, up("p"), Vec::new()));
         assert_eq!(queue.offer(&peer, 1, heartbeat(2)), Offer::NotCurrent);
         assert!(!queue.disconnect(&peer, 1, DownReason::TimedOut));
         assert_eq!(queue.offer(&peer, 2, heartbeat(3)), Offer::Queued);
@@ -433,9 +515,9 @@ mod tests {
         let queue = Arc::new(EventQueue::new(2, 1, None));
         let events = NetEvents::new(queue.clone());
         let peer = DeviceId::new("p");
-        assert!(queue.announce(1, up("p")));
+        assert!(queue.announce(1, up("p"), Vec::new()));
         assert!(
-            !queue.announce(2, up("q")),
+            !queue.announce(2, up("q"), Vec::new()),
             "too many connection events waiting"
         );
         assert_eq!(queue.offer(&peer, 1, heartbeat(1)), Offer::Queued);
@@ -445,9 +527,9 @@ mod tests {
         assert_eq!(events.len(), 4);
         // The PeerUp and PeerDown both count against the limit until read.
         assert!(matches!(events.try_recv(), Some(NetEvent::PeerUp(_))));
-        assert!(!queue.announce(3, up("q")));
+        assert!(!queue.announce(3, up("q"), Vec::new()));
         while events.try_recv().is_some() {}
-        assert!(queue.announce(3, up("q")));
+        assert!(queue.announce(3, up("q"), Vec::new()));
     }
 
     #[test]
@@ -467,7 +549,7 @@ mod tests {
             let queue = queue.clone();
             move || {
                 std::thread::sleep(Duration::from_millis(30));
-                assert!(queue.announce(1, up("p")));
+                assert!(queue.announce(1, up("p"), Vec::new()));
                 queue.wake();
             }
         });
@@ -497,11 +579,131 @@ mod tests {
         assert!(peer.supports_files());
     }
 
+    fn clipboard(peer: &str, generation: u64) -> (DeviceId, CoreMessage) {
+        (
+            DeviceId::new(peer),
+            CoreMessage::ClipboardText {
+                generation,
+                text: format!("text {generation}"),
+            },
+        )
+    }
+
+    /// The events waiting, as short names.
+    fn waiting(events: &NetEvents) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv())
+            .map(|event| match event {
+                NetEvent::PeerUp(up) => format!("up {}", up.peer),
+                NetEvent::PeerDown { peer, .. } => format!("down {peer}"),
+                NetEvent::Message {
+                    from,
+                    msg: CoreMessage::ClipboardText { generation, .. },
+                } => format!("{from} clipboard {generation}"),
+                NetEvent::Message { from, msg } => format!("{from} {:?}", msg.seq()),
+                NetEvent::Transfer(TransferEvent::Sent { id, .. }) => format!("sent {id}"),
+                NetEvent::Transfer(_) => "transfer".to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_the_newest_clipboard_text_from_each_peer_waits() {
+        let queue = Arc::new(EventQueue::new(3, 4, None));
+        let events = NetEvents::new(queue.clone());
+        let (p, q) = (DeviceId::new("p"), DeviceId::new("q"));
+        assert!(queue.announce(1, up("p"), Vec::new()));
+        assert!(queue.announce(2, up("q"), Vec::new()));
+        let (_, first) = clipboard("p", 1);
+        assert_eq!(queue.offer(&p, 1, first), Offer::Queued);
+        assert_eq!(queue.offer(&p, 1, heartbeat(2)), Offer::Queued);
+        let (_, other) = clipboard("q", 10);
+        assert_eq!(queue.offer(&q, 2, other), Offer::Queued);
+        // The queue is full, but a newer text takes the older one's place,
+        // at the back.
+        let (_, second) = clipboard("p", 3);
+        assert_eq!(queue.offer(&p, 1, second), Offer::Queued);
+        assert_eq!(queue.offer(&p, 1, heartbeat(4)), Offer::Full);
+        assert_eq!(
+            waiting(&events),
+            [
+                "up p",
+                "up q",
+                "p Some(2)",
+                "q clipboard 10",
+                "p clipboard 3"
+            ]
+        );
+        // Once read, a text no longer stands in the way of the next one.
+        let (_, third) = clipboard("p", 5);
+        assert_eq!(queue.offer(&p, 1, third), Offer::Queued);
+        let (_, fourth) = clipboard("p", 6);
+        assert_eq!(queue.offer(&p, 1, fourth), Offer::Queued);
+        assert_eq!(waiting(&events), ["p clipboard 6"]);
+        // A text from a replaced connection does not replace anything.
+        assert!(queue.announce(7, up("p"), Vec::new()));
+        let (_, stale) = clipboard("p", 8);
+        assert_eq!(queue.offer(&p, 1, stale), Offer::NotCurrent);
+    }
+
+    #[test]
+    fn transfer_reports_count_as_messages_and_are_never_lost_to_a_full_queue() {
+        let queue = Arc::new(EventQueue::new(2, 4, None));
+        let events = NetEvents::new(queue.clone());
+        let p = DeviceId::new("p");
+        let sent = |id| TransferEvent::Sent {
+            to: DeviceId::new("p"),
+            id,
+            files: 1,
+            skipped: 0,
+        };
+        assert_eq!(queue.transfer(&p, 1, sent(1)), None, "not announced");
+        assert!(queue.announce(1, up("p"), Vec::new()));
+        assert_eq!(queue.transfer(&p, 1, sent(2)), Some(false));
+        assert_eq!(queue.offer(&p, 1, heartbeat(3)), Offer::Queued);
+        // Full: messages are refused, but a transfer's end is queued, and
+        // the caller is told to close the connection.
+        assert_eq!(queue.offer(&p, 1, heartbeat(4)), Offer::Full);
+        assert_eq!(queue.transfer(&p, 1, sent(5)), Some(true));
+        assert_eq!(waiting(&events), ["up p", "sent 2", "p Some(3)", "sent 5"]);
+        assert_eq!(queue.transfer(&p, 1, sent(6)), Some(false));
+        assert!(queue.disconnect(&p, 1, DownReason::TimedOut));
+        assert_eq!(queue.transfer(&p, 1, sent(7)), None, "after PeerDown");
+        assert_eq!(waiting(&events), ["sent 6", "down p"]);
+        queue.close();
+        assert_eq!(queue.transfer(&p, 1, sent(8)), None);
+    }
+
+    #[test]
+    fn a_replaced_connection_s_last_reports_come_before_the_new_peer_up() {
+        // No room for messages at all: the reports still go in, because
+        // each one ends a transfer.
+        let queue = Arc::new(EventQueue::new(1, 4, None));
+        let events = NetEvents::new(queue.clone());
+        let p = DeviceId::new("p");
+        assert!(queue.announce(1, up("p"), Vec::new()));
+        assert_eq!(queue.offer(&p, 1, heartbeat(1)), Offer::Queued);
+        let ended = |id| TransferEvent::Sent {
+            to: DeviceId::new("p"),
+            id,
+            files: 0,
+            skipped: 0,
+        };
+        assert!(queue.announce(2, up("p"), vec![ended(7), ended(8)]));
+        assert_eq!(
+            waiting(&events),
+            ["up p", "p Some(1)", "sent 7", "sent 8", "up p"]
+        );
+        // A refused announcement queues nothing.
+        queue.close();
+        assert!(!queue.announce(3, up("p"), vec![ended(9)]));
+        assert!(events.is_empty());
+    }
+
     #[test]
     fn dropping_the_receiver_closes_the_queue() {
         let queue = Arc::new(EventQueue::new(4, 4, None));
         drop(NetEvents::new(queue.clone()));
-        assert!(!queue.announce(1, up("p")));
+        assert!(!queue.announce(1, up("p"), Vec::new()));
         assert_eq!(
             queue.offer(&DeviceId::new("p"), 1, heartbeat(1)),
             Offer::Closed
